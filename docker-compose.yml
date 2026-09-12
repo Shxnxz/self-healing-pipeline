@@ -80,26 +80,42 @@ services:
       kafka:
         condition: service_healthy
 
-  # --- Silver -------------------------------------------------------
-  # Bronze -> parsed/typed/cleaned, via one SQL transform.
-  silver-job:
+  # --- Silver 1 -----------------------------------------------------
+  # Bronze -> parsed/cleaned via SILVER1_TRANSFORM_SQL.
+  silver1-job:
     build: ./spark-jobs
-    container_name: silver-job
-    command: [ "python", "silver_job.py" ]
+    container_name: silver1-job
+    command: [ "python", "silver1_job.py" ]
     volumes:
       - ./delta:/data/delta
       - ./checkpoints:/data/checkpoints
     environment:
       BRONZE_PATH: /data/delta/bronze
-      SILVER_PATH: /data/delta/silver_cars
-      CHECKPOINT_PATH: /data/checkpoints/silver_cars
+      SILVER1_PATH: /data/delta/silver1
+      CHECKPOINT_PATH: /data/checkpoints/silver1
     depends_on:
       bronze-job:
         condition: service_started
 
+  # --- Silver 2 -----------------------------------------------------
+  # Silver 1 -> standardized via SILVER2_TRANSFORM_SQL.
+  silver2-job:
+    build: ./spark-jobs
+    container_name: silver2-job
+    command: [ "python", "silver2_job.py" ]
+    volumes:
+      - ./delta:/data/delta
+      - ./checkpoints:/data/checkpoints
+    environment:
+      SILVER1_PATH: /data/delta/silver1
+      SILVER2_PATH: /data/delta/silver2
+      CHECKPOINT_PATH: /data/checkpoints/silver2
+    depends_on:
+      silver1-job:
+        condition: service_started
+
   # --- Gold -------------------------------------------------------
-  # Silver -> business-ready fields. A plain SELECT for now; the future
-  # two-table join lands here (see gold_job.py).
+  # Silver 2 -> business-ready fields via GOLD_TRANSFORM_SQL.
   gold-job:
     build: ./spark-jobs
     container_name: gold-job
@@ -108,9 +124,9 @@ services:
       - ./delta:/data/delta
       - ./checkpoints:/data/checkpoints
     environment:
-      SILVER_PATH: /data/delta/silver_cars
-      GOLD_PATH: /data/delta/gold_car_overview
-      CHECKPOINT_PATH: /data/checkpoints/gold_car_overview
+      SILVER2_PATH: /data/delta/silver2
+      GOLD_PATH: /data/delta/gold
+      CHECKPOINT_PATH: /data/checkpoints/gold
     depends_on:
-      silver-job:
+      silver2-job:
         condition: service_started

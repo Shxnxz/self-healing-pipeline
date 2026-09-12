@@ -18,12 +18,16 @@ from deltalake import DeltaTable
 
 TABLES = {
     "bronze": "./delta/bronze",
+    "silver1": "./delta/silver1",
+    "silver2": "./delta/silver2",
+    "gold": "./delta/gold",
+    # Legacy aliases
     "silver_cars": "./delta/silver_cars",
     "gold_car_overview": "./delta/gold_car_overview",
 }
 
 if __name__ == "__main__":
-    name = sys.argv[1] if len(sys.argv) > 1 else "gold_car_overview"
+    name = sys.argv[1] if len(sys.argv) > 1 else "gold"
     if name not in TABLES:
         print(f"Unknown table '{name}'. Choose from: {list(TABLES)}")
         sys.exit(1)

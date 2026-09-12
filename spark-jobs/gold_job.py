@@ -1,47 +1,34 @@
 """
 Gold: business-ready fields, via SQL.
 
-Currently a straight SELECT from one Silver table. When you're ready to
-merge two Silver tables (per the plan), this is the file to change: add a
-second `spark.readStream...createOrReplaceTempView(...)` for the other
-Silver table, and turn GOLD_TRANSFORM_SQL into a JOIN between the two
-views instead of a plain SELECT. Streaming-to-streaming joins need a
-watermark on both sides at that point -- ask when you get there, it's a
-different pattern than this stateless SELECT.
+Reads from Silver 2, registers a temp view 'silver2', and runs
+GOLD_TRANSFORM_SQL to produce the business-ready Gold Delta table.
 """
 
 import os
 
 from common import build_spark, wait_for_delta_table
 
-SILVER_PATH = os.environ.get("SILVER_PATH", "/data/delta/silver_cars")
-GOLD_PATH = os.environ.get("GOLD_PATH", "/data/delta/gold_car_overview")
+SILVER2_PATH = os.environ.get("SILVER2_PATH", "/data/delta/silver2")
+GOLD_PATH = os.environ.get("GOLD_PATH", "/data/delta/gold")
 CHECKPOINT_PATH = os.environ.get(
-    "CHECKPOINT_PATH", "/data/checkpoints/gold_car_overview"
+    "CHECKPOINT_PATH", "/data/checkpoints/gold"
 )
 
-# Future: JOIN against a second silver table here (e.g. regional pricing)
-# instead of a plain SELECT from one.
+# Business-level transform SQL.
+# Currently selecting all standardized fields from Silver 2.
 GOLD_TRANSFORM_SQL = """
-SELECT
-    record_id,
-    company_name,
-    car_name,
-    powertrain_type,
-    horsepower_hp,
-    price_usd,
-    top_speed_kmh
-FROM silver_cars
+SELECT * FROM silver2
 """
 
 
 def main():
-    spark = build_spark("GoldCarOverview")
+    spark = build_spark("GoldCrashTransform")
 
-    wait_for_delta_table(SILVER_PATH)
+    wait_for_delta_table(SILVER2_PATH)
 
-    silver_stream = spark.readStream.format("delta").load(SILVER_PATH)
-    silver_stream.createOrReplaceTempView("silver_cars")
+    silver2_stream = spark.readStream.format("delta").load(SILVER2_PATH)
+    silver2_stream.createOrReplaceTempView("silver2")
 
     gold = spark.sql(GOLD_TRANSFORM_SQL)
 
@@ -52,7 +39,7 @@ def main():
         .start(GOLD_PATH)
     )
 
-    print(f"[gold] Streaming {SILVER_PATH} -> {GOLD_PATH}")
+    print(f"[gold] Streaming {SILVER2_PATH} -> {GOLD_PATH}")
     query.awaitTermination()
 
 

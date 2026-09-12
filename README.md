@@ -1,24 +1,26 @@
-# Self-healing pipeline — Bronze/Silver/Gold starter
+# Self-healing pipeline — Bronze/Silver1/Silver2/Gold Lakehouse
 
-Kafka → three Spark Structured Streaming jobs (Bronze, Silver, Gold) → Delta
+Kafka → Spark Structured Streaming jobs (Bronze, Silver1, Silver2, Gold) → Delta
 Lake, running as a multi-hop pipeline: each layer streams from the previous
-layer's Delta table, the same pattern real Lakehouses use. Ships with a
-small bundled mock dataset so it runs immediately with no download step.
+layer's Delta table, following the Medallion Lakehouse pattern.
 
 ```
 producer --> kafka --> bronze-job --> delta/bronze
                                           |
                                           v
-                                     silver-job --> delta/silver
-                                                        |
-                                                        v
-                                                   gold-job --> delta/gold
+                                     silver1-job --> delta/silver1 (Format & Cleaning)
+                                                         |
+                                                         v
+                                                    silver2-job --> delta/silver2 (Standardization)
+                                                                        |
+                                                                        v
+                                                                    gold-job --> delta/gold (Analytics)
 ```
 
 ## Prerequisites
 
 - Docker + Docker Compose v2
-- ~6-8 GB RAM free (Kafka + three separate Spark JVMs, one per layer)
+- ~6-8 GB RAM free (Kafka + Spark JVMs, one per layer)
 
 ## Setup
 
@@ -38,47 +40,41 @@ jars get pulled). Subsequent runs are fast.
 - **Kafka UI** — http://localhost:8080 — browse `crashes.crash1`, `crashes.crash2`, `crashes.crash3`
 - **Producer logs** — `[Crash1] Batch N: published 50 rows to 'crashes.crash1'`
 - **bronze-job logs** — prints subscribed topics and streams micro-batches into `delta/bronze`
+- **silver1-job logs** — unpacks JSON into 49 fields and runs formatting/cleaning SQL -> `delta/silver1`
+- **silver2-job logs** — streams from Silver 1 and applies standardization SQL -> `delta/silver2`
+- **gold-job logs** — streams from Silver 2 into business-ready table -> `delta/gold`
 
 ## Verify data landed, from the host (no Spark needed)
 
 ```bash
 pip install deltalake pandas
 python verify_delta.py bronze
-python verify_delta.py silver_cars
-python verify_delta.py gold_car_overview
+python verify_delta.py silver1
+python verify_delta.py silver2
+python verify_delta.py gold
 ```
-
-`silver_cars` should show parsed numeric fields (`horsepower_hp`,
-`price_usd`, `powertrain_type`, ...) instead of raw strings — including one
-row (Ford F-150) with `price_usd = NULL`, since its source value was the
-deliberately-messy `"unknown"`, proving the transform nulls out cleanly
-instead of crashing the batch.
 
 To stop: `docker compose down`. To wipe all state and start clean:
 `docker compose down && rm -rf delta checkpoints`.
 
 ## What's in each piece
 
-- **`producer/`** — reads a CSV (schema-agnostic), publishes rows to Kafka
-  in small batches on an interval, wrapped in an envelope
-  (`record_id`, `batch_id`, `ingestion_ts`, `payload`). Unchanged from
-  before -- doesn't know or care what columns exist.
+- **`producer/`** — reads partitioned CSVs, publishes rows to Kafka
+  in batches on an interval, wrapped in an envelope
+  (`record_id`, `batch_id`, `table_name`, `ingestion_ts`, `payload`, `**row`).
 - **`spark-jobs/common.py`** — shared Spark session builder and a
-  wait-for-upstream-table guard, used by all three jobs below.
-- **`spark-jobs/bronze_job.py`** — Kafka → Delta, untouched. Raw string
-  values plus Kafka's own metadata. No parsing.
-- **`spark-jobs/silver_job.py`** — the file to edit. `PAYLOAD_SCHEMA` at
-  the top defines what the JSON payload looks like (matches the mock
-  CSV's header exactly); `SILVER_TRANSFORM_SQL` is one plain SQL string
-  that does the actual cleaning, run via `spark.sql(...)`.
-- **`spark-jobs/gold_job.py`** — also editable SQL (`GOLD_TRANSFORM_SQL`).
-  Currently a plain `SELECT` from Silver; the comment marks exactly where
-  a join against a second Silver table goes later.
-- **`delta/{bronze,silver_cars,gold_car_overview}`** — the three tables.
+  wait-for-upstream-table guard, used by all jobs.
+- **`spark-jobs/bronze_job.py`** — Kafka → Delta, untouched raw landing. Raw string
+  values plus Kafka's own metadata.
+- **`spark-jobs/silver1_job.py`** — Bronze → Silver 1. Unpacks JSON envelope and
+  provides `SILVER1_TRANSFORM_SQL` for formatting and cleaning.
+- **`spark-jobs/silver2_job.py`** — Silver 1 → Silver 2. Provides
+  `SILVER2_TRANSFORM_SQL` for data standardization.
+- **`spark-jobs/gold_job.py`** — Silver 2 → Gold. Provides
+  `GOLD_TRANSFORM_SQL` for business-ready fields and metrics.
+- **`delta/{bronze,silver1,silver2,gold}`** — the four Lakehouse tables.
   Inspect with `verify_delta.py`.
 - **`checkpoints/`** — Structured Streaming's checkpoint state per job.
-  Don't hand-edit; delete the relevant subfolder for a clean restart of
-  just that layer.
 
 ## Swapping in the real dataset later
 

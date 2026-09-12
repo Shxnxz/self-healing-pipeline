@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # All three layer jobs live in this one image. docker-compose picks which
 # script to run per service via `command:`.
-COPY common.py bronze_job.py silver_job.py gold_job.py ./
+COPY common.py bronze_job.py silver1_job.py silver2_job.py gold_job.py ./
 
 # Overridden per-service in docker-compose.yml.
 CMD ["python", "bronze_job.py"]
