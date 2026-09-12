@@ -34,6 +34,7 @@ def main():
 
     query = (
         gold.writeStream.format("delta")
+        .trigger(processingTime="10 seconds")
         .option("checkpointLocation", CHECKPOINT_PATH)
         .outputMode("append")
         .start(GOLD_PATH)

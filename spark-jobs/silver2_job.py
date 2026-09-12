@@ -34,6 +34,7 @@ def main():
 
     query = (
         silver2.writeStream.format("delta")
+        .trigger(processingTime="10 seconds")
         .option("checkpointLocation", CHECKPOINT_PATH)
         .outputMode("append")
         .start(SILVER2_PATH)

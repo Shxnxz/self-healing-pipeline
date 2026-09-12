@@ -176,6 +176,7 @@ def main():
 
     query = (
         silver1.writeStream.format("delta")
+        .trigger(processingTime="10 seconds")
         .option("checkpointLocation", CHECKPOINT_PATH)
         .outputMode("append")
         .start(SILVER1_PATH)

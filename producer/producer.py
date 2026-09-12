@@ -34,7 +34,7 @@ KAFKA_TOPIC_PREFIX = os.environ.get("KAFKA_TOPIC_PREFIX", "crashes")
 TOPIC_PER_TABLE = os.environ.get("TOPIC_PER_TABLE", "true").lower() == "true"
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "crashes.raw")
 
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2000"))
 BATCH_INTERVAL_SECONDS = float(os.environ.get("BATCH_INTERVAL_SECONDS", "3"))
 LOOP_FOREVER = os.environ.get("LOOP_FOREVER", "true").lower() == "true"
 STREAMING_MODE = os.environ.get("STREAMING_MODE", "interleaved").lower()

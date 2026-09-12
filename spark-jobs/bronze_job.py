@@ -46,6 +46,7 @@ def main():
 
     query = (
         landed.writeStream.format("delta")
+        .trigger(processingTime="10 seconds") #Stop RAM from exploding
         .option("checkpointLocation", CHECKPOINT_PATH)
         .outputMode("append")
         .start(DELTA_TABLE_PATH)
