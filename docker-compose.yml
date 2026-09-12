@@ -42,21 +42,22 @@ services:
         condition: service_healthy
 
   # --- Producer -------------------------------------------------------
-  # Replays a CSV as if it were a live feed. Points at the bundled mock
-  # dataset by default -- swap CSV_PATH (and the mounted file) to point at
-  # the real dataset later, no code changes needed here.
+  # Replays partitioned CSV tables as live feeds into Kafka.
   producer:
     build: ./producer
     container_name: producer
     volumes:
       - ./data:/data:ro
     environment:
-      CSV_PATH: /data/mock_cars.csv
+      DATA_DIR: /data
+      TABLES: Crash1,Crash2,Crash3
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TOPIC: cars.raw
-      BATCH_SIZE: "5"
-      BATCH_INTERVAL_SECONDS: "5"
+      KAFKA_TOPIC_PREFIX: crashes
+      TOPIC_PER_TABLE: "true"
+      BATCH_SIZE: "50"
+      BATCH_INTERVAL_SECONDS: "3"
       LOOP_FOREVER: "true"
+      STREAMING_MODE: "interleaved"
     depends_on:
       kafka:
         condition: service_healthy
@@ -72,7 +73,7 @@ services:
       - ./checkpoints:/data/checkpoints
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TOPIC: cars.raw
+      KAFKA_TOPICS: crashes.crash1,crashes.crash2,crashes.crash3
       DELTA_TABLE_PATH: /data/delta/bronze
       CHECKPOINT_PATH: /data/checkpoints/bronze
     depends_on:

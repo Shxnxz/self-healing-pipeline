@@ -26,19 +26,18 @@ producer --> kafka --> bronze-job --> delta/bronze
 docker compose up --build
 ```
 
-That's it — no dataset to download. The producer replays the bundled
-`data/mock_cars.csv` (15 rows, using the real dataset's exact column
-names) through Kafka into Bronze, Silver, and Gold automatically.
+The producer replays the partitioned datasets (`data/Crash1`, `data/Crash2`,
+`data/Crash3`) across their respective parts through Kafka topics (`crashes.crash1`,
+`crashes.crash2`, `crashes.crash3`) into Bronze automatically.
 
 First run takes a minute or two (Spark images install a JVM, connector
 jars get pulled). Subsequent runs are fast.
 
 ## Watch it work
 
-- **Kafka UI** — http://localhost:8080 — browse the `cars.raw` topic
-- **Producer logs** — `Batch N: published 5 rows to 'cars.raw'` every 5s
-- **bronze-job / silver-job / gold-job logs** — each prints its source and
-  destination path once, then streams silently as micro-batches arrive
+- **Kafka UI** — http://localhost:8080 — browse `crashes.crash1`, `crashes.crash2`, `crashes.crash3`
+- **Producer logs** — `[Crash1] Batch N: published 50 rows to 'crashes.crash1'`
+- **bronze-job logs** — prints subscribed topics and streams micro-batches into `delta/bronze`
 
 ## Verify data landed, from the host (no Spark needed)
 
