@@ -56,7 +56,7 @@ services:
       TOPIC_PER_TABLE: "true"
       BATCH_SIZE: "50"
       BATCH_INTERVAL_SECONDS: "3"
-      LOOP_FOREVER: "true"
+      LOOP_FOREVER: "false"
       STREAMING_MODE: "interleaved"
     depends_on:
       kafka:
