@@ -1,0 +1,47 @@
+{
+  "suite_name": "bronze_cars_suite",
+  "rules": [
+    {
+      "rule_type": "required_column",
+      "column": "Company Names"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "Cars Names"
+    },
+    {
+      "rule_type": "not_null",
+      "column": "Company Names"
+    },
+    {
+      "rule_type": "not_null",
+      "column": "Cars Names"
+    },
+    {
+      "rule_type": "not_null",
+      "column": "Cars Prices"
+    },
+    {
+      "rule_type": "allowed_values",
+      "column": "Fuel Types",
+      "value_set": [
+        "Petrol",
+        "Diesel",
+        "Electric",
+        "Hybrid",
+        "Plug-in Hybrid"
+      ]
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "Seats",
+      "min_value": 1,
+      "max_value": 12
+    },
+    {
+      "rule_type": "row_count",
+      "min_value": 1,
+      "max_value": 1000
+    }
+  ]
+}

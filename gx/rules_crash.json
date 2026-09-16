@@ -1,0 +1,182 @@
+{
+  "suite_name": "bronze_crash_suite",
+  "rules": [
+    {
+      "rule_type": "required_column",
+      "column": "crash_record_id"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "crash_date"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "posted_speed_limit"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "date_police_notified"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "crash_month"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "crash_hour"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "crash_day_of_week"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "weather_condition"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "lighting_condition"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "latitude"
+    },
+    {
+      "rule_type": "required_column",
+      "column": "longitude"
+    },
+    {
+      "rule_type": "not_null",
+      "column": "crash_record_id"
+    },
+    {
+      "rule_type": "not_null",
+      "column": "crash_date"
+    },
+    {
+      "rule_type": "not_null",
+      "column": "posted_speed_limit"
+    },
+    {
+      "rule_type": "unique",
+      "column": "crash_record_id"
+    },
+    {
+      "rule_type": "regex",
+      "column": "crash_date",
+      "regex": "^\\d{4}-\\d{2}-\\d{2}(?:T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?)?$"
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "posted_speed_limit",
+      "min_value": 0,
+      "max_value": 85
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "crash_month",
+      "min_value": 1,
+      "max_value": 12
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "crash_hour",
+      "min_value": 0,
+      "max_value": 23
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "crash_day_of_week",
+      "min_value": 1,
+      "max_value": 7
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "injuries_total",
+      "min_value": 0,
+      "max_value": 100
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "latitude",
+      "min_value": 41.0,
+      "max_value": 43.0
+    },
+    {
+      "rule_type": "numeric_range",
+      "column": "longitude",
+      "min_value": -88.5,
+      "max_value": -87.0
+    },
+    {
+      "rule_type": "allowed_values",
+      "column": "street_direction",
+      "value_set": [
+        "N",
+        "S",
+        "E",
+        "W",
+        "NOR",
+        "SOU",
+        "EAS",
+        "WES",
+        "North",
+        "South",
+        "East",
+        "West"
+      ]
+    },
+    {
+      "rule_type": "allowed_values",
+      "column": "lighting_condition",
+      "value_set": [
+        "DAYLIGHT",
+        "DARKNESS, LIGHTED ROAD",
+        "DARKNESS",
+        "DAWN",
+        "DUSK",
+        "UNKNOWN",
+        "Day",
+        "Night with Light",
+        "Night, Lighted",
+        "Night",
+        "Morning",
+        "Not Known",
+        "D"
+      ]
+    },
+    {
+      "rule_type": "allowed_values",
+      "column": "weather_condition",
+      "value_set": [
+        "CLEAR",
+        "Clear Weather",
+        "Clear",
+        "RAIN",
+        "Rain",
+        "SNOW",
+        "Snow",
+        "CLOUDY/OVERCAST",
+        "Cloudy/Overcast",
+        "FOG/SMOKE/HAZE",
+        "Fog/Smoke/Haze",
+        "FREEZING RAIN/DRIZZLE",
+        "Freezing Rain/Drizzle",
+        "SEVERE CROSS-WIND GATE",
+        "Severe Cross-Wind Gate",
+        "BLOWING SAND, SOIL, DIRT",
+        "Blowing Sand, Soil, Dirt",
+        "OTHER",
+        "Other",
+        "UNKNOWN",
+        "Unknown",
+        "Not Known"
+      ]
+    },
+    {
+      "rule_type": "row_count",
+      "min_value": 1,
+      "max_value": 50000
+    }
+  ]
+}
