@@ -20,6 +20,9 @@ TABLES = {
     "bronze": "./delta/bronze",
     "silver1": "./delta/silver1",
     "silver2": "./delta/silver2",
+    "silver2_quarantine": "./delta/silver2_quarantine",
+    "quarantine": "./delta/silver2_quarantine",
+    "ref_mappings": "./delta/ref_canonical_mappings",
     "gold": "./delta/gold",
     # Legacy aliases
     "silver_cars": "./delta/silver_cars",

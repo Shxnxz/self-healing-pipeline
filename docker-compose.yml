@@ -98,7 +98,7 @@ services:
         condition: service_started
 
   # --- Silver 2 -----------------------------------------------------
-  # Silver 1 -> standardized via SILVER2_TRANSFORM_SQL.
+  # Silver 1 -> standardized via PySpark canonical lookups & parsing chains.
   silver2-job:
     build: ./spark-jobs
     container_name: silver2-job
@@ -110,6 +110,8 @@ services:
       SILVER1_PATH: /data/delta/silver1
       SILVER2_PATH: /data/delta/silver2
       CHECKPOINT_PATH: /data/checkpoints/silver2
+      QUARANTINE_PATH: /data/delta/silver2_quarantine
+      REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
     depends_on:
       silver1-job:
         condition: service_started

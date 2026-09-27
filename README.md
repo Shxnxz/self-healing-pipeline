@@ -51,6 +51,8 @@ pip install deltalake pandas
 python verify_delta.py bronze
 python verify_delta.py silver1
 python verify_delta.py silver2
+python verify_delta.py silver2_quarantine
+python verify_delta.py ref_mappings
 python verify_delta.py gold
 ```
 

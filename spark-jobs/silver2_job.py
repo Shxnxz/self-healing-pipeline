@@ -1,227 +1,295 @@
 """
-Silver 2: Data standardization via SQL.
+Silver 2: Data standardization via pure PySpark Structured Streaming.
 
-Reads from Silver 1's cleaned Delta table, registers a temp view 'silver1',
-and runs SILVER2_TRANSFORM_SQL for data standardization.
+Reads from Silver 1's cleaned Delta table, applies canonical lookup mappings
+and native date/numeric parsing chains, isolates failed records into a
+physically separate Quarantine table, and appends valid records to Silver 2.
 """
 
 import os
+from itertools import chain
+from typing import Dict
+
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    DecimalType,
+    IntegerType,
+    StringType,
+)
 
 from common import build_spark, wait_for_delta_table
+from ref_mappings import init_ref_mappings, load_mappings_dict
 
 SILVER1_PATH = os.environ.get("SILVER1_PATH", "/data/delta/silver1")
 SILVER2_PATH = os.environ.get("SILVER2_PATH", "/data/delta/silver2")
-CHECKPOINT_PATH = os.environ.get(
-    "CHECKPOINT_PATH", "/data/checkpoints/silver2"
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints/silver2")
+QUARANTINE_PATH = os.environ.get("QUARANTINE_PATH", "/data/delta/silver2_quarantine")
+REF_MAPPINGS_PATH = os.environ.get(
+    "REF_MAPPINGS_PATH", "/data/delta/ref_canonical_mappings"
 )
 
-# SQL for Silver 2 (Data Standardization).
-# Modify this query to apply standardization rules across sources.
-SILVER2_TRANSFORM_SQL = """
-SELECT
-    record_id,
-    batch_id,
-    table_name,
-    ingestion_ts,
-    topic,
-    kafka_timestamp,
-    crash_record_id,
+# Supported additive date format strings
+DATE_FORMATS = [
+    "yyyy-MM-dd",
+    "yyyy-MM-dd'T'HH:mm:ss",
+    "yyyy-MM-dd'T'HH:mm:ss.SSS",
+    "yyyy/MM/dd",
+    "yyyy/MM/dd HH:mm:ss",
+    "dd/MM/yyyy",
+    "MM/dd/yyyy",
+    "MM/dd/yyyy HH:mm:ss",
+    "yyyy-MM-dd HH:mm:ss",
+    "dd-MM-yyyy",
+    "yyyyMMdd",
+]
 
-    CASE
-        WHEN crash_date LIKE '____-__-__T%' 
-            THEN SUBSTRING(crash_date, 1, 10)
-        WHEN crash_date LIKE '____/__/__%' 
-            THEN REPLACE(SUBSTRING(crash_date, 1, 10), '/', '-')
-        WHEN crash_date LIKE '____-__-__' 
-            THEN crash_date
-        WHEN crash_date LIKE '__/__/____' 
-            THEN SUBSTRING(crash_date, 7, 4) || '-' || SUBSTRING(crash_date, 4, 2) || '-' || SUBSTRING(crash_date, 1, 2)
-        WHEN crash_date LIKE '__/__/____ %' 
-            THEN SUBSTRING(crash_date, 7, 4) || '-' || SUBSTRING(crash_date, 1, 2) || '-' || SUBSTRING(crash_date, 4, 2)
-        ELSE crash_date
-    END AS crash_date,
+# Supported additive timestamp format strings
+TIMESTAMP_FORMATS = [
+    "yyyy-MM-dd'T'HH:mm:ss",
+    "yyyy-MM-dd'T'HH:mm:ss.SSS",
+    "yyyy-MM-dd HH:mm:ss",
+    "yyyy-MM-dd",
+    "MM/dd/yyyy HH:mm:ss",
+    "MM/dd/yyyy hh:mm:ss a",
+    "MM/dd/yyyy",
+    "yyyy/MM/dd HH:mm:ss",
+]
 
-    posted_speed_limit,
-    traffic_control_device,
-    device_condition,
 
-    CASE 
-        WHEN weather_condition IN ('CLEAR', 'C', 'Clear', 'Clear Weather') 
-            THEN 'CLEAR'
-        WHEN weather_condition IN ('RAIN', 'R', 'Rain', 'Rainy') 
-            THEN 'RAIN'
-        WHEN weather_condition IN ('UNKNOWN', 'U', 'Unknown', 'Not Known') 
-            THEN 'UNKNOWN'
-        WHEN weather_condition IN ('CLOUDY/OVERCAST', 'O', 'Overcast', 'Cloudy') 
-            THEN 'CLOUDY'
-        ELSE weather_condition
-    END AS weather_condition,
+def _build_map_expr(field_name: str, mapping_dict: Dict[str, Dict[str, str]]):
+    """Create a Catalyst create_map expression for a given categorical field."""
+    field_map = mapping_dict.get(field_name, {})
+    if not field_map:
+        return F.lit(None).cast(StringType())
+    return F.create_map([F.lit(x) for x in chain(*field_map.items())])[
+        F.upper(F.trim(F.col(field_name)))
+    ]
 
-    CASE 
-        WHEN lighting_condition IN ('DAYLIGHT', 'D', 'Daylight', 'Morning', 'Day') 
-            THEN 'DAYLIGHT'
-        WHEN lighting_condition IN ('DARKNESS, LIGHTED ROAD', 'N, L', 'Darkness, Lighted Road', 'Night, Lighted', 'Night with Light') 
-            THEN 'DARKNESS, LIGHTED ROAD'
-        WHEN lighting_condition IN ('DARKNESS', 'N', 'Darkness', 'Night') 
-            THEN 'DARKNESS'
-        WHEN lighting_condition IN ('UNKNOWN', 'U', 'Not Known') 
-            THEN 'UNKNOWN'
-        ELSE lighting_condition
-    END AS lighting_condition,
 
-    first_crash_type,
-    trafficway_type,
-    alignment,
-    roadway_surface_cond,
-    road_defect,
-    report_type,
-    crash_type,
-    private_property_i,
+def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) -> DataFrame:
+    """
+    Apply native PySpark parsing chains and canonical reference lookups.
+    Tracks all mapping and parsing failures in `unmapped_payload`.
+    """
+    # 1. Native Date Parsing Chain (try_to_timestamp avoids parser policy exceptions)
+    parsed_crash_date = F.coalesce(
+        *[F.to_date(F.expr(f"try_to_timestamp(crash_date, \"{fmt}\")")) for fmt in DATE_FORMATS]
+    )
+    std_crash_date = F.date_format(parsed_crash_date, "yyyy-MM-dd")
 
-    CASE 
-        WHEN hit_and_run_i IN ('Y', 'TRUE', 'Yes', 'right') 
-            THEN 'Y'
-        WHEN hit_and_run_i IN ('N', 'FALSE', 'No', 'wrong') 
-            THEN 'N'
-        ELSE NULL
-    END AS hit_and_run_i,
+    # 2. Native Timestamp Parsing Chain for date_police_notified
+    parsed_police_ts = F.coalesce(
+        *[F.expr(f"try_to_timestamp(date_police_notified, \"{fmt}\")") for fmt in TIMESTAMP_FORMATS]
+    )
+    std_date_police_notified = F.date_format(parsed_police_ts, "yyyy-MM-dd HH:mm:ss")
 
-    CASE 
-        WHEN damage IN ('OVER $1,500', '> $1500', 'HIGH') 
-            THEN 'OVER $1,500'
-        WHEN damage IN ('$501 - $1,500', '$501 - $1500', 'MEDIUM') 
-            THEN '$501 - $1,500'
-        WHEN damage IN ('$500 OR LESS', '<= $500', '≤ $500', 'LOW') 
-            THEN '$500 OR LESS'
-        ELSE damage
-    END AS damage,
+    # 3. Categorical Fields via Reference Mapping Table
+    std_weather = _build_map_expr("weather_condition", mapping_dict)
+    std_lighting = _build_map_expr("lighting_condition", mapping_dict)
+    std_damage = _build_map_expr("damage", mapping_dict)
+    std_street_direction = _build_map_expr("street_direction", mapping_dict)
+    std_hit_and_run = _build_map_expr("hit_and_run_i", mapping_dict)
 
-    date_police_notified,
-    prim_contributory_cause,
-    sec_contributory_cause,
-    street_no,
+    # 4. Numeric & Time Parsing
+    # crash_hour: ref lookup, 12h/24h timestamp parse, or direct integer cast
+    hour_from_ref = _build_map_expr("crash_hour", mapping_dict)
+    hour_from_ts = F.hour(
+        F.coalesce(
+            F.expr("try_to_timestamp(crash_hour, 'h a')"),
+            F.expr("try_to_timestamp(crash_hour, 'hh a')"),
+            F.expr("try_to_timestamp(crash_hour, 'HH:mm')"),
+            F.expr("try_to_timestamp(crash_hour, 'h:mm a')"),
+        )
+    )
+    hour_from_cast = F.expr("try_cast(crash_hour as int)")
+    candidate_hour = F.coalesce(hour_from_ref.cast(IntegerType()), hour_from_ts, hour_from_cast)
+    std_crash_hour = F.when(candidate_hour.between(0, 23), candidate_hour).otherwise(None)
 
-    CASE 
-        WHEN street_direction IN ('S', 'South', 'SOU') THEN 'S'
-        WHEN street_direction IN ('N', 'North', 'NOR') THEN 'N'
-        WHEN street_direction IN ('E', 'East', 'EAS')  THEN 'E'
-        WHEN street_direction IN ('W', 'West', 'WES')  THEN 'W'
-        ELSE street_direction
-    END AS street_direction,
+    # crash_month: ref lookup, month name timestamp parse, or direct integer cast
+    month_from_ref = _build_map_expr("crash_month", mapping_dict)
+    month_from_ts = F.month(
+        F.coalesce(
+            F.expr("try_to_timestamp(crash_month, 'MMMM')"),
+            F.expr("try_to_timestamp(crash_month, 'MMM')"),
+        )
+    )
+    month_from_cast = F.expr("try_cast(crash_month as int)")
+    candidate_month = F.coalesce(month_from_ref.cast(IntegerType()), month_from_ts, month_from_cast)
+    std_crash_month = F.when(candidate_month.between(1, 12), candidate_month).otherwise(None)
 
-    street_name,
-    beat_of_occurrence,
+    # crash_day_of_week: ref lookup or direct integer cast
+    day_from_ref = _build_map_expr("crash_day_of_week", mapping_dict)
+    day_from_cast = F.expr("try_cast(crash_day_of_week as int)")
+    candidate_day = F.coalesce(day_from_ref.cast(IntegerType()), day_from_cast)
+    std_crash_day_of_week = F.when(candidate_day.between(1, 7), candidate_day).otherwise(None)
 
-    CASE 
-        WHEN num_units IN ('1', '1.0', 'one', '1 units')   THEN 1.0
-        WHEN num_units IN ('2', '2.0', 'two', '2 units')   THEN 2.0
-        WHEN num_units IN ('3', '3.0', 'three', '3 units') THEN 3.0
-        WHEN num_units IN ('4', '4.0', 'four', '4 units')  THEN 4.0
-        WHEN num_units IN ('5', '5.0', 'five', '5 units')  THEN 5.0
-        WHEN num_units IN ('6', '6.0', 'six', '6 units')   THEN 6.0
-        ELSE CAST(num_units AS DECIMAL(10,1))
-    END AS num_units,
+    # num_units: ref lookup for words ('one' -> 1.0) or regex numeric extract
+    units_from_ref = _build_map_expr("num_units", mapping_dict)
+    units_from_regex = F.expr("try_cast(regexp_extract(num_units, '(\\\\d+(\\\\.\\\\d+)?)', 1) as decimal(10,1))")
+    std_num_units = F.coalesce(units_from_ref.cast(DecimalType(10, 1)), units_from_regex)
 
-    CASE 
-        WHEN crash_month IN ('1', 'January', 'Jan', 'Ja')   THEN 1
-        WHEN crash_month IN ('2', 'February', 'Feb', 'Fe')  THEN 2
-        WHEN crash_month IN ('3', 'March', 'Mar', 'Ma')     THEN 3
-        WHEN crash_month IN ('4', 'April', 'Apr', 'Ap')     THEN 4
-        WHEN crash_month IN ('5', 'May', 'My')              THEN 5
-        WHEN crash_month IN ('6', 'June', 'Jun', 'Ju')      THEN 6
-        WHEN crash_month IN ('7', 'July', 'Jul', 'Jl')      THEN 7
-        WHEN crash_month IN ('8', 'August', 'Aug', 'Au')    THEN 8
-        WHEN crash_month IN ('9', 'September', 'Sep', 'Se') THEN 9
-        WHEN crash_month IN ('10', 'October', 'Oct', 'Oc')  THEN 10
-        WHEN crash_month IN ('11', 'November', 'Nov', 'No') THEN 11
-        WHEN crash_month IN ('12', 'December', 'Dec', 'De') THEN 12
-        ELSE CAST(crash_month AS INTEGER)
-    END AS crash_month,
+    # posted_speed_limit: regex numeric extract
+    std_posted_speed_limit = F.expr("try_cast(regexp_extract(posted_speed_limit, '(\\\\d+)', 1) as int)")
 
-    most_severe_injury,
-    injuries_total,
-    injuries_fatal,
-    injuries_incapacitating,
-    injuries_non_incapacitating,
-    injuries_reported_not_evident,
-    injuries_no_indication,
-    injuries_unknown,
+    # 5. Multi-field Failure Tracking into unmapped_payload
+    # Format: { field_name: (raw_col, std_col, is_mandatory) }
+    tracked_fields = {
+        "crash_date": (F.col("crash_date"), std_crash_date, True),
+        "weather_condition": (F.col("weather_condition"), std_weather, False),
+        "lighting_condition": (F.col("lighting_condition"), std_lighting, False),
+        "hit_and_run_i": (F.col("hit_and_run_i"), std_hit_and_run, False),
+        "damage": (F.col("damage"), std_damage, False),
+        "street_direction": (F.col("street_direction"), std_street_direction, False),
+        "num_units": (F.col("num_units"), std_num_units, False),
+        "crash_month": (F.col("crash_month"), std_crash_month, False),
+        "crash_hour": (F.col("crash_hour"), std_crash_hour, False),
+        "crash_day_of_week": (F.col("crash_day_of_week"), std_crash_day_of_week, False),
+        "date_police_notified": (F.col("date_police_notified"), std_date_police_notified, False),
+        "posted_speed_limit": (F.col("posted_speed_limit"), std_posted_speed_limit, False),
+    }
 
-    CASE 
-        WHEN crash_hour IN ('0', '00:00', '12 AM')              THEN 0
-        WHEN crash_hour IN ('1', '01:00', '1 AM', '01 AM')      THEN 1
-        WHEN crash_hour IN ('2', '02:00', '2 AM', '02 AM')      THEN 2
-        WHEN crash_hour IN ('3', '03:00', '3 AM', '03 AM')      THEN 3
-        WHEN crash_hour IN ('4', '04:00', '4 AM', '04 AM')      THEN 4
-        WHEN crash_hour IN ('5', '05:00', '5 AM', '05 AM')      THEN 5
-        WHEN crash_hour IN ('6', '06:00', '6 AM', '06 AM')      THEN 6
-        WHEN crash_hour IN ('7', '07:00', '7 AM', '07 AM')      THEN 7
-        WHEN crash_hour IN ('8', '08:00', '8 AM', '08 AM')      THEN 8
-        WHEN crash_hour IN ('9', '09:00', '9 AM', '09 AM')      THEN 9
-        WHEN crash_hour IN ('10', '10:00', '10 AM')             THEN 10
-        WHEN crash_hour IN ('11', '11:00', '11 AM')             THEN 11
-        WHEN crash_hour IN ('12', '12:00', '12 PM')             THEN 12
-        WHEN crash_hour IN ('13', '13:00', '1 PM', '01 PM')     THEN 13
-        WHEN crash_hour IN ('14', '14:00', '2 PM', '02 PM')     THEN 14
-        WHEN crash_hour IN ('15', '15:00', '3 PM', '03 PM')     THEN 15
-        WHEN crash_hour IN ('16', '16:00', '4 PM', '04 PM')     THEN 16
-        WHEN crash_hour IN ('17', '17:00', '5 PM', '05 PM')     THEN 17
-        WHEN crash_hour IN ('18', '18:00', '6 PM', '06 PM')     THEN 18
-        WHEN crash_hour IN ('19', '19:00', '7 PM', '07 PM')     THEN 19
-        WHEN crash_hour IN ('20', '20:00', '8 PM', '08 PM')     THEN 20
-        WHEN crash_hour IN ('21', '21:00', '9 PM', '09 PM')     THEN 21
-        WHEN crash_hour IN ('22', '22:00', '10 PM')             THEN 22
-        WHEN crash_hour IN ('23', '23:00', '11 PM')             THEN 23
-        ELSE CAST(crash_hour AS INTEGER)
-    END AS crash_hour,
+    failure_structs = []
+    for name, (raw_col, std_col, mandatory) in tracked_fields.items():
+        if mandatory:
+            # Fatal if standardized value is null
+            cond = std_col.isNull()
+            val = F.coalesce(raw_col, F.lit("MISSING_MANDATORY_VALUE"))
+        else:
+            # Failure if raw input existed but could not be parsed/mapped
+            cond = raw_col.isNotNull() & (F.trim(raw_col) != "") & std_col.isNull()
+            val = raw_col.cast(StringType())
 
-    CASE 
-        WHEN crash_day_of_week IN ('1', 'Sunday', 'Sun', 'Su')       THEN 1
-        WHEN crash_day_of_week IN ('2', 'Monday', 'Mon', 'Mo')       THEN 2
-        WHEN crash_day_of_week IN ('3', 'Tuesday', 'Tue', 'Tu')      THEN 3
-        WHEN crash_day_of_week IN ('4', 'Wednesday', 'Wed', 'We')    THEN 4
-        WHEN crash_day_of_week IN ('5', 'Thursday', 'Thu', 'Th')     THEN 5
-        WHEN crash_day_of_week IN ('6', 'Friday', 'Fri', 'Fr')       THEN 6
-        WHEN crash_day_of_week IN ('7', 'Saturday', 'Sat', 'Sa')     THEN 7
-        ELSE CAST(crash_day_of_week AS INTEGER)
-    END AS crash_day_of_week,
+        failure_structs.append(
+            F.when(cond, F.struct(F.lit(name).alias("key"), val.alias("val"))).otherwise(None)
+        )
 
-    idot_control_no,
-    latitude,
-    longitude,
-    location,
-    intersection_related_i,
-    crash_date_est_i,
-    photos_taken_i,
-    statements_taken_i,
-    work_zone_i,
-    work_zone_type,
-    lane_cnt,
-    workers_present_i,
-    dooring_i
-FROM silver1
-"""
+    unmapped_payload = F.map_from_entries(F.array_compact(F.array(*failure_structs)))
+
+    # 6. Project standardized columns (exact 55 Silver columns + unmapped_payload)
+    return df.select(
+        F.col("record_id"),
+        F.col("batch_id"),
+        F.col("table_name"),
+        F.col("ingestion_ts"),
+        F.col("topic"),
+        F.col("kafka_timestamp"),
+        F.col("crash_record_id"),
+        std_crash_date.alias("crash_date"),
+        std_posted_speed_limit.alias("posted_speed_limit"),
+        F.col("traffic_control_device"),
+        F.col("device_condition"),
+        std_weather.alias("weather_condition"),
+        std_lighting.alias("lighting_condition"),
+        F.col("first_crash_type"),
+        F.col("trafficway_type"),
+        F.col("alignment"),
+        F.col("roadway_surface_cond"),
+        F.col("road_defect"),
+        F.col("report_type"),
+        F.col("crash_type"),
+        F.col("private_property_i"),
+        std_hit_and_run.alias("hit_and_run_i"),
+        std_damage.alias("damage"),
+        std_date_police_notified.alias("date_police_notified"),
+        F.col("prim_contributory_cause"),
+        F.col("sec_contributory_cause"),
+        F.col("street_no"),
+        std_street_direction.alias("street_direction"),
+        F.col("street_name"),
+        F.col("beat_of_occurrence"),
+        std_num_units.alias("num_units"),
+        std_crash_month.alias("crash_month"),
+        F.col("most_severe_injury"),
+        F.col("injuries_total"),
+        F.col("injuries_fatal"),
+        F.col("injuries_incapacitating"),
+        F.col("injuries_non_incapacitating"),
+        F.col("injuries_reported_not_evident"),
+        F.col("injuries_no_indication"),
+        F.col("injuries_unknown"),
+        std_crash_hour.alias("crash_hour"),
+        std_crash_day_of_week.alias("crash_day_of_week"),
+        F.col("idot_control_no"),
+        F.col("latitude"),
+        F.col("longitude"),
+        F.col("location"),
+        F.col("intersection_related_i"),
+        F.col("crash_date_est_i"),
+        F.col("photos_taken_i"),
+        F.col("statements_taken_i"),
+        F.col("work_zone_i"),
+        F.col("work_zone_type"),
+        F.col("lane_cnt"),
+        F.col("workers_present_i"),
+        F.col("dooring_i"),
+        unmapped_payload.alias("unmapped_payload"),
+    )
+
+
+def make_batch_processor(spark: SparkSession):
+    """Returns the foreachBatch function with access to spark session."""
+
+    def process_micro_batch(batch_df: DataFrame, batch_id: int):
+        # 1. Reload the latest committed canonical mappings per micro-batch
+        mapping_dict = load_mappings_dict(spark, REF_MAPPINGS_PATH)
+
+        # 2. Apply transformations and capture failed fields
+        transformed = standardize_silver2(batch_df, mapping_dict)
+
+        # 3. Persist to avoid double evaluation across valid and quarantine splits
+        transformed.persist()
+
+        try:
+            valid_df = transformed.filter(F.size(F.col("unmapped_payload")) == 0).drop(
+                "unmapped_payload"
+            )
+            quarantine_df = transformed.filter(F.size(F.col("unmapped_payload")) > 0)
+
+            # Append clean rows to Silver 2
+            valid_df.write.format("delta").mode("append").save(SILVER2_PATH)
+
+            # Append quarantined rows with lineage metadata if any exist
+            if quarantine_df.head(1):
+                quarantine_out = (
+                    quarantine_df.withColumn("quarantined_at", F.current_timestamp())
+                    .withColumn("silver2_batch_id", F.lit(str(batch_id)))
+                    .withColumn("healing_status", F.lit("PENDING"))
+                )
+                quarantine_out.write.format("delta").mode("append").save(QUARANTINE_PATH)
+                print(
+                    f"[silver2] Batch {batch_id}: captured quarantined records at {QUARANTINE_PATH}"
+                )
+        finally:
+            transformed.unpersist()
+
+    return process_micro_batch
 
 
 def main():
     spark = build_spark("Silver2StandardizeTransform")
 
+    # Initialize reference canonical mappings if table does not exist
+    init_ref_mappings(spark, REF_MAPPINGS_PATH)
+
+    # Wait for upstream Silver 1 Delta table
     wait_for_delta_table(SILVER1_PATH)
 
     silver1_stream = spark.readStream.format("delta").load(SILVER1_PATH)
-    silver1_stream.createOrReplaceTempView("silver1")
 
-    silver2 = spark.sql(SILVER2_TRANSFORM_SQL)
+    batch_processor = make_batch_processor(spark)
 
     query = (
-        silver2.writeStream.format("delta")
+        silver1_stream.writeStream.format("delta")
         .trigger(processingTime="10 seconds")
         .option("checkpointLocation", CHECKPOINT_PATH)
-        .outputMode("append")
-        .start(SILVER2_PATH)
+        .foreachBatch(batch_processor)
+        .start()
     )
 
-    print(f"[silver2] Streaming {SILVER1_PATH} -> {SILVER2_PATH}")
+    print(
+        f"[silver2] Streaming {SILVER1_PATH} -> {SILVER2_PATH} (Quarantine: {QUARANTINE_PATH})"
+    )
     query.awaitTermination()
 
 
