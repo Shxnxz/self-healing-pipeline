@@ -23,6 +23,8 @@ TABLES = {
     "silver2_quarantine": "./delta/silver2_quarantine",
     "quarantine": "./delta/silver2_quarantine",
     "ref_mappings": "./delta/ref_canonical_mappings",
+    "fuzzy_audit": "./delta/silver2_fuzzy_audit",
+    "audit": "./delta/silver2_fuzzy_audit",
     "gold": "./delta/gold",
     # Legacy aliases
     "silver_cars": "./delta/silver_cars",
