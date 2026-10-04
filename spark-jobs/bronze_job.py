@@ -15,7 +15,10 @@ from pyspark.sql.functions import current_timestamp
 from common import build_spark
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "cars.raw")
+KAFKA_TOPICS = os.environ.get(
+    "KAFKA_TOPICS",
+    os.environ.get("KAFKA_TOPIC", "crashes.crash1,crashes.crash2,crashes.crash3"),
+)
 DELTA_TABLE_PATH = os.environ.get("DELTA_TABLE_PATH", "/data/delta/bronze")
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "/data/checkpoints/bronze")
 
@@ -26,7 +29,7 @@ def main():
     raw_stream = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
-        .option("subscribe", KAFKA_TOPIC)
+        .option("subscribe", KAFKA_TOPICS)
         .option("startingOffsets", "earliest")
         .option("failOnDataLoss", "false")
         .load()
@@ -43,12 +46,13 @@ def main():
 
     query = (
         landed.writeStream.format("delta")
+        .trigger(processingTime="10 seconds") #Stop RAM from exploding
         .option("checkpointLocation", CHECKPOINT_PATH)
         .outputMode("append")
         .start(DELTA_TABLE_PATH)
     )
 
-    print(f"[bronze] Streaming '{KAFKA_TOPIC}' -> {DELTA_TABLE_PATH}")
+    print(f"[bronze] Streaming '{KAFKA_TOPICS}' -> {DELTA_TABLE_PATH}")
     query.awaitTermination()
 
 

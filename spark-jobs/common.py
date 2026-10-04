@@ -24,6 +24,7 @@ def build_spark(app_name: str, driver_memory: str = "1g") -> SparkSession:
     builder = (
         SparkSession.builder.appName(app_name)
         .config("spark.driver.memory", driver_memory)
+        .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config(
             "spark.sql.catalog.spark_catalog",

@@ -42,21 +42,22 @@ services:
         condition: service_healthy
 
   # --- Producer -------------------------------------------------------
-  # Replays a CSV as if it were a live feed. Points at the bundled mock
-  # dataset by default -- swap CSV_PATH (and the mounted file) to point at
-  # the real dataset later, no code changes needed here.
+  # Replays partitioned CSV tables as live feeds into Kafka.
   producer:
     build: ./producer
     container_name: producer
     volumes:
       - ./data:/data:ro
     environment:
-      CSV_PATH: /data/mock_cars.csv
+      DATA_DIR: /data
+      TABLES: Crash1,Crash2,Crash3
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TOPIC: cars.raw
-      BATCH_SIZE: "5"
-      BATCH_INTERVAL_SECONDS: "5"
-      LOOP_FOREVER: "true"
+      KAFKA_TOPIC_PREFIX: crashes
+      TOPIC_PER_TABLE: "true"
+      BATCH_SIZE: "50"
+      BATCH_INTERVAL_SECONDS: "3"
+      LOOP_FOREVER: "false"
+      STREAMING_MODE: "interleaved"
     depends_on:
       kafka:
         condition: service_healthy
@@ -72,33 +73,53 @@ services:
       - ./checkpoints:/data/checkpoints
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TOPIC: cars.raw
+      KAFKA_TOPICS: crashes.crash1,crashes.crash2,crashes.crash3
       DELTA_TABLE_PATH: /data/delta/bronze
       CHECKPOINT_PATH: /data/checkpoints/bronze
     depends_on:
       kafka:
         condition: service_healthy
 
-  # --- Silver -------------------------------------------------------
-  # Bronze -> parsed/typed/cleaned, via one SQL transform.
-  silver-job:
+  # --- Silver 1 -----------------------------------------------------
+  # Bronze -> parsed/cleaned via SILVER1_TRANSFORM_SQL.
+  silver1-job:
     build: ./spark-jobs
-    container_name: silver-job
-    command: [ "python", "silver_job.py" ]
+    container_name: silver1-job
+    command: [ "python", "silver1_job.py" ]
     volumes:
       - ./delta:/data/delta
       - ./checkpoints:/data/checkpoints
     environment:
       BRONZE_PATH: /data/delta/bronze
-      SILVER_PATH: /data/delta/silver_cars
-      CHECKPOINT_PATH: /data/checkpoints/silver_cars
+      SILVER1_PATH: /data/delta/silver1
+      CHECKPOINT_PATH: /data/checkpoints/silver1
     depends_on:
       bronze-job:
         condition: service_started
 
+  # --- Silver 2 -----------------------------------------------------
+  # Silver 1 -> standardized via PySpark canonical lookups & parsing chains.
+  silver2-job:
+    build: ./spark-jobs
+    container_name: silver2-job
+    command: [ "python", "silver2_job.py" ]
+    volumes:
+      - ./delta:/data/delta
+      - ./checkpoints:/data/checkpoints
+    environment:
+      SILVER1_PATH: /data/delta/silver1
+      SILVER2_PATH: /data/delta/silver2
+      CHECKPOINT_PATH: /data/checkpoints/silver2
+      QUARANTINE_PATH: /data/delta/silver2_quarantine
+      DEAD_LETTER_PATH: /data/delta/silver2_dead_letter
+      REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
+      FUZZY_AUDIT_PATH: /data/delta/silver2_fuzzy_audit
+    depends_on:
+      silver1-job:
+        condition: service_started
+
   # --- Gold -------------------------------------------------------
-  # Silver -> business-ready fields. A plain SELECT for now; the future
-  # two-table join lands here (see gold_job.py).
+  # Silver 2 -> business-ready fields via GOLD_TRANSFORM_SQL.
   gold-job:
     build: ./spark-jobs
     container_name: gold-job
@@ -107,9 +128,9 @@ services:
       - ./delta:/data/delta
       - ./checkpoints:/data/checkpoints
     environment:
-      SILVER_PATH: /data/delta/silver_cars
-      GOLD_PATH: /data/delta/gold_car_overview
-      CHECKPOINT_PATH: /data/checkpoints/gold_car_overview
+      SILVER2_PATH: /data/delta/silver2
+      GOLD_PATH: /data/delta/gold
+      CHECKPOINT_PATH: /data/checkpoints/gold
     depends_on:
-      silver-job:
+      silver2-job:
         condition: service_started
