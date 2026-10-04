@@ -5,11 +5,10 @@ Handles seed definitions, Delta table initialization, and dictionary lookups
 for categorical standardization in Silver 2 and self-healing LLM loops.
 """
 
-import os
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DoubleType,
@@ -32,9 +31,12 @@ REF_MAPPINGS_SCHEMA = StructType(
     ]
 )
 
+# record_id lets every fuzzy correction be traced back to its Silver row
+# (and to its lineage node in Neo4j).
 FUZZY_AUDIT_SCHEMA = StructType(
     [
         StructField("field", StringType(), False),
+        StructField("record_id", StringType(), True),
         StructField("raw", StringType(), False),
         StructField("matched", StringType(), False),
         StructField("distance", IntegerType(), False),
@@ -80,6 +82,34 @@ CANONICAL_ANCHORS: Dict[str, List[str]] = {
     ],
 }
 
+# Anchor -> value stored in ref_canonical_mappings (shared by Silver 2 and promotion)
+ANCHOR_TO_CANONICAL: Dict[str, Dict[str, str]] = {
+    "street_direction": {"NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W"},
+    "crash_month": {
+        "JANUARY": "1",
+        "FEBRUARY": "2",
+        "MARCH": "3",
+        "APRIL": "4",
+        "MAY": "5",
+        "JUNE": "6",
+        "JULY": "7",
+        "AUGUST": "8",
+        "SEPTEMBER": "9",
+        "OCTOBER": "10",
+        "NOVEMBER": "11",
+        "DECEMBER": "12",
+    },
+    "crash_day_of_week": {
+        "SUNDAY": "1",
+        "MONDAY": "2",
+        "TUESDAY": "3",
+        "WEDNESDAY": "4",
+        "THURSDAY": "5",
+        "FRIDAY": "6",
+        "SATURDAY": "7",
+    },
+}
+
 
 def fuzzy_canonical(col, anchors: List[str], max_frac: float = 0.25):
     """
@@ -101,14 +131,18 @@ def fuzzy_canonical(col, anchors: List[str], max_frac: float = 0.25):
         )
     )
     best, second = scored[0], scored[1]
+    # A single-anchor list has no runner-up: treat it as infinitely far away
+    second_d = F.coalesce(second["d"], F.lit(1000))
     limit = F.greatest(F.lit(1), F.floor(F.length(key) * max_frac))
     return F.when(
-        (F.length(key) >= 4) & (best["d"] <= limit) & (second["d"] - best["d"] >= 2),
+        (F.length(key) >= 4) & (best["d"] <= limit) & (second_d - best["d"] >= 2),
         best["v"],
     )
 
 
-# Initial seed vocabulary extracted from original Silver 2 SQL rules
+# Initial seed vocabulary extracted from original Silver 2 SQL rules.
+# Deliberately NOT seeded: two-letter month abbreviations that are ambiguous
+# ("MA" = March/May, "JU" = June/July). Those go to quarantine instead of guessing.
 SEED_ENTRIES = [
     # weather_condition
     ("weather_condition", "CLEAR", "CLEAR"),
@@ -190,7 +224,6 @@ SEED_ENTRIES = [
     ("crash_month", "FE", "2"),
     ("crash_month", "MARCH", "3"),
     ("crash_month", "MAR", "3"),
-    ("crash_month", "MA", "3"),
     ("crash_month", "APRIL", "4"),
     ("crash_month", "APR", "4"),
     ("crash_month", "AP", "4"),
@@ -198,7 +231,6 @@ SEED_ENTRIES = [
     ("crash_month", "MY", "5"),
     ("crash_month", "JUNE", "6"),
     ("crash_month", "JUN", "6"),
-    ("crash_month", "JU", "6"),
     ("crash_month", "JULY", "7"),
     ("crash_month", "JUL", "7"),
     ("crash_month", "JL", "7"),
@@ -242,10 +274,16 @@ SEED_ENTRIES = [
 ]
 
 
+def _is_delta_table(spark: SparkSession, path: str) -> bool:
+    """True if `path` holds a Delta table (works for local, HDFS and object stores)."""
+    from delta.tables import DeltaTable
+
+    return DeltaTable.isDeltaTable(spark, path)
+
+
 def init_ref_mappings(spark: SparkSession, ref_path: str) -> None:
     """Initialize the ref_canonical_mappings Delta table if not already present."""
-    log_marker = os.path.join(ref_path, "_delta_log")
-    if not os.path.isdir(log_marker):
+    if not _is_delta_table(spark, ref_path):
         print(f"[ref_mappings] Initializing canonical reference table at {ref_path}...")
         now = datetime.now(timezone.utc)
         rows = [
@@ -269,25 +307,53 @@ def load_mappings_dict(spark: SparkSession, ref_path: str) -> Dict[str, Dict[str
     """
     Load the latest committed canonical mappings from Delta into a nested dictionary:
     { field_name: { UPPER_RAW_SYNONYM: CANONICAL_VALUE } }
+
+    Rows are applied oldest-first so that if the same (field, synonym) was ever
+    written twice with different canonical values, the most recent one wins
+    deterministically.
     """
     ref_df = spark.read.format("delta").load(ref_path)
-    collected = ref_df.select("field_name", "raw_synonym", "canonical_value").collect()
+    collected = (
+        ref_df.select("field_name", "raw_synonym", "canonical_value", "added_at")
+        .orderBy("added_at")
+        .collect()
+    )
     mapping_dict: Dict[str, Dict[str, str]] = {}
     for row in collected:
         field = row.field_name
         synonym = (row.raw_synonym or "").strip().upper()
         if not field or not synonym:
             continue
-        if field not in mapping_dict:
-            mapping_dict[field] = {}
-        mapping_dict[field][synonym] = row.canonical_value
+        mapping_dict.setdefault(field, {})[synonym] = row.canonical_value
     return mapping_dict
+
+
+def overlay_mappings(
+    base: Dict[str, Dict[str, str]],
+    overrides: Dict[str, Dict[str, str]],
+) -> Dict[str, Dict[str, str]]:
+    """
+    Return a copy of `base` with `overrides` applied (in memory only, nothing is
+    written to Delta).
+
+    Used by the Validate step of the healing loop: an LLM-proposed fix such as
+    {"weather_condition": {"MISTY DARK": "CLOUDY"}} can be tested by replaying the
+    quarantined raw rows through standardize_silver2 with the overlay, BEFORE the
+    value has reached the promotion threshold in ref_canonical_mappings.
+    """
+    merged = {field: dict(synonyms) for field, synonyms in base.items()}
+    for field, synonyms in overrides.items():
+        target = merged.setdefault(field, {})
+        for raw, canonical in synonyms.items():
+            key = (raw or "").strip().upper()
+            if key:
+                target[key] = canonical
+    return merged
 
 
 def init_fuzzy_audit(spark: SparkSession, audit_path: str) -> None:
     """Initialize the silver2_fuzzy_audit Delta table if not already present."""
-    log_marker = os.path.join(audit_path, "_delta_log")
-    if not os.path.isdir(log_marker):
+    if not _is_delta_table(spark, audit_path):
         print(f"[ref_mappings] Initializing fuzzy audit table at {audit_path}...")
         df = spark.createDataFrame([], schema=FUZZY_AUDIT_SCHEMA)
         df.write.format("delta").mode("overwrite").save(audit_path)
@@ -305,15 +371,19 @@ def promote_fuzzy_variants(
     If a (field, raw, matched) pattern appears >= threshold times, promote it
     into ref_canonical_mappings so future lookups succeed via exact match O(1).
 
+    The insert is a Delta MERGE keyed on (field_name, raw_synonym), so running
+    promotion twice (or concurrently) can never create duplicate rules.
+
     IMPORTANT: Promoted entries are NEVER added to CANONICAL_ANCHORS to prevent
     bad promotions from attracting other typos.
     """
-    log_marker = os.path.join(audit_path, "_delta_log")
-    if not os.path.isdir(log_marker):
+    from delta.tables import DeltaTable
+
+    if not _is_delta_table(spark, audit_path):
         return 0
 
     audit_df = spark.read.format("delta").load(audit_path)
-    if audit_df.count() == 0:
+    if audit_df.isEmpty():
         return 0
 
     # Aggregate by field, normalized raw synonym, and matched anchor
@@ -328,38 +398,12 @@ def promote_fuzzy_variants(
     if not candidates:
         return 0
 
-    # Load existing mappings to avoid duplicate promotions
+    # Skip rules that already exist (also keeps the log output accurate)
     ref_df = spark.read.format("delta").load(ref_path)
     existing_synonyms = set(
         (r.field_name, r.raw_synonym)
         for r in ref_df.select("field_name", "raw_synonym").collect()
     )
-
-    # Direction and date canonical mappings
-    dir_to_canonical = {"NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W"}
-    month_to_canonical = {
-        "JANUARY": "1",
-        "FEBRUARY": "2",
-        "MARCH": "3",
-        "APRIL": "4",
-        "MAY": "5",
-        "JUNE": "6",
-        "JULY": "7",
-        "AUGUST": "8",
-        "SEPTEMBER": "9",
-        "OCTOBER": "10",
-        "NOVEMBER": "11",
-        "DECEMBER": "12",
-    }
-    weekday_to_canonical = {
-        "SUNDAY": "1",
-        "MONDAY": "2",
-        "TUESDAY": "3",
-        "WEDNESDAY": "4",
-        "THURSDAY": "5",
-        "FRIDAY": "6",
-        "SATURDAY": "7",
-    }
 
     now = datetime.now(timezone.utc)
     new_rows = []
@@ -369,18 +413,11 @@ def promote_fuzzy_variants(
         matched = row.matched
         cnt = row.cnt
 
-        if (f_name, raw_syn) in existing_synonyms:
+        if not raw_syn or (f_name, raw_syn) in existing_synonyms:
             continue
 
-        # Map anchor to canonical target value
-        if f_name == "street_direction":
-            canonical_val = dir_to_canonical.get(matched, matched)
-        elif f_name == "crash_month":
-            canonical_val = month_to_canonical.get(matched, matched)
-        elif f_name == "crash_day_of_week":
-            canonical_val = weekday_to_canonical.get(matched, matched)
-        else:
-            canonical_val = matched
+        # Map anchor to canonical target value (identity for weather/lighting)
+        canonical_val = ANCHOR_TO_CANONICAL.get(f_name, {}).get(matched, matched)
 
         new_rows.append(
             (
@@ -394,17 +431,23 @@ def promote_fuzzy_variants(
             )
         )
 
-    if new_rows:
-        new_df = spark.createDataFrame(new_rows, schema=REF_MAPPINGS_SCHEMA)
-        new_df.write.format("delta").mode("append").save(ref_path)
-        print(
-            f"[ref_mappings] Promoted {len(new_rows)} recurring fuzzy variants into {ref_path}."
+    if not new_rows:
+        return 0
+
+    new_df = spark.createDataFrame(new_rows, schema=REF_MAPPINGS_SCHEMA)
+    (
+        DeltaTable.forPath(spark, ref_path)
+        .alias("t")
+        .merge(
+            new_df.alias("s"),
+            "t.field_name = s.field_name AND t.raw_synonym = s.raw_synonym",
         )
-        for r in new_rows:
-            print(
-                f"  -> Promoted '{r[1]}' for field '{r[0]}' -> '{r[2]}' ({r[6]})"
-            )
-        return len(new_rows)
-
-    return 0
-
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+    print(
+        f"[ref_mappings] Promoted {len(new_rows)} recurring fuzzy variants into {ref_path}."
+    )
+    for r in new_rows:
+        print(f"  -> Promoted '{r[1]}' for field '{r[0]}' -> '{r[2]}' ({r[6]})")
+    return len(new_rows)

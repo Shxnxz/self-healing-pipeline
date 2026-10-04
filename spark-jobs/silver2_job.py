@@ -4,16 +4,32 @@ Silver 2: Data standardization via pure PySpark Structured Streaming.
 Reads from Silver 1's cleaned Delta table, applies canonical lookup mappings
 and native date/numeric parsing chains, isolates failed records into a
 physically separate Quarantine table, and appends valid records to Silver 2.
+
+Per micro-batch the job runs in two stages:
+
+  1. TRANSFORM  - standardize + materialize. Any Spark exception here (schema
+                  drift, analysis errors, ...) is caught and the raw batch is
+                  parked in the dead-letter table for the small-LLM triage node.
+                  Nothing has been written to Silver 2 / quarantine yet, so
+                  dead-lettering the whole batch cannot create duplicates.
+  2. WRITE      - valid -> Silver 2, failed -> quarantine, fuzzy fixes -> audit.
+                  Each write is an idempotent Delta write (txnAppId/txnVersion),
+                  so if the job dies half-way and Spark replays the batch, the
+                  writes that already landed are skipped instead of duplicated.
+                  Failures here are infrastructure problems and are re-raised.
+
+Quarantine rows carry the ORIGINAL Silver 1 row in `raw_record`. The Validate
+step of the healing loop can therefore replay them through `standardize_silver2`
+(optionally with `ref_mappings.overlay_mappings` to test a proposed fix before
+it is promoted) and just check that `columns_to_remediate` comes back empty.
 """
 
-import json
 import os
 import traceback
-import urllib.request
 from itertools import chain
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DecimalType,
@@ -44,32 +60,59 @@ FUZZY_AUDIT_PATH = os.environ.get(
     "FUZZY_AUDIT_PATH", os.environ.get("AUDIT_PATH", "/data/delta/silver2_fuzzy_audit")
 )
 
-# Supported additive date format strings
+# Idempotent-write application id. Delta ignores any write whose txnVersion is
+# <= the last one recorded for the same appId, and batch ids restart at 0 when a
+# checkpoint is wiped. So: if you ever delete CHECKPOINT_PATH, change this value.
+TXN_APP_ID = os.environ.get("TXN_APP_ID", "silver2_job")
+
+# Set to "true" only if Silver 1 is ever updated/merged (not append-only);
+# updates are then skipped by the stream instead of crashing it.
+SILVER1_SKIP_CHANGE_COMMITS = (
+    os.environ.get("SILVER1_SKIP_CHANGE_COMMITS", "false").lower() == "true"
+)
+
+# try_to_timestamp / array_compact need Spark 3.4+
+MIN_SPARK_VERSION = (3, 4)
+
+MAX_ERROR_CHARS = 4000
+MAX_TRACE_CHARS = 8000
+
+# Supported additive date format strings.
+# Slash dates are read US-style (month first) because that is the source
+# convention; "d/M/yyyy" is only a fallback for values that cannot be month-first
+# (e.g. 25/12/2021). Ambiguous values like 03/04/2021 therefore parse as March 4.
 DATE_FORMATS = [
-    "yyyy-MM-dd",
-    "yyyy-MM-dd'T'HH:mm:ss",
     "yyyy-MM-dd'T'HH:mm:ss.SSS",
-    "yyyy/MM/dd",
-    "yyyy/MM/dd HH:mm:ss",
-    "dd/MM/yyyy",
-    "MM/dd/yyyy",
-    "MM/dd/yyyy HH:mm:ss",
+    "yyyy-MM-dd'T'HH:mm:ss",
     "yyyy-MM-dd HH:mm:ss",
+    "yyyy-MM-dd",
+    "yyyy/MM/dd HH:mm:ss",
+    "yyyy/MM/dd",
+    "M/d/yyyy h:mm:ss a",
+    "M/d/yyyy H:mm:ss",
+    "M/d/yyyy",
+    "d/M/yyyy H:mm:ss",
+    "d/M/yyyy",
     "dd-MM-yyyy",
     "yyyyMMdd",
 ]
 
-# Supported additive timestamp format strings
+# Supported additive timestamp format strings (same month-first convention)
 TIMESTAMP_FORMATS = [
-    "yyyy-MM-dd'T'HH:mm:ss",
     "yyyy-MM-dd'T'HH:mm:ss.SSS",
+    "yyyy-MM-dd'T'HH:mm:ss",
     "yyyy-MM-dd HH:mm:ss",
     "yyyy-MM-dd",
-    "MM/dd/yyyy HH:mm:ss",
-    "MM/dd/yyyy hh:mm:ss a",
-    "MM/dd/yyyy",
     "yyyy/MM/dd HH:mm:ss",
+    "M/d/yyyy h:mm:ss a",
+    "M/d/yyyy H:mm:ss",
+    "M/d/yyyy",
 ]
+
+
+def _try_ts(col_name: str, fmt: str) -> Column:
+    """try_to_timestamp never raises on a bad value or format mismatch; it yields NULL."""
+    return F.expr(f"try_to_timestamp(`{col_name}`, \"{fmt}\")")
 
 
 def _build_map_expr(
@@ -87,12 +130,38 @@ def _build_map_expr(
     ]
 
 
+def _digits_only(raw_col: Column, max_len: int = 3) -> Column:
+    """Trimmed value cast to INT, only when it is a short run of digits (no overflow)."""
+    t = F.trim(raw_col)
+    return F.when(t.rlike(rf"^\d{{1,{max_len}}}$"), t.cast(IntegerType())).otherwise(None)
+
+
+def _fuzzy_audit_struct(
+    field: str, record_id: Column, raw_col: Column, effective_fuzzy: Column
+) -> Column:
+    """(field, record_id, raw, matched, distance) for one successful fuzzy correction."""
+    return F.when(
+        effective_fuzzy.isNotNull() & raw_col.isNotNull() & (F.trim(raw_col) != ""),
+        F.struct(
+            F.lit(field).alias("field"),
+            record_id.alias("record_id"),
+            raw_col.alias("raw"),
+            effective_fuzzy.alias("matched"),
+            F.levenshtein(F.upper(F.trim(raw_col)), effective_fuzzy).alias("distance"),
+        ),
+    ).otherwise(None)
+
+
 def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) -> DataFrame:
     """
     Apply native PySpark parsing chains and canonical reference lookups.
     Tracks all mapping and parsing failures in `columns_to_remediate`.
+
+    Pure function of (Silver 1 row, mapping_dict): it is also what the healing
+    loop replays quarantined rows through.
     """
     # Explicit bindings to input DataFrame columns to avoid projection alias shadowing
+    record_id = df["record_id"]
     raw_crash_date = df["crash_date"]
     raw_date_police_notified = df["date_police_notified"]
     raw_weather = df["weather_condition"]
@@ -106,15 +175,18 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
     raw_num_units = df["num_units"]
     raw_speed_limit = df["posted_speed_limit"]
 
-    # 1. Native Date Parsing Chain (try_to_timestamp avoids parser policy exceptions)
+    # Keep the untouched Silver 1 row so quarantined records can be replayed
+    raw_record = F.struct(*[df[c] for c in df.columns])
+
+    # 1. Native Date Parsing Chain
     parsed_crash_date = F.coalesce(
-        *[F.to_date(F.expr(f"try_to_timestamp(`crash_date`, \"{fmt}\")")) for fmt in DATE_FORMATS]
+        *[F.to_date(_try_ts("crash_date", fmt)) for fmt in DATE_FORMATS]
     )
     std_crash_date = F.date_format(parsed_crash_date, "yyyy-MM-dd")
 
     # 2. Native Timestamp Parsing Chain for date_police_notified
     parsed_police_ts = F.coalesce(
-        *[F.expr(f"try_to_timestamp(`date_police_notified`, \"{fmt}\")") for fmt in TIMESTAMP_FORMATS]
+        *[_try_ts("date_police_notified", fmt) for fmt in TIMESTAMP_FORMATS]
     )
     std_date_police_notified = F.date_format(parsed_police_ts, "yyyy-MM-dd HH:mm:ss")
 
@@ -169,14 +241,14 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
             F.expr("try_to_timestamp(`crash_hour`, 'h:mm a')"),
         )
     )
-    hour_from_cast = F.when(raw_crash_hour.rlike(r"^\d+$"), raw_crash_hour.cast(IntegerType())).otherwise(None)
-    candidate_hour = F.coalesce(hour_from_ref.cast(IntegerType()), hour_from_ts, hour_from_cast)
+    candidate_hour = F.coalesce(
+        hour_from_ref.cast(IntegerType()), hour_from_ts, _digits_only(raw_crash_hour)
+    )
     std_crash_hour = F.when(candidate_hour.between(0, 23), candidate_hour).otherwise(None)
 
     # crash_month: exact lookup -> direct cast -> fuzzy canonical fallback
     month_from_ref = _build_map_expr("crash_month", mapping_dict, raw_crash_month)
-    month_from_cast = F.when(raw_crash_month.rlike(r"^\d+$"), raw_crash_month.cast(IntegerType())).otherwise(None)
-    candidate_month = F.coalesce(month_from_ref.cast(IntegerType()), month_from_cast)
+    candidate_month = F.coalesce(month_from_ref.cast(IntegerType()), _digits_only(raw_crash_month))
     exact_crash_month = F.when(candidate_month.between(1, 12), candidate_month).otherwise(None)
 
     fuzzy_month_anchor = fuzzy_canonical(
@@ -202,8 +274,7 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
 
     # crash_day_of_week: exact lookup -> direct cast -> fuzzy canonical fallback
     day_from_ref = _build_map_expr("crash_day_of_week", mapping_dict, raw_crash_day)
-    day_from_cast = F.when(raw_crash_day.rlike(r"^\d+$"), raw_crash_day.cast(IntegerType())).otherwise(None)
-    candidate_day = F.coalesce(day_from_ref.cast(IntegerType()), day_from_cast)
+    candidate_day = F.coalesce(day_from_ref.cast(IntegerType()), _digits_only(raw_crash_day))
     exact_crash_day = F.when(candidate_day.between(1, 7), candidate_day).otherwise(None)
 
     fuzzy_day_anchor = fuzzy_canonical(
@@ -224,11 +295,11 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
 
     # num_units: ref lookup for words ('one' -> 1.0) or regex numeric extract
     units_from_ref = _build_map_expr("num_units", mapping_dict, raw_num_units)
-    units_from_regex = F.regexp_extract(raw_num_units, r"(\d+(\.\d+)?)", 1).cast(DecimalType(10, 1))
+    units_from_regex = F.regexp_extract(raw_num_units, r"(\d{1,8}(\.\d+)?)", 1).cast(DecimalType(10, 1))
     std_num_units = F.coalesce(units_from_ref.cast(DecimalType(10, 1)), units_from_regex)
 
     # posted_speed_limit: regex numeric extract
-    std_posted_speed_limit = F.regexp_extract(raw_speed_limit, r"(\d+)", 1).cast(IntegerType())
+    std_posted_speed_limit = F.regexp_extract(raw_speed_limit, r"(\d{1,4})", 1).cast(IntegerType())
 
     # 5. Multi-field Failure Tracking into columns_to_remediate
     # Format: { field_name: (raw_col, std_col, is_mandatory) }
@@ -265,82 +336,19 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
     columns_to_remediate = F.map_from_entries(F.array_compact(F.array(*failure_structs)))
 
     # 6. Audit Trail for Fuzzy Canonical Corrections
-    # Captures (field, raw, matched, distance) for all successful fuzzy corrections in batch.
-    fuzzy_audit_structs = [
-        F.when(
-            effective_fuzzy_weather.isNotNull()
-            & raw_weather.isNotNull()
-            & (F.trim(raw_weather) != ""),
-            F.struct(
-                F.lit("weather_condition").alias("field"),
-                raw_weather.alias("raw"),
-                effective_fuzzy_weather.alias("matched"),
-                F.levenshtein(
-                    F.upper(F.trim(raw_weather)),
-                    effective_fuzzy_weather,
-                ).alias("distance"),
-            ),
-        ).otherwise(None),
-        F.when(
-            effective_fuzzy_lighting.isNotNull()
-            & raw_lighting.isNotNull()
-            & (F.trim(raw_lighting) != ""),
-            F.struct(
-                F.lit("lighting_condition").alias("field"),
-                raw_lighting.alias("raw"),
-                effective_fuzzy_lighting.alias("matched"),
-                F.levenshtein(
-                    F.upper(F.trim(raw_lighting)),
-                    effective_fuzzy_lighting,
-                ).alias("distance"),
-            ),
-        ).otherwise(None),
-        F.when(
-            effective_fuzzy_dir.isNotNull()
-            & raw_street_direction.isNotNull()
-            & (F.trim(raw_street_direction) != ""),
-            F.struct(
-                F.lit("street_direction").alias("field"),
-                raw_street_direction.alias("raw"),
-                effective_fuzzy_dir.alias("matched"),
-                F.levenshtein(
-                    F.upper(F.trim(raw_street_direction)),
-                    effective_fuzzy_dir,
-                ).alias("distance"),
-            ),
-        ).otherwise(None),
-        F.when(
-            effective_fuzzy_month.isNotNull()
-            & raw_crash_month.isNotNull()
-            & (F.trim(raw_crash_month) != ""),
-            F.struct(
-                F.lit("crash_month").alias("field"),
-                raw_crash_month.alias("raw"),
-                effective_fuzzy_month.alias("matched"),
-                F.levenshtein(
-                    F.upper(F.trim(raw_crash_month)),
-                    effective_fuzzy_month,
-                ).alias("distance"),
-            ),
-        ).otherwise(None),
-        F.when(
-            effective_fuzzy_day.isNotNull()
-            & raw_crash_day.isNotNull()
-            & (F.trim(raw_crash_day) != ""),
-            F.struct(
-                F.lit("crash_day_of_week").alias("field"),
-                raw_crash_day.alias("raw"),
-                effective_fuzzy_day.alias("matched"),
-                F.levenshtein(
-                    F.upper(F.trim(raw_crash_day)),
-                    effective_fuzzy_day,
-                ).alias("distance"),
-            ),
-        ).otherwise(None),
-    ]
-    fuzzy_audit_entries = F.array_compact(F.array(*fuzzy_audit_structs))
+    # Captures (field, record_id, raw, matched, distance) for every successful fuzzy
+    # correction in the batch.
+    fuzzy_audit_entries = F.array_compact(
+        F.array(
+            _fuzzy_audit_struct("weather_condition", record_id, raw_weather, effective_fuzzy_weather),
+            _fuzzy_audit_struct("lighting_condition", record_id, raw_lighting, effective_fuzzy_lighting),
+            _fuzzy_audit_struct("street_direction", record_id, raw_street_direction, effective_fuzzy_dir),
+            _fuzzy_audit_struct("crash_month", record_id, raw_crash_month, effective_fuzzy_month),
+            _fuzzy_audit_struct("crash_day_of_week", record_id, raw_crash_day, effective_fuzzy_day),
+        )
+    )
 
-    # 7. Project standardized columns (exact 55 Silver columns + failure/audit lineage)
+    # 7. Project standardized columns (exact 55 Silver columns + failure/audit/replay lineage)
     return df.select(
         F.col("record_id"),
         F.col("batch_id"),
@@ -399,6 +407,51 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
         F.col("dooring_i"),
         columns_to_remediate.alias("columns_to_remediate"),
         fuzzy_audit_entries.alias("_fuzzy_audit_entries"),
+        raw_record.alias("raw_record"),
+    )
+
+
+def _txn_write(df: DataFrame, path: str, table_tag: str, batch_id: int, merge_schema: bool = False):
+    """Idempotent Delta append: a replayed (appId, batch_id) pair is skipped by Delta."""
+    writer = (
+        df.write.format("delta")
+        .mode("append")
+        .option("txnAppId", f"{TXN_APP_ID}:{table_tag}")
+        .option("txnVersion", batch_id)
+    )
+    if merge_schema:
+        writer = writer.option("mergeSchema", "true")
+    writer.save(path)
+
+
+def _dead_letter_batch(batch_df: DataFrame, batch_id: int, exc: BaseException) -> None:
+    """
+    Park the raw batch plus the Spark error for the small-LLM triage node.
+    The batch is stored as JSON so the dead-letter schema stays stable even when
+    the failure is schema drift in Silver 1.
+    """
+    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    cols = [batch_df[c] for c in batch_df.columns]
+    out = (
+        batch_df.select(F.to_json(F.struct(*cols)).alias("raw_json"))
+        .withColumn("record_id", F.get_json_object("raw_json", "$.record_id"))
+        .withColumn("stage", F.lit("transform"))
+        .withColumn("error_type", F.lit(type(exc).__name__))
+        .withColumn("error_message", F.lit(str(exc)[:MAX_ERROR_CHARS]))
+        .withColumn("error_trace", F.lit(trace[-MAX_TRACE_CHARS:]))
+        .withColumn("silver2_batch_id", F.lit(str(batch_id)))
+        .withColumn("failed_at", F.current_timestamp())
+        .withColumn("healing_status", F.lit("PENDING_LLM"))
+    )
+    try:
+        _txn_write(out, DEAD_LETTER_PATH, "dead_letter", batch_id, merge_schema=True)
+    except Exception as dl_exc:  # could not even park the batch: stop, let Spark replay it
+        raise RuntimeError(
+            f"[silver2] Batch {batch_id}: transform failed AND dead-letter write failed"
+        ) from dl_exc
+    print(
+        f"[silver2] Batch {batch_id}: transform failed ({type(exc).__name__}); "
+        f"batch parked at {DEAD_LETTER_PATH} for LLM triage"
     )
 
 
@@ -409,51 +462,67 @@ def make_batch_processor(spark: SparkSession):
         # 1. Reload the latest committed canonical mappings per micro-batch
         mapping_dict = load_mappings_dict(spark, REF_MAPPINGS_PATH)
 
-        # 2. Apply transformations and capture failed fields
-        transformed = standardize_silver2(batch_df, mapping_dict)
-
-        # 3. Persist to avoid double evaluation across valid, quarantine, and audit splits
-        transformed.persist()
-
+        # 2. TRANSFORM stage: build, persist and materialize in one go.
+        #    Anything that blows up here is a data/schema problem -> dead letter.
+        transformed = None
         try:
-            # Clean rows: drop lineage/audit tracking columns before writing to Silver 2
+            transformed = standardize_silver2(batch_df, mapping_dict).persist()
+            stats = transformed.agg(
+                F.count(F.lit(1)).alias("total"),
+                F.sum(F.when(F.size("columns_to_remediate") > 0, 1).otherwise(0)).alias("quarantined"),
+                F.sum(F.when(F.size("_fuzzy_audit_entries") > 0, 1).otherwise(0)).alias("fuzzy"),
+            ).first()
+        except Exception as exc:
+            if transformed is not None:
+                transformed.unpersist()
+            _dead_letter_batch(batch_df, batch_id, exc)
+            return
+
+        # 3. WRITE stage: idempotent writes; errors propagate so Spark replays the batch
+        try:
+            total = int(stats["total"] or 0)
+            n_quarantined = int(stats["quarantined"] or 0)
+            n_fuzzy = int(stats["fuzzy"] or 0)
+            if total == 0:
+                return
+
+            failed = F.size(F.col("columns_to_remediate")) > 0
+
+            # Clean rows: drop lineage/audit/replay columns before writing to Silver 2
             # Adds zero extra columns to Silver 2
-            valid_df = transformed.filter(
-                F.size(F.col("columns_to_remediate")) == 0
-            ).drop("columns_to_remediate", "_fuzzy_audit_entries")
+            if total - n_quarantined > 0:
+                valid_df = transformed.filter(~failed).drop(
+                    "columns_to_remediate", "_fuzzy_audit_entries", "raw_record"
+                )
+                _txn_write(valid_df, SILVER2_PATH, "valid", batch_id)
 
-            # Quarantined rows: drop audit tracking column
-            quarantine_df = transformed.filter(
-                F.size(F.col("columns_to_remediate")) > 0
-            ).drop("_fuzzy_audit_entries")
-
-            # Append clean rows to Silver 2
-            valid_df.write.format("delta").mode("append").save(SILVER2_PATH)
-
-            # Append quarantined rows with lineage metadata if any exist
-            if quarantine_df.head(1):
+            # Quarantined rows keep columns_to_remediate and the original raw_record
+            if n_quarantined > 0:
                 quarantine_out = (
-                    quarantine_df.withColumn("quarantined_at", F.current_timestamp())
+                    transformed.filter(failed)
+                    .drop("_fuzzy_audit_entries")
+                    .withColumn("quarantined_at", F.current_timestamp())
                     .withColumn("silver2_batch_id", F.lit(str(batch_id)))
                     .withColumn("healing_status", F.lit("PENDING"))
                 )
-                quarantine_out.write.format("delta").mode("append").save(QUARANTINE_PATH)
+                _txn_write(quarantine_out, QUARANTINE_PATH, "quarantine", batch_id, merge_schema=True)
                 print(
-                    f"[silver2] Batch {batch_id}: captured quarantined records at {QUARANTINE_PATH}"
+                    f"[silver2] Batch {batch_id}: quarantined {n_quarantined} of {total} records "
+                    f"at {QUARANTINE_PATH}"
                 )
 
-            # Log fuzzy corrections to small audit Delta table: (field, raw, matched, distance)
-            fuzzy_records_df = transformed.filter(
-                F.size(F.col("_fuzzy_audit_entries")) > 0
-            )
-            if fuzzy_records_df.head(1):
+            # Log fuzzy corrections: (field, record_id, raw, matched, distance)
+            if n_fuzzy > 0:
                 audit_df = (
-                    fuzzy_records_df.select(
+                    transformed.filter(F.size(F.col("_fuzzy_audit_entries")) > 0)
+                    .select(
                         F.explode("_fuzzy_audit_entries").alias("entry"),
                         F.lit(str(batch_id)).alias("batch_id"),
                         F.current_timestamp().alias("corrected_at"),
-                    ).select(
+                    )
+                    .select(
                         F.col("entry.field").alias("field"),
+                        F.col("entry.record_id").alias("record_id"),
                         F.col("entry.raw").alias("raw"),
                         F.col("entry.matched").alias("matched"),
                         F.col("entry.distance").cast(IntegerType()).alias("distance"),
@@ -461,7 +530,7 @@ def make_batch_processor(spark: SparkSession):
                         F.col("batch_id"),
                     )
                 )
-                audit_df.write.format("delta").mode("append").save(FUZZY_AUDIT_PATH)
+                _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", batch_id, merge_schema=True)
                 print(
                     f"[silver2] Batch {batch_id}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
                 )
@@ -471,8 +540,18 @@ def make_batch_processor(spark: SparkSession):
     return process_micro_batch
 
 
+def _require_spark_version(spark: SparkSession) -> None:
+    major_minor = tuple(int(p) for p in spark.version.split(".")[:2])
+    if major_minor < MIN_SPARK_VERSION:
+        raise RuntimeError(
+            f"Silver 2 needs Spark >= {'.'.join(map(str, MIN_SPARK_VERSION))} "
+            f"(try_to_timestamp, array_compact); running {spark.version}"
+        )
+
+
 def main():
     spark = build_spark("Silver2StandardizeTransform")
+    _require_spark_version(spark)
 
     # Initialize reference canonical mappings if table does not exist
     init_ref_mappings(spark, REF_MAPPINGS_PATH)
@@ -483,13 +562,16 @@ def main():
     # Wait for upstream Silver 1 Delta table
     wait_for_delta_table(SILVER1_PATH)
 
-    silver1_stream = spark.readStream.format("delta").load(SILVER1_PATH)
+    reader = spark.readStream.format("delta")
+    if SILVER1_SKIP_CHANGE_COMMITS:
+        reader = reader.option("skipChangeCommits", "true")
+    silver1_stream = reader.load(SILVER1_PATH)
 
     batch_processor = make_batch_processor(spark)
 
+    # foreachBatch owns all writes, so no sink format is set on the writeStream
     query = (
-        silver1_stream.writeStream.format("delta")
-        .trigger(processingTime="10 seconds")
+        silver1_stream.writeStream.trigger(processingTime="10 seconds")
         .option("checkpointLocation", CHECKPOINT_PATH)
         .foreachBatch(batch_processor)
         .start()
@@ -497,11 +579,11 @@ def main():
 
     print(
         f"[silver2] Streaming {SILVER1_PATH} -> {SILVER2_PATH} "
-        f"(Quarantine: {QUARANTINE_PATH}, Audit: {FUZZY_AUDIT_PATH})"
+        f"(Quarantine: {QUARANTINE_PATH}, Audit: {FUZZY_AUDIT_PATH}, "
+        f"Dead letter: {DEAD_LETTER_PATH})"
     )
     query.awaitTermination()
 
 
 if __name__ == "__main__":
     main()
-

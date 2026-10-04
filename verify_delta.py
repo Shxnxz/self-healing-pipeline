@@ -25,6 +25,8 @@ TABLES = {
     "ref_mappings": "./delta/ref_canonical_mappings",
     "fuzzy_audit": "./delta/silver2_fuzzy_audit",
     "audit": "./delta/silver2_fuzzy_audit",
+    "dead_letter": "./delta/silver2_dead_letter",
+    "silver2_dead_letter": "./delta/silver2_dead_letter",
     "gold": "./delta/gold",
     # Legacy aliases
     "silver_cars": "./delta/silver_cars",

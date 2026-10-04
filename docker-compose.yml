@@ -111,6 +111,7 @@ services:
       SILVER2_PATH: /data/delta/silver2
       CHECKPOINT_PATH: /data/checkpoints/silver2
       QUARANTINE_PATH: /data/delta/silver2_quarantine
+      DEAD_LETTER_PATH: /data/delta/silver2_dead_letter
       REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
       FUZZY_AUDIT_PATH: /data/delta/silver2_fuzzy_audit
     depends_on:
