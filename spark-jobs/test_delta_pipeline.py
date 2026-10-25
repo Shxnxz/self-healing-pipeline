@@ -152,7 +152,7 @@ def run_tests():
     base_rows[1]["crash_month"] = "MA"  # ambiguous month (March or May) -> quarantine
     base_rows[1]["posted_speed_limit"] = "99999999999"  # overflow digits -> quarantine
 
-    # Row 2: FUZZY AUDIT record (typo within Levenshtein distance)
+    # Row 2: FUZZY AUDIT record (typo within Damerau-Levenshtein distance)
     base_rows[2]["record_id"] = "REC_FUZZY_03"
     base_rows[2]["weather_condition"] = "CLOUDY"
     base_rows[2]["lighting_condition"] = "DAYLITE"  # Typo of DAYLIGHT (dist 2)

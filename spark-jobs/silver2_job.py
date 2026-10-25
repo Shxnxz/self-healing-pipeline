@@ -43,6 +43,7 @@ from common import build_spark, wait_for_delta_table
 from ref_mappings import (
     ANCHOR_TO_CANONICAL,
     CANONICAL_ANCHORS,
+    damerau_levenshtein_udf,
     fuzzy_canonical,
     init_fuzzy_audit,
     init_ref_mappings,
@@ -150,7 +151,7 @@ def _fuzzy_audit_struct(
             record_id.alias("record_id"),
             raw_col.alias("raw"),
             effective_fuzzy.alias("matched"),
-            F.levenshtein(F.upper(F.trim(raw_col)), effective_fuzzy).alias("distance"),
+            damerau_levenshtein_udf(F.upper(F.trim(raw_col)), effective_fuzzy).alias("distance"),
         ),
     ).otherwise(None)
 
