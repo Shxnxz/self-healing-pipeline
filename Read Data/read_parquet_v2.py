@@ -211,7 +211,7 @@ def get_active_id() -> str:
             return anchor[0]
     except Exception:
         pass
-    
+
     # Fallback known anchor ID
     fallback_id = "e8e76ac3-0376-4540-a532-acf3d735216b"
     set_active_id(fallback_id)
