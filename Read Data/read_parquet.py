@@ -36,7 +36,7 @@ def main():
 
         # Check if user wants all rows or a custom limit
         show_all = "--all" in sys.argv or "-a" in sys.argv or "all" in sys.argv
-        
+
         # Determine row limit
         limit = None
         for a in sys.argv[2:]:

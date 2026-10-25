@@ -174,7 +174,7 @@ def run_tests():
     assert "columns_to_remediate" not in s2_df.columns, "columns_to_remediate leaked into Silver 2"
     assert "raw_record" not in s2_df.columns, "raw_record leaked into Silver 2"
     assert "_fuzzy_audit_entries" not in s2_df.columns, "_fuzzy_audit_entries leaked into Silver 2"
-    
+
     # Check date parsing result: 03/04/2021 -> 2021-03-04
     rec1 = s2_df.filter(F.col("record_id") == "REC_VALID_01").first()
     assert rec1.crash_date == "2021-03-04", f"Expected 2021-03-04, got {rec1.crash_date}"
@@ -192,7 +192,7 @@ def run_tests():
     assert "REC_QUAR_02" in quar_ids, "REC_QUAR_02 missing from Quarantine"
     assert "raw_record" in quar_df.columns, "raw_record missing from Quarantine table"
     assert "healing_status" in quar_df.columns, "healing_status missing from Quarantine table"
-    
+
     q_rec = quar_df.filter(F.col("record_id") == "REC_QUAR_02").first()
     assert q_rec.healing_status == "PENDING"
     assert "weather_condition" in q_rec.columns_to_remediate
@@ -255,7 +255,7 @@ def run_tests():
     print("\n[TEST 7] Testing Transform exception dead-letter parking...")
     # Create corrupted DataFrame with missing required column to trigger failure in standardize
     corrupted_df = test_batch_df.drop("crash_date")
-    
+
     print("  -> Executing batch 2 (intentionally broken schema)...")
     # Batch processor should NOT raise an unhandled exception to caller
     processor(corrupted_df, 2)
@@ -265,7 +265,7 @@ def run_tests():
     dl_rows = dl_df.collect()
     print(f"  -> Dead letter rows count: {len(dl_rows)}")
     assert len(dl_rows) > 0, "No records found in DEAD_LETTER_PATH"
-    
+
     first_dl = dl_rows[0]
     print(f"     Dead Letter Sample: batch={first_dl.silver2_batch_id}, stage={first_dl.stage}, error_type={first_dl.error_type}, healing_status={first_dl.healing_status}")
     print(f"     Error Message: {first_dl.error_message[:100]}...")
