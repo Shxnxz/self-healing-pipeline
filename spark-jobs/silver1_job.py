@@ -15,6 +15,7 @@ from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
 from common import build_spark, wait_for_delta_table
+from schema_guard import process_source_batch
 
 BRONZE_PATH = os.environ.get("BRONZE_PATH", "/data/delta/bronze")
 SILVER1_PATH = os.environ.get("SILVER1_PATH", "/data/delta/silver1")
@@ -150,13 +151,10 @@ FROM bronze_flat
 """
 
 
-def start(spark: SparkSession, upstream: Optional[StreamingQuery] = None) -> StreamingQuery:
-    """Start the Silver 1 query on `spark`; `upstream` is the Bronze query if it shares this driver."""
-    wait_for_delta_table(BRONZE_PATH, upstream=upstream)
-
-    bronze_stream = spark.readStream.format("delta").load(BRONZE_PATH)
-
-    flattened = bronze_stream.select(
+def write_clean_batch(batch_df, batch_id):
+    """Run the existing cleanup only after source schema validation."""
+    spark = batch_df.sparkSession
+    flattened = batch_df.select(
         col("topic"),
         col("kafka_timestamp"),
         from_json(col("raw_value"), ENVELOPE_SCHEMA).alias("env"),
@@ -176,16 +174,24 @@ def start(spark: SparkSession, upstream: Optional[StreamingQuery] = None) -> Str
     flattened.createOrReplaceTempView("bronze_flat")
     silver1 = spark.sql(SILVER1_TRANSFORM_SQL)
 
-    query = (
-        silver1.writeStream.format("delta")
-        .queryName("silver1")
-        .trigger(processingTime="10 seconds")
-        .option("checkpointLocation", CHECKPOINT_PATH)
-        .outputMode("append")
-        .start(SILVER1_PATH)
-    )
+    (silver1.write.format("delta").mode("append")
+     .option("txnAppId", os.getenv("SILVER1_TXN_APP_ID", "silver1") + "_clean")
+     .option("txnVersion", batch_id).save(SILVER1_PATH))
 
-    print(f"[silver1] Streaming {BRONZE_PATH} -> {SILVER1_PATH}")
+
+def start(spark: SparkSession, upstream: Optional[StreamingQuery] = None) -> StreamingQuery:
+    wait_for_delta_table(BRONZE_PATH, upstream=upstream)
+    bronze_stream = spark.readStream.format("delta").load(BRONZE_PATH)
+    dead_letter_path = os.environ.get("SILVER1_DEAD_LETTER_PATH", "/data/delta/silver1_dead_letter")
+
+    def process(batch, batch_id):
+        process_source_batch(batch, batch_id, CRASH_COLUMNS, write_clean_batch, dead_letter_path)
+
+    query = (bronze_stream.writeStream.queryName("silver1")
+             .trigger(processingTime="10 seconds")
+             .option("checkpointLocation", CHECKPOINT_PATH)
+             .foreachBatch(process).start())
+    print(f"[silver1] Validating {BRONZE_PATH} -> {SILVER1_PATH}", flush=True)
     return query
 
 

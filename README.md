@@ -152,3 +152,27 @@ Unit tests (no Kafka or Neo4j needed): `cd lineage && python -m pytest tests`.
 - Every field in the mock CSV mirrors the real dataset's messy formatting
   (units embedded in strings, comma-formatted prices) on purpose, so the
   Silver transform you write against it transfers directly.
+
+## Replay one partition and test source schema mismatch
+
+The producer can select exact CSV basenames with `CSV_FILES`. For example, put
+these values in `.env` to replay only the column-mismatch partition:
+
+```dotenv
+TABLES=Crash4
+CSV_FILES=Crash4-2.csv
+KAFKA_TOPICS=crashes.crash4
+QWEN_ENABLED=true
+```
+
+Run `docker compose up --build -d`. `CSV_FILES` is optional: leaving it empty
+keeps the existing all-partitions behavior for the selected tables. Kafka retains
+old messages, so use a dedicated topic or isolated output/checkpoint directories
+when repeating an experiment; restarting the producer republishes records.
+
+Silver 1 validates JSON payload keys before parsing with its fixed schema. Schema
+mismatches are stored in `silver1_dead_letter` with the original raw payload and
+Kafka offsets, then sent to local Qwen. Invalid rows cannot enter Silver 1, Silver
+2, or Gold. The schema guard does not rename fields or implement lookup/remediation.
+When all source records have invalid schemas, downstream jobs may wait for a valid
+Silver 1 table; this is expected and is not evidence of failed Qwen classification.
