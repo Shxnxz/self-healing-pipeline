@@ -80,6 +80,8 @@ class QwenClassifier:
                     raise ValueError('Invalid identifier')
                 if not (key == 'table' and value == table) and value not in excerpt:
                     raise ValueError('Ungrounded identifier')
+            if table is not None and prediction['table'] not in (None, table):
+                raise ValueError('Prediction conflicts with trusted source table')
             # Prefer the full Spark error class when one is explicitly present.
             classes = re.findall(r'\[([A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*)\]', excerpt)
             if prediction['error_class'] and prediction['error_class'] not in classes and classes:

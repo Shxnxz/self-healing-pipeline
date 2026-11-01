@@ -15,6 +15,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Keep small handoff dependencies separate from the large Spark installation.
+COPY requirements-qwen.txt .
+RUN pip install --no-cache-dir -r requirements-qwen.txt
+
 # All layer jobs and support modules live in this one image.
 COPY *.py ./
 

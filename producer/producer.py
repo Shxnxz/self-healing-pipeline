@@ -63,6 +63,10 @@ def find_table_files(data_dir: str, table_name: str) -> list[str]:
     if not files:
         files = glob.glob(os.path.join(data_dir, f"{table_name}*.csv"))
 
+    # Optional exact basename allowlist for replaying selected partitions.
+    selected = {name.strip() for name in os.environ.get("CSV_FILES", "").split(",") if name.strip()}
+    if selected:
+        files = [path for path in files if os.path.basename(path) in selected]
     files.sort(key=natural_sort_key)
     return files
 
