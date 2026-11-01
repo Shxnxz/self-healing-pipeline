@@ -1,40 +1,38 @@
-"""Optional triage handoff. No lookup, graph writes, or remediation."""
-import hashlib
-import json
+"""Classify, persist and optionally publish incidents before a batch completes."""
 import os
 import sys
 import traceback
-import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+
 from .classifier import QwenClassifier
+from .handoff import build_incident, publish_incident, save_incident
 
 
-def capture_exception(exc, *, job_name, batch_id=None, table=None, dead_letter_path=None):
+def capture_exception(exc, *, job_name, batch_id=None, table=None,
+                      dead_letter_path=None, context=None):
     if os.getenv('QWEN_ENABLED', 'false').lower() != 'true':
         return None
-    try:
-        trace = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        failure = QwenClassifier().classify(trace, job_name=job_name, batch_id=batch_id, table=table)
-        failure.update(error_text=trace, dead_letter_path=dead_letter_path,
-                       created_at=datetime.now(timezone.utc).isoformat())
-        directory = Path(os.getenv('QWEN_INCIDENT_DIR', 'incidents'))
-        directory.mkdir(parents=True, exist_ok=True)
-        identity = json.dumps([job_name, batch_id, dead_letter_path, trace])
-        key = hashlib.sha256(identity.encode()).hexdigest()
-        temporary = directory / (key+'.'+uuid.uuid4().hex+'.tmp')
-        temporary.write_text(json.dumps(failure, indent=2))
-        temporary.replace(directory/(key+'.json'))
-        print(f"[qwen] {job_name} batch={batch_id}: {failure['failure_type']} ({failure['classification_status']})", file=sys.stderr)
-        return failure
-    except Exception as recording_error:
-        print(f'[qwen] Triage unavailable: {type(recording_error).__name__}', file=sys.stderr)
-        return None
+    trace = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    classification = QwenClassifier().classify(
+        trace, job_name=job_name, batch_id=batch_id, table=table)
+    incident = build_incident(classification, error_text=trace,
+                             dead_letter_path=dead_letter_path, context=context)
+    incident['created_at'] = datetime.now(timezone.utc).isoformat()
+    save_incident(incident, os.getenv('QWEN_INCIDENT_DIR', 'incidents'))
+    publish_incident(incident)
+    print(f"[qwen] {job_name} batch={batch_id}: {incident['failure_type']} "
+          f"({incident['classification_status']})", file=sys.stderr)
+    return incident
 
 
 def run_job(main, *, job_name):
     try:
         return main()
     except Exception as exc:
-        capture_exception(exc, job_name=job_name)
+        try:
+            capture_exception(exc, job_name=job_name)
+        except Exception as recording_error:
+            # Keep the original job failure; batch callbacks propagate handoff failures.
+            print(f'[qwen] Incident recording failed: {type(recording_error).__name__}',
+                  file=sys.stderr)
         raise
