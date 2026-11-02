@@ -74,6 +74,16 @@ python verify_delta.py ref_mappings
 python verify_delta.py gold
 ```
 
+For a richer view, `Read Data/read_parquet_v3.py` (needs `duckdb deltalake pandas`,
+`rich` optional) knows the per-source layout:
+
+```bash
+python "Read Data/read_parquet_v3.py" overview                # rows per source and layer
+python "Read Data/read_parquet_v3.py" silver2 --table 10      # all sources, with source_table
+python "Read Data/read_parquet_v3.py" quarantine --source crash3
+python "Read Data/read_parquet_v3.py" trace                   # one record through its branch
+```
+
 To stop: `docker compose down`. To wipe all state and start clean:
 `docker compose down && rm -rf delta checkpoints`.
 
