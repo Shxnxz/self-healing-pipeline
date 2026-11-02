@@ -6,7 +6,7 @@ for categorical standardization in Silver 2 and self-healing LLM loops.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -130,7 +130,7 @@ CANONICAL_TAXONOMY: Dict[str, Dict[str, List[str]]] = {
     },
 }
 
-# Closed-vocabulary fields eligible for Levenshtein fuzzy distance matching
+# Closed-vocabulary fields eligible for Damerau-Levenshtein fuzzy distance matching
 FUZZY_CANONICAL_FIELDS = [
     "weather_condition",
     "lighting_condition",
@@ -152,9 +152,82 @@ ANCHOR_TO_CANONICAL: Dict[str, Dict[str, str]] = {
 }
 
 
+def damerau_levenshtein(a: Optional[str], b: Optional[str]) -> Optional[int]:
+    """
+    Damerau-Levenshtein distance (Damerau, 1964): the minimum number of insertions,
+    deletions, substitutions and transpositions of two adjacent characters needed to
+    turn `a` into `b`. This is the unrestricted variant (a substring may be edited
+    again after a transposition), so it is a true metric. A swap such as JUEN -> JUNE
+    costs 1, where plain Levenshtein charges 2.
+
+    Returns None if either input is None.
+    """
+    if a is None or b is None:
+        return None
+    len_a, len_b = len(a), len(b)
+    if len_a == 0 or len_b == 0:
+        return max(len_a, len_b)
+
+    # last_row[ch] = last row (1-based) of `a` in which character ch occurred
+    last_row: Dict[str, int] = {}
+    inf = len_a + len_b
+    # (len_a + 2) x (len_b + 2) table with a sentinel row/column of `inf` at index 0
+    d = [[0] * (len_b + 2) for _ in range(len_a + 2)]
+    d[0][0] = inf
+    for i in range(len_a + 1):
+        d[i + 1][0] = inf
+        d[i + 1][1] = i
+    for j in range(len_b + 1):
+        d[0][j + 1] = inf
+        d[1][j + 1] = j
+
+    for i in range(1, len_a + 1):
+        last_match_col = 0
+        for j in range(1, len_b + 1):
+            i1 = last_row.get(b[j - 1], 0)
+            j1 = last_match_col
+            if a[i - 1] == b[j - 1]:
+                cost = 0
+                last_match_col = j
+            else:
+                cost = 1
+            d[i + 1][j + 1] = min(
+                d[i][j] + cost,  # substitution
+                d[i + 1][j] + 1,  # insertion
+                d[i][j + 1] + 1,  # deletion
+                d[i1][j1] + (i - i1 - 1) + 1 + (j - j1 - 1),  # transposition
+            )
+        last_row[a[i - 1]] = i
+    return d[len_a + 1][len_b + 1]
+
+
+# Python UDF wrapper so Silver 2 (and the fuzzy audit trail) can score values in Spark.
+# Spark's built-in F.levenshtein has no transposition operation.
+damerau_levenshtein_udf = F.udf(damerau_levenshtein, IntegerType())
+
+
+_FUZZY_SCORE_SCHEMA = StructType(
+    [
+        StructField("best_d", IntegerType(), True),
+        StructField("best_v", StringType(), True),
+        StructField("second_d", IntegerType(), True),
+    ]
+)
+
+
+def _score_anchors(key: Optional[str], anchors: List[str]) -> Optional[Tuple]:
+    """(best distance, best anchor, runner-up distance) of `key` against `anchors`."""
+    if key is None:
+        return None
+    # Sorting (distance, anchor) keeps ties deterministic, like the old struct sort
+    scored = sorted((damerau_levenshtein(key, a), a) for a in anchors)
+    second_d = scored[1][0] if len(scored) > 1 else None
+    return scored[0][0], scored[0][1], second_d
+
+
 def fuzzy_canonical(col, anchors: List[str], max_frac: float = 0.25):
     """
-    Deterministic Levenshtein matching against seed canonical anchors.
+    Deterministic Damerau-Levenshtein matching against seed canonical anchors.
 
     Guardrails:
     1. Minimum length of 4: protects against single-character ambiguity like N/S/E/W.
@@ -165,19 +238,15 @@ def fuzzy_canonical(col, anchors: List[str], max_frac: float = 0.25):
     """
     c = F.col(col) if isinstance(col, str) else col
     key = F.upper(F.trim(c))
-    scored = F.array_sort(
-        F.transform(
-            F.array(*[F.lit(a) for a in anchors]),
-            lambda a: F.struct(F.levenshtein(key, a).alias("d"), a.alias("v")),
-        )
-    )
-    best, second = scored[0], scored[1]
+    anchors = list(anchors)
+    # Spark SQL higher-order lambdas cannot call Python UDFs, so one UDF scores all anchors
+    score = F.udf(lambda k: _score_anchors(k, anchors), _FUZZY_SCORE_SCHEMA)(key)
     # A single-anchor list has no runner-up: treat it as infinitely far away
-    second_d = F.coalesce(second["d"], F.lit(1000))
+    second_d = F.coalesce(score["second_d"], F.lit(1000))
     limit = F.greatest(F.lit(1), F.floor(F.length(key) * max_frac))
     return F.when(
-        (F.length(key) >= 4) & (best["d"] <= limit) & (second_d - best["d"] >= 2),
-        best["v"],
+        (F.length(key) >= 4) & (score["best_d"] <= limit) & (second_d - score["best_d"] >= 2),
+        score["best_v"],
     )
 
 

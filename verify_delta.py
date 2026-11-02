@@ -1,25 +1,30 @@
 """
 Quick sanity check, run from the host (not inside a container).
 
-Reads any of the three Delta tables directly using the lightweight
+Reads any of the pipeline's Delta tables directly using the lightweight
 `deltalake` package -- no Spark/JVM required. Handy for confirming data is
 flowing through all three layers while the docker-compose stack runs.
 
 Usage:
     pip install deltalake pandas
-    python verify_delta.py bronze
-    python verify_delta.py silver_cars
-    python verify_delta.py gold_car_overview
+    python verify_delta.py bronze_crash1
+    python verify_delta.py silver2_crash3
+    python verify_delta.py gold
 """
 
 import sys
 
 from deltalake import DeltaTable
 
+SOURCES = ["crash1", "crash2", "crash3", "crash4"]  # spark-jobs/sources.py
+
 TABLES = {
-    "bronze": "./delta/bronze",
-    "silver1": "./delta/silver1",
-    "silver2": "./delta/silver2",
+    # One table per source and layer: bronze_crash1 .. silver2_crash4
+    **{
+        f"{layer}_{source}": f"./delta/{layer}_{source}"
+        for layer in ("bronze", "silver1", "silver2")
+        for source in SOURCES
+    },
     "silver2_quarantine": "./delta/silver2_quarantine",
     "quarantine": "./delta/silver2_quarantine",
     "ref_mappings": "./delta/ref_canonical_mappings",

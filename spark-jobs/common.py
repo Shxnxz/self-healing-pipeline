@@ -13,6 +13,8 @@ import os
 import time
 from typing import Optional
 
+from pyspark.sql import DataFrame
+
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession
 from pyspark.sql.streaming import StreamingQuery
@@ -39,6 +41,9 @@ def build_spark(app_name: str, driver_memory: str = "1g") -> SparkSession:
     builder = (
         SparkSession.builder.appName(app_name)
         .config("spark.driver.memory", driver_memory)
+        # Default is 200 tasks per shuffle, which is far too many for micro-batches of a
+        # few hundred rows, and every per-source query pays it (see sources.py).
+        .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8"))
         .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config(
@@ -74,6 +79,64 @@ def build_spark(app_name: str, driver_memory: str = "1g") -> SparkSession:
     spark = configure_spark_with_delta_pip(builder, extra_packages=packages).getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark
+
+
+# Delta conflicts a concurrent writer can cause on a table several queries append to
+# (the shared quarantine / dead letter / audit tables, see sources.py). The first
+# writes race to create the table, and mergeSchema writes change its metadata.
+_RETRYABLE_DELTA_CONFLICTS = (
+    "ConcurrentAppendException",
+    "ConcurrentWriteException",
+    "MetadataChangedException",
+    "ProtocolChangedException",
+    "ConcurrentTransactionException",
+    "DeltaConcurrentModificationException",
+)
+
+
+def _is_delta_conflict(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}"
+    return any(name in text for name in _RETRYABLE_DELTA_CONFLICTS)
+
+
+def idempotent_append(
+    df: DataFrame,
+    path: str,
+    app_id: str,
+    version: int,
+    merge_schema: bool = False,
+    attempts: int = 5,
+) -> None:
+    """
+    Append `df` to the Delta table at `path`, at most once per (app_id, version).
+
+    Delta skips a write whose txnVersion is <= the last one it recorded for the same
+    txnAppId on that table, so a micro-batch Spark replays after a crash is not
+    written twice. That also means two queries writing the same table must never
+    share an app_id: their batch ids both start at 0, and one would silently skip
+    the other's batches. Callers therefore put the source in app_id.
+
+    A write that loses a race with another writer is retried; a failed commit wrote
+    nothing, and the txn check keeps the retry from duplicating rows.
+    """
+    for attempt in range(1, attempts + 1):
+        writer = (
+            df.write.format("delta")
+            .mode("append")
+            .option("txnAppId", app_id)
+            .option("txnVersion", version)
+        )
+        if merge_schema:
+            writer = writer.option("mergeSchema", "true")
+        try:
+            writer.save(path)
+            return
+        except Exception as exc:
+            if attempt == attempts or not _is_delta_conflict(exc):
+                raise
+            print(f"Concurrent write conflict on {path} ({type(exc).__name__}); "
+                  f"retry {attempt}/{attempts - 1}", flush=True)
+            time.sleep(0.5 * attempt)
 
 
 def wait_for_delta_table(

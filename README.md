@@ -4,23 +4,31 @@ Kafka → Spark Structured Streaming jobs (Bronze, Silver1, Silver2, Gold) → D
 Lake, running as a multi-hop pipeline: each layer streams from the previous
 layer's Delta table, following the Medallion Lakehouse pattern.
 
+Each data folder (`data/Crash1` .. `data/Crash4`) is its own source with its own
+Bronze, Silver 1 and Silver 2 tables. The branches meet only in Gold, a UNION ALL
+of every Silver 2 table, so a problem in one folder stays in its own branch
+(and in lineage, its blast radius is that branch plus Gold):
+
 ```
-producer --> kafka --> bronze-job --> delta/bronze
-                                          |
-                                          v
-                                     silver1-job --> delta/silver1 (Format & Cleaning)
-                                                         |
-                                                         v
-                                                    silver2-job --> delta/silver2 (Standardization)
-                                                                        |
-                                                                        v
-                                                                    gold-job --> delta/gold (Analytics)
+crashes.crash1 --> bronze_crash1 --> silver1_crash1 --> silver2_crash1 --+
+crashes.crash2 --> bronze_crash2 --> silver1_crash2 --> silver2_crash2 --+--> gold (UNION ALL,
+crashes.crash3 --> bronze_crash3 --> silver1_crash3 --> silver2_crash3 --+     source_table)
+crashes.crash4 --> bronze_crash4 --> silver1_crash4 --> silver2_crash4 --+
+                                          |                  |
+                                          v                  v
+                             silver1_dead_letter     silver2_quarantine, silver2_dead_letter,
+                                  (shared)           silver2_fuzzy_audit (shared, each row
+                                                     tagged with its source / target_table)
 ```
+
+The layout lives in `spark-jobs/sources.py`. `SOURCES` (default
+`crash1,crash2,crash3,crash4`) on the Spark services must name the same folders as
+the producer's `TABLES`; a source with no data blocks the layers after it.
 
 ## Prerequisites
 
 - Docker + Docker Compose v2
-- ~4 GB RAM free (Kafka + two Spark JVMs)
+- ~5 GB RAM free (Kafka + two Spark JVMs; the Silver 2 + Gold driver uses 2 GB)
 
 ## Setup
 
@@ -28,23 +36,28 @@ producer --> kafka --> bronze-job --> delta/bronze
 docker compose up --build
 ```
 
-The producer replays the partitioned datasets (`data/Crash1`, `data/Crash2`,
-`data/Crash3`) across their respective parts through Kafka topics (`crashes.crash1`,
-`crashes.crash2`, `crashes.crash3`) into Bronze automatically.
+The producer replays the partitioned datasets (`data/Crash1` .. `data/Crash4`)
+across their respective parts through one Kafka topic each (`crashes.crash1` ..
+`crashes.crash4`) into each source's Bronze table automatically.
+
+**Moving from the old single-branch layout:** the per-source tables live at new
+paths (`delta/bronze_crash1`, ...), so nothing old is reused. For a clean start,
+stop the stack and delete `delta/` and `checkpoints/` (the reference mappings are
+re-seeded on start), then `docker compose up -d --build`.
 
 First run takes a minute or two (Spark images install a JVM, connector
 jars get pulled). Subsequent runs are fast.
 
 ## Watch it work
 
-- **Kafka UI** — http://localhost:8080 — browse `crashes.crash1`, `crashes.crash2`, `crashes.crash3`
+- **Kafka UI** — http://localhost:8080 — browse `crashes.crash1` .. `crashes.crash4`
 - **Producer logs** — `[Crash1] Batch N: published 50 rows to 'crashes.crash1'`
-- **bronze-silver1-job logs** — one Spark driver running two queries:
-  - `[bronze]` prints subscribed topics and streams micro-batches into `delta/bronze`
-  - `[silver1]` unpacks JSON into 49 fields and runs formatting/cleaning SQL -> `delta/silver1`
-- **silver2-gold-job logs** — one Spark driver running two queries:
-  - `[silver2]` streams from Silver 1 and applies standardization SQL -> `delta/silver2`
-  - `[gold]` streams from Silver 2 into business-ready table -> `delta/gold`
+- **bronze-silver1-job logs** — one Spark driver running 8 queries (2 per source):
+  - `[bronze_crash1]` streams its topic into `delta/bronze_crash1`
+  - `[silver1_crash1]` unpacks JSON into 49 fields and runs formatting/cleaning SQL -> `delta/silver1_crash1`
+- **silver2-gold-job logs** — one Spark driver running 5 queries:
+  - `[silver2_crash1]` standardizes Silver 1 -> `delta/silver2_crash1`, failures -> `delta/silver2_quarantine`
+  - `[gold]` streams the UNION ALL of every Silver 2 table into `delta/gold`
 - **lineage-consumer logs** — `[lineage] write_gold COMPLETED (n of m events written)`
 - **Neo4j browser** — http://localhost:7474 (user `neo4j`, password `NEO4J_PASSWORD`, default
   `selfhealing`) — try `MATCH p=(:Table)-[:FEEDS*]->(:Table) RETURN p`
@@ -53,12 +66,22 @@ jars get pulled). Subsequent runs are fast.
 
 ```bash
 pip install deltalake pandas
-python verify_delta.py bronze
-python verify_delta.py silver1
-python verify_delta.py silver2
+python verify_delta.py bronze_crash1
+python verify_delta.py silver1_crash1
+python verify_delta.py silver2_crash3
 python verify_delta.py silver2_quarantine
 python verify_delta.py ref_mappings
 python verify_delta.py gold
+```
+
+For a richer view, `Read Data/read_parquet_v3.py` (needs `duckdb deltalake pandas`,
+`rich` optional) knows the per-source layout:
+
+```bash
+python "Read Data/read_parquet_v3.py" overview                # rows per source and layer
+python "Read Data/read_parquet_v3.py" silver2 --table 10      # all sources, with source_table
+python "Read Data/read_parquet_v3.py" quarantine --source crash3
+python "Read Data/read_parquet_v3.py" trace                   # one record through its branch
 ```
 
 To stop: `docker compose down`. To wipe all state and start clean:
@@ -100,13 +123,16 @@ Spark jobs --OpenLineage events--> kafka: openlineage.events --> lineage-consume
 ```
 
 - `lineage/normalize.py` keeps only the events that write a pipeline table and maps
-  paths to table names (`/data/delta/silver2` becomes `silver2`). The raw stream is
+  paths to table names (`/data/delta/silver2_crash3` becomes `silver2_crash3`; tables
+  must sit directly under `/data/delta`, a nested path is dropped). The raw stream is
   mostly Spark-internal plans and `_delta_log` reads, which carry no lineage.
 - `lineage/graph.py` merges `(:Job)`, `(:Run)`, `(:Table)`, `(:SchemaVersion)` and
   `(:Table)-[:FEEDS]->(:Table)` into Neo4j. Every statement is a `MERGE`, so a replayed
   event changes nothing. The `:Table` nodes are the ones incidents attach to.
 - `graph.downstream_tables()` / `upstream_tables()` answer "what does a failure in
-  `silver2` reach" for the Deterministic Lookup step.
+  `silver2_crash3` reach" (just `gold`, not the other sources) for the Deterministic
+  Lookup step. Incidents are keyed per layer (`silver2|column|value`), so a fix learned
+  on one source is found again on another.
 
 The listener must be **openlineage-spark 1.53.0 or newer** (pinned to 1.54.0). Earlier
 versions do not report the Gold write, so the `silver2 -> gold` edge is missing.
@@ -161,7 +187,7 @@ these values in `.env` to replay only the column-mismatch partition:
 ```dotenv
 TABLES=Crash4
 CSV_FILES=Crash4-2.csv
-KAFKA_TOPICS=crashes.crash4
+SOURCES=crash4
 QWEN_ENABLED=true
 ```
 

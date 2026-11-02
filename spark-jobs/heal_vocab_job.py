@@ -104,7 +104,7 @@
 #     """
 #     Classify an unknown raw string into one of the allowed canonical enums.
 #     Handles semantic variants (e.g. 'misty dark', abbreviations, '$1489')
-#     that Levenshtein edit distance cannot reach.
+#     that Damerau-Levenshtein edit distance cannot reach.
 #     """
 #     valid_targets = CANONICAL_ENUMS.get(field_name, [])
 #     if not valid_targets:

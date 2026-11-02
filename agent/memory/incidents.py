@@ -9,6 +9,7 @@ task 3.5, and its output size must match `vector.dimensions` in schema.cypher.
 """
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -27,10 +28,30 @@ def get_driver():
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 
+# Per-source tables are "<layer>_<source>" (spark-jobs/sources.py): silver2_crash3.
+# Sources are letters and digits only, so the suffix never contains "_".
+_PER_SOURCE_TABLE = re.compile(r"^(bronze|silver1|silver2)_([a-z][a-z0-9]*)$")
+# Shared tables whose names look like "<layer>_<word>" but are not a source branch.
+_SHARED_TABLES = {"silver2_quarantine", "silver1_dead_letter", "silver2_dead_letter", "silver2_fuzzy_audit"}
+
+
+def logical_table(table_name: str) -> str:
+    """The layer a table belongs to: "silver2_crash3" -> "silver2"; other names unchanged.
+
+    The four source branches share one vocabulary, so a fix learned on Crash1 must be
+    found again when the same value shows up in Crash3. Incidents are therefore keyed
+    on the layer, while (:Incident)-[:AFFECTS]->(:Table) keeps the exact table.
+    """
+    if table_name in _SHARED_TABLES:
+        return table_name
+    match = _PER_SOURCE_TABLE.match(table_name or "")
+    return match.group(1) if match else table_name
+
+
 def signature_key(table_name: str, column_name: Optional[str], raw_value: Optional[str]) -> str:
-    """Exact-match key for a failure: same table, column and normalised raw value."""
+    """Exact-match key for a failure: same layer, column and normalised raw value."""
     value = (raw_value or "").strip().upper()
-    return f"{table_name}|{column_name or ''}|{value}"
+    return f"{logical_table(table_name)}|{column_name or ''}|{value}"
 
 
 def apply_schema(driver) -> None:
