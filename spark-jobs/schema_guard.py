@@ -19,11 +19,14 @@ def schema_error(table, expected_only, source_only):
     )
 
 
-def process_source_batch(batch, batch_id, expected_columns, write_valid, dead_letter_path):
+def process_source_batch(batch, batch_id, expected_columns, write_valid, dead_letter_path,
+                         txn_app_id=None, affected_dataset='bronze'):
     """Park schema-invalid raw records, classify each signature, then clean valid rows.
 
     Storage failures propagate, so the streaming checkpoint cannot skip unsaved data.
     Qwen failures retain a reviewable incident and never release invalid records.
+    `txn_app_id` must differ per source when several sources share dead_letter_path
+    (see common.idempotent_append); it defaults to SILVER1_TXN_APP_ID.
     """
     from pyspark.sql import functions as F
     from pyspark.sql.types import MapType, StringType
@@ -71,9 +74,9 @@ def process_source_batch(batch, batch_id, expected_columns, write_valid, dead_le
                       .withColumn('silver1_batch_id', F.lit(batch_id))
                       .withColumn('healing_status', F.lit('PENDING_LLM'))
                       .withColumn('failed_at', F.current_timestamp()))
-            (parked.write.format('delta').mode('append')
-             .option('txnAppId', os.getenv('SILVER1_TXN_APP_ID', 'silver1') + '_dead_letter')
-             .option('txnVersion', batch_id).save(dead_letter_path))
+            from common import idempotent_append
+            app_id = (txn_app_id or os.getenv('SILVER1_TXN_APP_ID', 'silver1')) + '_dead_letter'
+            idempotent_append(parked, dead_letter_path, app_id, batch_id)
             for issue in issues:
                 exc = (ValueError('[CORRUPT_RECORD] Malformed JSON object in table '
                                   + str(issue._table_name or 'UNKNOWN'))
@@ -86,7 +89,7 @@ def process_source_batch(batch, batch_id, expected_columns, write_valid, dead_le
                                       table=issue._table_name, dead_letter_path=dead_letter_path,
                                       context={
                                           'source_topic': issue.topic,
-                                          'affected_dataset': 'bronze',
+                                          'affected_dataset': affected_dataset,
                                           'detected_error_class': issue._detected_error_class,
                                           'expected_only': issue._expected_only,
                                           'source_only': issue._source_only,

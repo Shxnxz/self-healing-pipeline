@@ -11,7 +11,10 @@ Tests:
   5. Vocabulary promotion via Delta MERGE
   6. In-memory overlay validation (overlay_mappings)
   7. Transform failure -> DEAD_LETTER_PATH parking
-  8. Real data slice from /data/delta/silver1
+  8. Real data slice from one source's Silver 1 table (/data/delta/silver1_crash1)
+
+The per-source layout itself (several sources in one driver, shared quarantine,
+Gold UNION ALL) is covered by test_per_source_pipeline.py.
 """
 import os
 import shutil
@@ -30,6 +33,7 @@ from pyspark.sql.types import (
 )
 
 from common import build_spark
+from sources import source_names, table_path
 import ref_mappings
 from ref_mappings import (
     _is_delta_table,
@@ -54,6 +58,8 @@ TEST_AUDIT = f"{TEST_BASE}/fuzzy_audit"
 TEST_SILVER2 = f"{TEST_BASE}/silver2"
 TEST_QUARANTINE = f"{TEST_BASE}/quarantine"
 TEST_DEAD_LETTER = f"{TEST_BASE}/dead_letter"
+# Real Silver 1 rows to build test batches from: the first source's table.
+SILVER1_SAMPLE_PATH = table_path("silver1", source_names()[0])
 
 
 def cleanup_test_dirs():
@@ -120,13 +126,12 @@ def run_tests():
     print("\n[TEST 4] Testing micro-batch processing & routing...")
     silver2_job.REF_MAPPINGS_PATH = TEST_REF
     silver2_job.FUZZY_AUDIT_PATH = TEST_AUDIT
-    silver2_job.SILVER2_PATH = TEST_SILVER2
     silver2_job.QUARANTINE_PATH = TEST_QUARANTINE
     silver2_job.DEAD_LETTER_PATH = TEST_DEAD_LETTER
     silver2_job.TXN_APP_ID = "test_run"
 
     # Read base schema from silver1
-    silver1_df = spark.read.format("delta").load(silver2_job.SILVER1_PATH)
+    silver1_df = spark.read.format("delta").load(SILVER1_SAMPLE_PATH)
     cols = silver1_df.columns
 
     # Grab 3 sample rows as base template
@@ -160,7 +165,7 @@ def run_tests():
     base_rows[2]["street_direction"] = "NORTH"
 
     test_batch_df = spark.createDataFrame(base_rows, schema=silver1_df.schema)
-    processor = make_batch_processor(spark)
+    processor = make_batch_processor(spark, TEST_SILVER2, target_table="silver2_test")
 
     print("  -> Executing batch 1...")
     processor(test_batch_df, 1)
@@ -279,8 +284,8 @@ def run_tests():
     # -------------------------------------------------------------
     # Test 8: Real Data Batch from Silver 1
     # -------------------------------------------------------------
-    print("\n[TEST 8] Processing real batch of 50 rows from /data/delta/silver1...")
-    real_slice = spark.read.format("delta").load(silver2_job.SILVER1_PATH).limit(50)
+    print(f"\n[TEST 8] Processing real batch of 50 rows from {SILVER1_SAMPLE_PATH}...")
+    real_slice = spark.read.format("delta").load(SILVER1_SAMPLE_PATH).limit(50)
     processor(real_slice, 3)
 
     final_s2 = spark.read.format("delta").load(TEST_SILVER2).count()

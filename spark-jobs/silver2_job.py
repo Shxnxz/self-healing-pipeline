@@ -5,6 +5,11 @@ Reads from Silver 1's cleaned Delta table, applies canonical lookup mappings
 and native date/numeric parsing chains, isolates failed records into a
 physically separate Quarantine table, and appends valid records to Silver 2.
 
+One query per source (sources.py): silver1_crash3 -> silver2_crash3. The
+quarantine, dead-letter, fuzzy-audit and ref-mapping tables are shared by all
+sources; quarantine and dead-letter rows carry `target_table` (e.g.
+"silver2_crash3"), the Silver 2 table a healed row is replayed into.
+
 Per micro-batch the job runs in two stages:
 
   1. TRANSFORM  - standardize + materialize. Any Spark exception here (schema
@@ -39,7 +44,8 @@ from pyspark.sql.types import (
     StringType,
 )
 
-from common import build_spark, wait_for_delta_table
+from common import build_spark, idempotent_append, wait_for_delta_table
+from sources import checkpoint_path, shared_path, source_names, table_name, table_path
 from ref_mappings import (
     ANCHOR_TO_CANONICAL,
     CANONICAL_ANCHORS,
@@ -50,23 +56,21 @@ from ref_mappings import (
     load_mappings_dict,
 )
 
-SILVER1_PATH = os.environ.get("SILVER1_PATH", "/data/delta/silver1")
-SILVER2_PATH = os.environ.get("SILVER2_PATH", "/data/delta/silver2")
-CHECKPOINT_PATH = os.environ.get("SILVER2_CHECKPOINT_PATH", "/data/checkpoints/silver2")
-QUARANTINE_PATH = os.environ.get("QUARANTINE_PATH", "/data/delta/silver2_quarantine")
-DEAD_LETTER_PATH = os.environ.get(
-    "DEAD_LETTER_PATH", "/data/delta/silver2_dead_letter"
-)
-REF_MAPPINGS_PATH = os.environ.get(
-    "REF_MAPPINGS_PATH", "/data/delta/ref_canonical_mappings"
-)
+# Silver 1 / Silver 2 tables and checkpoints are per source (sources.py):
+# silver1_crash3 -> silver2_crash3. The tables below are shared by every source.
+QUARANTINE_PATH = os.environ.get("QUARANTINE_PATH", shared_path("silver2_quarantine"))
+DEAD_LETTER_PATH = os.environ.get("DEAD_LETTER_PATH", shared_path("silver2_dead_letter"))
+REF_MAPPINGS_PATH = os.environ.get("REF_MAPPINGS_PATH", shared_path("ref_canonical_mappings"))
 FUZZY_AUDIT_PATH = os.environ.get(
-    "FUZZY_AUDIT_PATH", os.environ.get("AUDIT_PATH", "/data/delta/silver2_fuzzy_audit")
+    "FUZZY_AUDIT_PATH", os.environ.get("AUDIT_PATH", shared_path("silver2_fuzzy_audit"))
 )
 
-# Idempotent-write application id. Delta ignores any write whose txnVersion is
-# <= the last one recorded for the same appId, and batch ids restart at 0 when a
-# checkpoint is wiped. So: if you ever delete CHECKPOINT_PATH, change this value.
+# Base of the idempotent-write application ids; each source query uses
+# "<TXN_APP_ID>_<source>". Delta ignores any write whose txnVersion is <= the last
+# one recorded for the same appId, and batch ids restart at 0 when a checkpoint is
+# wiped. So: if you ever delete the checkpoints, change this value. The source
+# suffix matters: the four queries all write the shared quarantine with batch ids
+# starting at 0, and with one shared appId Delta would skip each other's batches.
 TXN_APP_ID = os.environ.get("TXN_APP_ID", "silver2_job")
 
 # Set to "true" only if Silver 1 is ever updated/merged (not append-only);
@@ -399,20 +403,26 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
     )
 
 
-def _txn_write(df: DataFrame, path: str, table_tag: str, batch_id: int, merge_schema: bool = False):
+def _txn_write(
+    df: DataFrame,
+    path: str,
+    table_tag: str,
+    batch_id: int,
+    merge_schema: bool = False,
+    txn_app_id: Optional[str] = None,
+):
     """Idempotent Delta append: a replayed (appId, batch_id) pair is skipped by Delta."""
-    writer = (
-        df.write.format("delta")
-        .mode("append")
-        .option("txnAppId", f"{TXN_APP_ID}:{table_tag}")
-        .option("txnVersion", batch_id)
-    )
-    if merge_schema:
-        writer = writer.option("mergeSchema", "true")
-    writer.save(path)
+    app_id = f"{txn_app_id or TXN_APP_ID}:{table_tag}"
+    idempotent_append(df, path, app_id, batch_id, merge_schema=merge_schema)
 
 
-def _dead_letter_batch(batch_df: DataFrame, batch_id: int, exc: BaseException) -> None:
+def _dead_letter_batch(
+    batch_df: DataFrame,
+    batch_id: int,
+    exc: BaseException,
+    txn_app_id: Optional[str] = None,
+    target_table: Optional[str] = None,
+) -> None:
     """
     Park the raw batch plus the Spark error for the small-LLM triage node.
     The batch is stored as JSON so the dead-letter schema stays stable even when
@@ -430,21 +440,35 @@ def _dead_letter_batch(batch_df: DataFrame, batch_id: int, exc: BaseException) -
         .withColumn("silver2_batch_id", F.lit(str(batch_id)))
         .withColumn("failed_at", F.current_timestamp())
         .withColumn("healing_status", F.lit("PENDING_LLM"))
+        .withColumn("target_table", F.lit(target_table).cast(StringType()))
     )
     try:
-        _txn_write(out, DEAD_LETTER_PATH, "dead_letter", batch_id, merge_schema=True)
+        _txn_write(out, DEAD_LETTER_PATH, "dead_letter", batch_id, merge_schema=True,
+                   txn_app_id=txn_app_id)
     except Exception as dl_exc:  # could not even park the batch: stop, let Spark replay it
         raise RuntimeError(
             f"[silver2] Batch {batch_id}: transform failed AND dead-letter write failed"
         ) from dl_exc
     print(
-        f"[silver2] Batch {batch_id}: transform failed ({type(exc).__name__}); "
+        f"[{target_table or 'silver2'}] Batch {batch_id}: transform failed ({type(exc).__name__}); "
         f"batch parked at {DEAD_LETTER_PATH} for LLM triage"
     )
 
 
-def make_batch_processor(spark: SparkSession):
-    """Returns the foreachBatch function with access to spark session."""
+def make_batch_processor(
+    spark: SparkSession,
+    silver2_path: str,
+    txn_app_id: Optional[str] = None,
+    target_table: Optional[str] = None,
+):
+    """
+    Returns the foreachBatch function for one source.
+
+    Valid rows go to `silver2_path` (that source's own Silver 2 table); failures go
+    to the shared quarantine / dead letter tables tagged with `target_table`, the
+    Silver 2 table a healed row is replayed into. `txn_app_id` must be unique per
+    source (see TXN_APP_ID).
+    """
 
     def process_micro_batch(batch_df: DataFrame, batch_id: int):
         # 1. Reload the latest committed canonical mappings per micro-batch
@@ -463,7 +487,7 @@ def make_batch_processor(spark: SparkSession):
         except Exception as exc:
             if transformed is not None:
                 transformed.unpersist()
-            _dead_letter_batch(batch_df, batch_id, exc)
+            _dead_letter_batch(batch_df, batch_id, exc, txn_app_id, target_table)
             # Classify only after the raw batch is durably preserved (IC2/IC4).
             from qwen_classifier.integration import capture_exception
             capture_exception(exc, job_name="Silver2", batch_id=batch_id,
@@ -486,7 +510,7 @@ def make_batch_processor(spark: SparkSession):
                 valid_df = transformed.filter(~failed).drop(
                     "columns_to_remediate", "_fuzzy_audit_entries", "raw_record"
                 )
-                _txn_write(valid_df, SILVER2_PATH, "valid", batch_id)
+                _txn_write(valid_df, silver2_path, "valid", batch_id, txn_app_id=txn_app_id)
 
             # Quarantined rows keep columns_to_remediate and the original raw_record
             if n_quarantined > 0:
@@ -496,10 +520,12 @@ def make_batch_processor(spark: SparkSession):
                     .withColumn("quarantined_at", F.current_timestamp())
                     .withColumn("silver2_batch_id", F.lit(str(batch_id)))
                     .withColumn("healing_status", F.lit("PENDING"))
+                    .withColumn("target_table", F.lit(target_table).cast(StringType()))
                 )
-                _txn_write(quarantine_out, QUARANTINE_PATH, "quarantine", batch_id, merge_schema=True)
+                _txn_write(quarantine_out, QUARANTINE_PATH, "quarantine", batch_id,
+                           merge_schema=True, txn_app_id=txn_app_id)
                 print(
-                    f"[silver2] Batch {batch_id}: quarantined {n_quarantined} of {total} records "
+                    f"[{target_table or 'silver2'}] Batch {batch_id}: quarantined {n_quarantined} of {total} records "
                     f"at {QUARANTINE_PATH}"
                 )
 
@@ -522,9 +548,10 @@ def make_batch_processor(spark: SparkSession):
                         F.col("batch_id"),
                     )
                 )
-                _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", batch_id, merge_schema=True)
+                _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", batch_id,
+                           merge_schema=True, txn_app_id=txn_app_id)
                 print(
-                    f"[silver2] Batch {batch_id}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
+                    f"[{target_table or 'silver2'}] Batch {batch_id}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
                 )
         finally:
             transformed.unpersist()
@@ -541,37 +568,47 @@ def _require_spark_version(spark: SparkSession) -> None:
         )
 
 
-def start(spark: SparkSession, upstream: Optional[StreamingQuery] = None) -> StreamingQuery:
-    """Start the Silver 2 query on `spark`; `upstream` is the Silver 1 query if it shares this driver."""
+def init_shared_tables(spark: SparkSession) -> None:
+    """Create the shared reference and audit tables once, before any source query starts."""
     _require_spark_version(spark)
-
-    # Initialize reference canonical mappings if table does not exist
     init_ref_mappings(spark, REF_MAPPINGS_PATH)
-
-    # Initialize fuzzy audit Delta table if not already present
     init_fuzzy_audit(spark, FUZZY_AUDIT_PATH)
 
+
+def start(
+    spark: SparkSession, source: str, upstream: Optional[StreamingQuery] = None
+) -> StreamingQuery:
+    """Start silver2_<source>; `upstream` is the silver1_<source> query if it shares this driver."""
+    # Idempotent: the first source creates the tables, the rest find them.
+    init_shared_tables(spark)
+
+    silver1_path = table_path("silver1", source)
+    silver2_path = table_path("silver2", source)
+    target_table = table_name("silver2", source)
+
     # Wait for upstream Silver 1 Delta table
-    wait_for_delta_table(SILVER1_PATH, upstream=upstream)
+    wait_for_delta_table(silver1_path, upstream=upstream)
 
     reader = spark.readStream.format("delta")
     if SILVER1_SKIP_CHANGE_COMMITS:
         reader = reader.option("skipChangeCommits", "true")
-    silver1_stream = reader.load(SILVER1_PATH)
+    silver1_stream = reader.load(silver1_path)
 
-    batch_processor = make_batch_processor(spark)
+    batch_processor = make_batch_processor(
+        spark, silver2_path, txn_app_id=f"{TXN_APP_ID}_{source}", target_table=target_table
+    )
 
     # foreachBatch owns all writes, so no sink format is set on the writeStream
     query = (
-        silver1_stream.writeStream.queryName("silver2")
+        silver1_stream.writeStream.queryName(target_table)
         .trigger(processingTime="10 seconds")
-        .option("checkpointLocation", CHECKPOINT_PATH)
+        .option("checkpointLocation", checkpoint_path("silver2", source))
         .foreachBatch(batch_processor)
         .start()
     )
 
     print(
-        f"[silver2] Streaming {SILVER1_PATH} -> {SILVER2_PATH} "
+        f"[{target_table}] Streaming {silver1_path} -> {silver2_path} "
         f"(Quarantine: {QUARANTINE_PATH}, Audit: {FUZZY_AUDIT_PATH}, "
         f"Dead letter: {DEAD_LETTER_PATH})"
     )
@@ -579,7 +616,10 @@ def start(spark: SparkSession, upstream: Optional[StreamingQuery] = None) -> Str
 
 
 def main():
-    start(build_spark("Silver2StandardizeTransform")).awaitTermination()
+    spark = build_spark("Silver2StandardizeTransform")
+    for source in source_names():
+        start(spark, source)
+    spark.streams.awaitAnyTermination()
 
 
 if __name__ == "__main__":

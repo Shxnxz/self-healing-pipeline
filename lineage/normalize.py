@@ -9,7 +9,9 @@ no Neo4j) so it can be tested with captured events.
 Only events that write at least one pipeline table are kept; reads and internal
 plans carry no lineage on their own. Datasets map to tables like this:
   - a directory directly under DELTA_ROOT becomes (:Table {name: "<dir name>"}), so
-    /data/delta/silver2 -> "silver2", the name (:Incident)-[:AFFECTS]->(:Table) uses
+    /data/delta/silver2_crash3 -> "silver2_crash3", the name (:Incident)-[:AFFECTS]->(:Table)
+    uses. Per-source tables must therefore sit directly under the root
+    (spark-jobs/sources.py); /data/delta/silver2/crash3 would be dropped
   - a Kafka topic becomes (:Table {kind: "kafka_topic"})
   - anything else (`_delta_log` snapshots, parquet part files, ...) is dropped
 """

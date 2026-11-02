@@ -2,8 +2,8 @@
 Silver 1: Parse JSON envelope + Initial formatting & cleaning via SQL.
 
 Reads raw JSON strings from Bronze, unpacks the envelope and payload schema,
-and registers a temp view 'bronze_flat'. Runs SILVER1_TRANSFORM_SQL which can
-be modified for formatting and cleaning logic.
+and runs SILVER1_TRANSFORM_SQL over it, which can be modified for formatting and
+cleaning logic. One query per source: bronze_crash3 -> silver1_crash3.
 """
 
 import os
@@ -14,14 +14,16 @@ from pyspark.sql.functions import col, coalesce, from_json
 from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import LongType, StringType, StructField, StructType
 
-from common import build_spark, wait_for_delta_table
+from common import build_spark, idempotent_append, wait_for_delta_table
 from schema_guard import process_source_batch
+from sources import checkpoint_path, shared_path, source_names, table_name, table_path
 
-BRONZE_PATH = os.environ.get("BRONZE_PATH", "/data/delta/bronze")
-SILVER1_PATH = os.environ.get("SILVER1_PATH", "/data/delta/silver1")
-CHECKPOINT_PATH = os.environ.get(
-    "SILVER1_CHECKPOINT_PATH", "/data/checkpoints/silver1"
-)
+# Shared by every source; each parked row records its source table.
+DEAD_LETTER_PATH = os.environ.get("SILVER1_DEAD_LETTER_PATH", shared_path("silver1_dead_letter"))
+
+# Base for the idempotent-write ids; the source is appended per query (see
+# common.idempotent_append). If you ever wipe the checkpoints, change this value.
+SILVER1_TXN_APP_ID = os.getenv("SILVER1_TXN_APP_ID", "silver1")
 
 CRASH_COLUMNS = [
     "crash_record_id",
@@ -90,6 +92,9 @@ ENVELOPE_SCHEMA = StructType(
 
 # SQL for Silver 1 (Formatting & Cleaning).
 # Modify this query to apply any custom type casts, trims, or cleanups.
+# `{bronze_flat}` is the parsed batch, passed to spark.sql() as a DataFrame rather
+# than a temp view: temp views are shared by the whole Spark session, so the
+# per-source queries running in parallel would overwrite each other's view.
 SILVER1_TRANSFORM_SQL = """
 SELECT
     record_id,
@@ -147,11 +152,11 @@ SELECT
     NULLIF(TRIM(lane_cnt), '') AS lane_cnt,
     NULLIF(UPPER(TRIM(workers_present_i)), '') AS workers_present_i,
     NULLIF(UPPER(TRIM(dooring_i)), '') AS dooring_i
-FROM bronze_flat
+FROM {bronze_flat}
 """
 
 
-def write_clean_batch(batch_df, batch_id):
+def write_clean_batch(batch_df, batch_id, silver1_path, txn_app_id):
     """Run the existing cleanup only after source schema validation."""
     spark = batch_df.sparkSession
     flattened = batch_df.select(
@@ -171,32 +176,42 @@ def write_clean_batch(batch_df, batch_id):
         ],
     )
 
-    flattened.createOrReplaceTempView("bronze_flat")
-    silver1 = spark.sql(SILVER1_TRANSFORM_SQL)
+    silver1 = spark.sql(SILVER1_TRANSFORM_SQL, bronze_flat=flattened)
 
-    (silver1.write.format("delta").mode("append")
-     .option("txnAppId", os.getenv("SILVER1_TXN_APP_ID", "silver1") + "_clean")
-     .option("txnVersion", batch_id).save(SILVER1_PATH))
+    idempotent_append(silver1, silver1_path, txn_app_id + "_clean", batch_id)
 
 
-def start(spark: SparkSession, upstream: Optional[StreamingQuery] = None) -> StreamingQuery:
-    wait_for_delta_table(BRONZE_PATH, upstream=upstream)
-    bronze_stream = spark.readStream.format("delta").load(BRONZE_PATH)
-    dead_letter_path = os.environ.get("SILVER1_DEAD_LETTER_PATH", "/data/delta/silver1_dead_letter")
+def start(
+    spark: SparkSession, source: str, upstream: Optional[StreamingQuery] = None
+) -> StreamingQuery:
+    """Start silver1_<source>: bronze_<source> -> silver1_<source>, bad schemas -> shared dead letter."""
+    bronze_path = table_path("bronze", source)
+    silver1_path = table_path("silver1", source)
+    txn_app_id = f"{SILVER1_TXN_APP_ID}_{source}"
+    wait_for_delta_table(bronze_path, upstream=upstream)
+    bronze_stream = spark.readStream.format("delta").load(bronze_path)
+
+    def write_clean(batch, batch_id):
+        write_clean_batch(batch, batch_id, silver1_path, txn_app_id)
 
     def process(batch, batch_id):
-        process_source_batch(batch, batch_id, CRASH_COLUMNS, write_clean_batch, dead_letter_path)
+        process_source_batch(batch, batch_id, CRASH_COLUMNS, write_clean, DEAD_LETTER_PATH,
+                             txn_app_id=txn_app_id,
+                             affected_dataset=table_name("bronze", source))
 
-    query = (bronze_stream.writeStream.queryName("silver1")
+    query = (bronze_stream.writeStream.queryName(f"silver1_{source}")
              .trigger(processingTime="10 seconds")
-             .option("checkpointLocation", CHECKPOINT_PATH)
+             .option("checkpointLocation", checkpoint_path("silver1", source))
              .foreachBatch(process).start())
-    print(f"[silver1] Validating {BRONZE_PATH} -> {SILVER1_PATH}", flush=True)
+    print(f"[silver1_{source}] Validating {bronze_path} -> {silver1_path}", flush=True)
     return query
 
 
 def main():
-    start(build_spark("Silver1CleanTransform")).awaitTermination()
+    spark = build_spark("Silver1CleanTransform")
+    for source in source_names():
+        start(spark, source)
+    spark.streams.awaitAnyTermination()
 
 
 if __name__ == "__main__":

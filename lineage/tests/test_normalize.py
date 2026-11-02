@@ -121,3 +121,11 @@ def test_malformed_events_are_ignored():
     assert normalize({}) is None
     assert normalize({"eventType": "COMPLETE", "run": {}}) is None
     assert normalize({"eventType": "OTHER", "run": {"runId": "r"}, "eventTime": "t"}) is None
+
+
+def test_per_source_tables_become_their_own_nodes():
+    # spark-jobs/sources.py puts each source's tables directly under the root.
+    ds = {"namespace": "file", "name": "/data/delta/silver2_crash3"}
+    assert table_from_dataset(ds) == TableRef("silver2_crash3", "delta")
+    # A nested layout would silently drop out of the graph, which is why sources.py avoids it.
+    assert table_from_dataset({"namespace": "file", "name": "/data/delta/silver2/crash3"}) is None
