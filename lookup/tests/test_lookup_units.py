@@ -229,3 +229,35 @@ def test_case_variant_rename_is_not_reused_even_with_same_signature_key():
     ctx = evaluate(f, "silver1_crash4", past, [], [])  # find_exact returned it
     assert not ctx["reusable"]
     assert ctx["candidates"][0]["matched_by"] == "STRUCTURED"
+
+
+# --- per-folder layout (PR #25: bronze_crashN -> silver1_crashN -> silver2_crashN -> gold) ---
+def test_split_table_handles_per_folder_names_only():
+    from failures import split_table
+    assert split_table("silver2_crash3") == ("silver2", "crash3")
+    assert split_table("/data/delta/bronze_crash1") == ("bronze", "crash1")
+    assert split_table("silver2_quarantine") == (None, None)
+    assert split_table("silver1_dead_letter") == (None, None)
+    assert split_table("gold") == (None, None)
+
+
+def test_schema_guard_table_name_in_affected_dataset_is_split():
+    f = from_qwen_incident(qwen_schema_msg(affected_dataset="bronze_crash3", table="Crash3"))
+    assert (f.origin_layer, f.detected_layer, f.folder) == ("bronze", "silver1", "Crash3")
+
+
+def test_silver2_crash_gets_folder_from_target_table():
+    msg = qwen_schema_msg(job_name="Silver2", table="silver2_crash3", affected_dataset=None,
+                          failure_type="MISSING_COLUMN")
+    f = from_qwen_incident(msg)
+    assert (f.origin_layer, f.detected_layer, f.folder) == ("silver1", "silver2", "crash3")
+    assert resolve_table(f.origin_layer, f.folder, {"silver1_crash3"}) == "silver1_crash3"
+
+
+def test_quarantine_folder_comes_from_target_table():
+    rows = [{"record_id": "r1", "table_name": "Crash3", "target_table": "silver2_crash3",
+             "columns_to_remediate": {"crash_month": "Jule"}},
+            {"record_id": "r2", "table_name": None, "target_table": "silver2_crash3",
+             "columns_to_remediate": {"crash_month": "JULE"}}]
+    (g,) = group_quarantine_rows(rows)
+    assert g.folder == "crash3" and g.rows_affected == 2

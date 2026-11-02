@@ -20,7 +20,7 @@ from confluent_kafka import Producer
 import config
 from failures import group_quarantine_rows
 
-COLUMNS = ["record_id", "table_name", "silver2_batch_id", "columns_to_remediate",
+COLUMNS = ["record_id", "table_name", "target_table", "silver2_batch_id", "columns_to_remediate",
            "quarantined_at", "healing_status"]
 
 

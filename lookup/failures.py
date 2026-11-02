@@ -46,6 +46,23 @@ JOB_LAYERS = {
 }
 
 
+# Layers with one table per data folder (spark-jobs/sources.py): silver2_crash3.
+PER_SOURCE_LAYERS = ("bronze", "silver1", "silver2")
+_SHARED_SUFFIXES = {"quarantine"}  # silver2_quarantine is shared, not a folder
+
+
+def split_table(name: Optional[str]):
+    """'silver2_crash3' -> ('silver2', 'crash3'); anything else -> (None, None).
+    Source names are letters and digits only (sources.py), so one '_' splits them."""
+    if not name:
+        return None, None
+    name = name.strip().rstrip("/").split("/")[-1]
+    layer, sep, rest = name.partition("_")
+    if sep and layer in PER_SOURCE_LAYERS and rest and "_" not in rest and rest not in _SHARED_SUFFIXES:
+        return layer, rest
+    return None, None
+
+
 def family(failure_type: Optional[str]) -> str:
     ft = (failure_type or "").upper()
     if ft in SCHEMA_TYPES:
@@ -125,7 +142,10 @@ class StructuredFailure:
 
 
 def _layers_for_job(job_name: Optional[str], affected_dataset: Optional[str]):
-    """Return (origin, detected, origin_affected)."""
+    """Return (origin, detected, origin_affected). `affected_dataset` may be a layer
+    ("bronze") or, since the per-folder split, a table ("bronze_crash3")."""
+    layer, _ = split_table(affected_dataset)
+    affected_dataset = layer or affected_dataset
     if job_name in JOB_LAYERS:
         origin, detected = JOB_LAYERS[job_name]
         return (affected_dataset or origin), detected, False
@@ -150,12 +170,17 @@ def from_qwen_incident(msg: dict) -> Optional[StructuredFailure]:
         failure_type = detected_class
     trusted = msg.get("classification_status") == "OK" and not msg.get("needs_review", True)
     batch = msg.get("batch_id")
+    # Folder: producer name ("Crash3"), or taken from a per-folder table name
+    # ("silver2_crash3" from Silver 2, "bronze_crash3" from the schema guard).
+    table = msg.get("table") or ref.get("source_table")
+    folder = (split_table(table)[1] or table
+              or split_table(msg.get("affected_dataset"))[1])
     return StructuredFailure(
         source=QWEN,
         failure_type=failure_type,
         origin_layer=origin,
         detected_layer=detected,
-        folder=msg.get("table") or ref.get("source_table"),
+        folder=folder,
         column_name=columns.get("reported_column") or msg.get("column"),
         raw_value=None,
         expected_only=tuple(sorted(columns.get("expected_only") or ref.get("expected_only") or ())),
@@ -179,17 +204,20 @@ def from_qwen_incident(msg: dict) -> Optional[StructuredFailure]:
 def group_quarantine_rows(rows: List[dict], sample_size: int = 5) -> List[StructuredFailure]:
     """Group quarantine rows into one failure per (folder, column, normalised value).
 
-    Each row is a dict with `table_name`, `record_id`, `silver2_batch_id` and
-    `columns_to_remediate` (column -> raw value, a dict or a list of pairs). A row
-    that fails on three columns contributes to three groups.
+    Each row is a dict with `table_name`, `record_id`, `silver2_batch_id`,
+    `columns_to_remediate` (column -> raw value, a dict or a list of pairs) and,
+    since the per-folder split, `target_table` ("silver2_crash3"), which names the
+    folder more reliably than the producer's `table_name`. A row that fails on
+    three columns contributes to three groups.
     """
     groups = {}
     for row in rows:
+        folder = split_table(row.get("target_table"))[1] or row.get("table_name")
         failing = row.get("columns_to_remediate") or {}
         if not isinstance(failing, dict):
             failing = dict(failing)
         for column, value in failing.items():
-            key = (row.get("table_name"), column, (value or "").strip().upper())
+            key = (folder, column, (value or "").strip().upper())
             g = groups.setdefault(key, {"rows": 0, "ids": [], "batches": set(), "value": value})
             g["rows"] += 1
             if row.get("record_id") and len(g["ids"]) < sample_size:
