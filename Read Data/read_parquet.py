@@ -3,16 +3,29 @@ import os
 # pyrefly: ignore [missing-import]
 import duckdb
 
-# Mapping of folder names for your pipeline layers
+SOURCES = ["crash1", "crash2", "crash3", "crash4"]  # spark-jobs/sources.py
+
+# Each data folder has its own Bronze / Silver 1 / Silver 2 table (bronze_crash1, ...);
+# Gold is the UNION ALL of the Silver 2 tables. "bronze", "silver1" and "silver2" read
+# every source's table at once. Note: globbing part files can include files Delta has
+# logically removed (after OPTIMIZE / overwrite); read_parquet_v3.py reads only the
+# current snapshot.
 LAYERS = {
-    "bronze": "./delta/bronze/part-*.parquet",
-    "silver1": "./delta/silver1/part-*.parquet",
-    "silver2": "./delta/silver2/part-*.parquet",
+    **{
+        f"{layer}_{source}": f"./delta/{layer}_{source}/part-*.parquet"
+        for layer in ("bronze", "silver1", "silver2")
+        for source in SOURCES
+    },
+    "bronze": "./delta/bronze_crash*/part-*.parquet",
+    "silver1": "./delta/silver1_crash*/part-*.parquet",
+    "silver2": "./delta/silver2_crash*/part-*.parquet",
     "gold": "./delta/gold/part-*.parquet",
-    # Legacy aliases
-    "silver": "./delta/silver1/part-*.parquet",
-    "silver_cars": "./delta/silver_cars/part-*.parquet",
-    "gold_car_overview": "./delta/gold_car_overview/part-*.parquet",
+    "quarantine": "./delta/silver2_quarantine/part-*.parquet",
+    "dead_letter": "./delta/silver2_dead_letter/part-*.parquet",
+    "audit": "./delta/silver2_fuzzy_audit/part-*.parquet",
+    "ref": "./delta/ref_canonical_mappings/part-*.parquet",
+    # Legacy alias
+    "silver": "./delta/silver1_crash*/part-*.parquet",
 }
 
 def main():
@@ -26,13 +39,16 @@ def main():
         parquet_pattern = LAYERS[arg]
         target_name = arg
     else:
-        print(f"Unknown argument '{arg}'. Provide a layer (bronze, silver, gold) or a direct path to a .parquet file.")
+        print(f"Unknown argument '{arg}'. Provide a table ({', '.join(LAYERS)}) or a direct path to a .parquet file.")
         sys.exit(1)
 
     print(f"\n--- Reading: {target_name} ---")
 
     try:
-        query = f"SELECT * FROM '{parquet_pattern}'"
+        # union_by_name: quarantine / audit were written with mergeSchema, and
+        # "bronze" etc. read several tables at once
+        source = f"read_parquet('{parquet_pattern}', union_by_name = true)"
+        query = f"SELECT * FROM {source}"
 
         # Check if user wants all rows or a custom limit
         show_all = "--all" in sys.argv or "-a" in sys.argv or "all" in sys.argv
@@ -55,9 +71,10 @@ def main():
             print("\n=== Data Preview (Top 10 rows) ===")
             duckdb.sql(query).limit(10).show(max_rows=10, max_width=10000)
             print("(Tip: Run with '--all' to view all rows, or specify a number: python3 read_parquet.py gold 20)")
+            print("(Tables: bronze_crash1 .. silver2_crash4, bronze/silver1/silver2 for all sources, gold, quarantine.)")
 
         # 2. Get total row count
-        count = duckdb.sql(f"SELECT COUNT(*) FROM '{parquet_pattern}'").fetchone()[0]
+        count = duckdb.sql(f"SELECT COUNT(*) FROM {source}").fetchall()[0][0]
         print(f"Total rows in {target_name}: {count}")
 
         # 3. Convert to Pandas DataFrame for further Python processing

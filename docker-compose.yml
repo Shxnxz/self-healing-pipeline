@@ -50,7 +50,8 @@ services:
       - ./data:/data:ro
     environment:
       DATA_DIR: /data
-      TABLES: ${TABLES:-Crash1,Crash2,Crash3}
+      # Must match SOURCES on the Spark jobs below (same folders, lower-cased).
+      TABLES: ${TABLES:-Crash1,Crash2,Crash3,Crash4}
       CSV_FILES: ${CSV_FILES:-}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC_PREFIX: crashes
@@ -64,9 +65,10 @@ services:
         condition: service_healthy
 
   # --- Bronze + Silver 1 -------------------------------------------
-  # One Spark driver, two streaming queries:
-  #   Kafka -> Delta, untouched raw landing (bronze)
-  #   Bronze -> parsed/cleaned via SILVER1_TRANSFORM_SQL (silver1)
+  # One Spark driver, one query per layer per source (spark-jobs/sources.py),
+  # so 8 queries with the 4 default sources:
+  #   crashes.crashN -> bronze_crashN    untouched raw landing
+  #   bronze_crashN  -> silver1_crashN   parsed/cleaned via SILVER1_TRANSFORM_SQL
   bronze-silver1-job:
     build: ./spark-jobs
     container_name: bronze-silver1-job
@@ -87,13 +89,14 @@ services:
       QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TOPICS: ${KAFKA_TOPICS:-crashes.crash1,crashes.crash2,crashes.crash3}
       OPENLINEAGE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       OPENLINEAGE_TOPIC: openlineage.events
-      BRONZE_PATH: /data/delta/bronze
-      BRONZE_CHECKPOINT_PATH: /data/checkpoints/bronze
-      SILVER1_PATH: /data/delta/silver1
-      SILVER1_CHECKPOINT_PATH: /data/checkpoints/silver1
+      # One branch per data folder; topic crashes.<source>, tables <layer>_<source>.
+      SOURCES: ${SOURCES:-crash1,crash2,crash3,crash4}
+      DELTA_ROOT: /data/delta
+      CHECKPOINT_ROOT: /data/checkpoints
+      SPARK_DRIVER_MEMORY: ${BRONZE_SILVER1_DRIVER_MEMORY:-1g}
+      SPARK_SHUFFLE_PARTITIONS: "8"
       SILVER1_TXN_APP_ID: ${SILVER1_TXN_APP_ID:-silver1}
       SILVER1_OPTIONAL_COLUMNS: ${SILVER1_OPTIONAL_COLUMNS:-[]}
     depends_on:
@@ -101,9 +104,11 @@ services:
         condition: service_healthy
 
   # --- Silver 2 + Gold ----------------------------------------------
-  # One Spark driver, two streaming queries:
-  #   Silver 1 -> standardized via canonical lookups & parsing chains (silver2)
-  #   Silver 2 -> business-ready fields via GOLD_TRANSFORM_SQL (gold)
+  # One Spark driver, 5 queries with the 4 default sources:
+  #   silver1_crashN -> silver2_crashN   canonical lookups & parsing chains (one per source;
+  #                                      failures -> the shared silver2_quarantine)
+  #   silver2_crash1..4 -> gold          UNION ALL, business-ready fields via GOLD_TRANSFORM_SQL
+  # 2g driver: the four Silver 2 queries each cache their micro-batch at the same time.
   silver2-gold-job:
     build: ./spark-jobs
     container_name: silver2-gold-job
@@ -123,10 +128,12 @@ services:
       QWEN_INCIDENT_DIR: /data/incidents
       QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
-      SILVER1_PATH: /data/delta/silver1
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      SILVER2_PATH: /data/delta/silver2
-      SILVER2_CHECKPOINT_PATH: /data/checkpoints/silver2
+      SOURCES: ${SOURCES:-crash1,crash2,crash3,crash4}
+      DELTA_ROOT: /data/delta
+      CHECKPOINT_ROOT: /data/checkpoints
+      SPARK_DRIVER_MEMORY: ${SILVER2_GOLD_DRIVER_MEMORY:-2g}
+      SPARK_SHUFFLE_PARTITIONS: "8"
       QUARANTINE_PATH: /data/delta/silver2_quarantine
       DEAD_LETTER_PATH: /data/delta/silver2_dead_letter
       REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
