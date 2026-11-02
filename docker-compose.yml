@@ -50,7 +50,8 @@ services:
       - ./data:/data:ro
     environment:
       DATA_DIR: /data
-      TABLES: Crash1,Crash2,Crash3
+      TABLES: ${TABLES:-Crash1,Crash2,Crash3}
+      CSV_FILES: ${CSV_FILES:-}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC_PREFIX: crashes
       TOPIC_PER_TABLE: "true"
@@ -83,14 +84,18 @@ services:
       QWEN_BASE_URL: ${QWEN_BASE_URL:-http://host.docker.internal:11434}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3:4b-instruct}
       QWEN_INCIDENT_DIR: /data/incidents
+      QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
+      QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TOPICS: crashes.crash1,crashes.crash2,crashes.crash3
+      KAFKA_TOPICS: ${KAFKA_TOPICS:-crashes.crash1,crashes.crash2,crashes.crash3}
       OPENLINEAGE_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       OPENLINEAGE_TOPIC: openlineage.events
       BRONZE_PATH: /data/delta/bronze
       BRONZE_CHECKPOINT_PATH: /data/checkpoints/bronze
       SILVER1_PATH: /data/delta/silver1
       SILVER1_CHECKPOINT_PATH: /data/checkpoints/silver1
+      SILVER1_TXN_APP_ID: ${SILVER1_TXN_APP_ID:-silver1}
+      SILVER1_OPTIONAL_COLUMNS: ${SILVER1_OPTIONAL_COLUMNS:-[]}
     depends_on:
       kafka:
         condition: service_healthy
@@ -116,7 +121,10 @@ services:
       QWEN_BASE_URL: ${QWEN_BASE_URL:-http://host.docker.internal:11434}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3:4b-instruct}
       QWEN_INCIDENT_DIR: /data/incidents
+      QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
+      QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
       SILVER1_PATH: /data/delta/silver1
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SILVER2_PATH: /data/delta/silver2
       SILVER2_CHECKPOINT_PATH: /data/checkpoints/silver2
       QUARANTINE_PATH: /data/delta/silver2_quarantine

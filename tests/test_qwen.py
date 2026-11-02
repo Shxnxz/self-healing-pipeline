@@ -61,3 +61,10 @@ class Tests(unittest.TestCase):
             self.assertEqual(len(list(Path(directory).glob('*.json'))),1)
     def test_blank(self):
         with self.assertRaises(ValueError): QwenClassifier().classify('')
+
+    @patch('qwen_classifier.classifier.urlopen')
+    def test_source_table_cannot_be_overridden(self, call):
+        call.return_value = reply(dict(GOOD, table='OtherTable'))
+        result = QwenClassifier().classify(ERROR + ' join OtherTable', table='Crash4')
+        self.assertEqual(result['table'], 'Crash4')
+        self.assertEqual(result['classification_status'], 'INVALID_OUTPUT')
