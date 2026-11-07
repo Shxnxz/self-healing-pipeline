@@ -491,7 +491,7 @@ def make_batch_processor(
             # Classify only after the raw batch is durably preserved (IC2/IC4).
             from qwen_classifier.integration import capture_exception
             capture_exception(exc, job_name="Silver2", batch_id=batch_id,
-                              dead_letter_path=DEAD_LETTER_PATH)
+                              table=target_table, dead_letter_path=DEAD_LETTER_PATH)
             return
 
         # 3. WRITE stage: idempotent writes; errors propagate so Spark replays the batch
