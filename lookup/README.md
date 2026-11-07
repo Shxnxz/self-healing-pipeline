@@ -103,18 +103,13 @@ Everything else goes to **diagnose**.
 }
 ```
 
-## Using it from the LangGraph agent
+## Consuming the output
 
-`agent/nodes/lookup.py` wraps this package for LangGraph, so the agent and the
-Kafka service share one implementation:
-
-- `lookup_node(state)` takes either a `recovery.lookup` message (`state["lookup_result"]`)
-  or raw failures (`state["failures"]`: StructuredFailure dicts, Qwen messages or legacy
-  `{table_name, column_name, raw_value}` groups). It selects the top item and sets `route`,
-  `failure`, `lineage_context`, `incident_context`, `blast_radius`, and for remediate
-  also `action` / `action_params`.
-- `route_after_lookup(state)` returns `remediate`, `diagnose`, or `done` when the stack is empty.
-- `next_failure(state)` drops the handled item and selects the next one.
+The next step of the healing loop (e.g. a LangGraph agent) reads `recovery.lookup`
+and works through `stack` from the top: items with `route: remediate` carry the
+past fix in `incident_context.match` (`action`, `action_params`); items with
+`route: diagnose` carry the lineage and nearest incidents for the reasoning LLM.
+Consumers should deduplicate on `failure.failure_id` (delivery is at-least-once).
 
 ## Tuning
 
@@ -131,5 +126,5 @@ precision near 1.0. A wrong auto-fix costs more than an extra diagnosis.
 
 ```bash
 pip install pytest neo4j
-python -m pytest lookup/tests agent/tests
+python -m pytest lookup/tests
 ```

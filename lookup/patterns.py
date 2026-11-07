@@ -177,7 +177,7 @@ ORDER BY i.resolved_at DESC LIMIT 10
 
 
 def signature_text(failure: StructuredFailure, table: Optional[str]) -> str:
-    """Text to embed; the same format as agent/nodes/lookup.py on the Mie branch."""
+    """Text to embed. The Learn node must embed incidents with the same format and model."""
     return (f"table={table or ''} column={(failure.column_name or '').strip()} "
             f"value={(failure.signature_value or '').strip().upper()} failure={failure.failure_type}")
 
