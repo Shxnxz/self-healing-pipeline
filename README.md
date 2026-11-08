@@ -145,6 +145,22 @@ container already exists, apply the new constraints once with
 
 Unit tests (no Kafka or Neo4j needed): `cd lineage && python -m pytest tests`.
 
+## Deterministic Lookup
+
+`lookup/` ranks failures and checks the incident memory before any LLM runs. See
+[lookup/README.md](lookup/README.md).
+
+```
+silver2_quarantine --lookup-scanner--> kafka: recovery.failures  --+
+Qwen (QWEN_KAFKA_ENABLED=true) ------> kafka: recovery.incidents --+--> deterministic-lookup --> kafka: recovery.lookup
+                                                                          (Neo4j lineage + incidents)
+```
+
+Each `recovery.lookup` message is a stack, highest impact first. Each item holds the
+structured failure, its lineage context (blast radius score 0-100 with a breakdown) and
+its incident context (best past fix, and whether it can be reused). `route` says
+`remediate` or `diagnose`. Unit tests: `python -m pytest lookup/tests`.
+
 ## Swapping in the real dataset later
 
 1. Drop the real CSV into `data/` (e.g. `data/cars_dataset_2025.csv`).
