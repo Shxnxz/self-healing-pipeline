@@ -16,5 +16,6 @@ def diagnose(state: RecoveryState) -> dict:
     return {
         "diagnosis": {"status": NOT_IMPLEMENTED, "hypothesis": None, "confidence": 0.0,
                       "proposed_action": None},
+        "stubbed": [NAME],
         "trace": [step(NAME, "stub: no diagnosis (Task 103)")],
     }

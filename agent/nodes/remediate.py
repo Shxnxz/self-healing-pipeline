@@ -17,5 +17,6 @@ def remediate(state: RecoveryState) -> dict:
     return {
         "execution": {"status": NOT_IMPLEMENTED, "action": action,
                       "reasons": ["remediate is not built yet (Task 104); nothing was changed"]},
+        "stubbed": [NAME],
         "trace": [step(NAME, f"stub: {action} not executed (Task 104)")],
     }

@@ -16,5 +16,6 @@ def policy_gate(state: RecoveryState) -> dict:
     return {
         "policy": {"status": NOT_IMPLEMENTED, "passed": False,
                    "reasons": ["policy gate is not built yet (Task 103)"]},
+        "stubbed": [NAME],
         "trace": [step(NAME, "stub: rejected (Task 103)")],
     }

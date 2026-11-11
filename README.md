@@ -170,7 +170,8 @@ so a crashed workflow resumes and a redelivered one is skipped. See
 [agent/README.md](agent/README.md).
 
 Only the graph, routing, state and consumer exist so far. The steps after the lookup
-are stubs that change nothing, so every failure currently ends `ESCALATED`.
+are stubs that change nothing, so every failure currently ends `ESCALATED`. A failure
+that ended on a stub is run again when it is published again after the step is built.
 Unit tests: `python -m pytest agent`.
 
 ## Swapping in the real dataset later
