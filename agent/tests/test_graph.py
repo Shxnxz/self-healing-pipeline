@@ -39,7 +39,7 @@ def test_new_failure_is_diagnosed_then_escalated_by_the_gate():
     state = run(stack_item(route="diagnose"))
     assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
     assert state["status"] == "ESCALATED"
-    assert state["escalation"]["reason"] == "POLICY_GATE_REJECTED"
+    assert state["escalation"]["reason"] == "NO_DIAGNOSIS"   # no model in tests: nothing for the gate to reject
     assert state["action"] is None and "execution" not in state
 
 

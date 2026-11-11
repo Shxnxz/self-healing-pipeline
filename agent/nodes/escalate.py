@@ -11,7 +11,10 @@ from agent.state import EXECUTION_SUCCESS, STATUS_ESCALATED, RecoveryState, step
 NAME = "escalate"
 
 STEP_FAILED = "STEP_FAILED"
-POLICY_GATE_REJECTED = "POLICY_GATE_REJECTED"
+POLICY_GATE_REJECTED = "POLICY_GATE_REJECTED"   # a proposed fix was stopped by a check
+ENGINEER_REQUESTED = "ENGINEER_REQUESTED"       # Diagnose itself proposed ESCALATE
+NO_DIAGNOSIS = "NO_DIAGNOSIS"                   # model unreachable or its reply unusable
+POLICY_OUTCOME_REASONS = {"ENGINEER_REQUESTED": ENGINEER_REQUESTED, "NO_DIAGNOSIS": NO_DIAGNOSIS}
 GATE_PASSED_WITHOUT_ACTION = "GATE_PASSED_WITHOUT_ACTION"
 REMEDIATION_FAILED = "REMEDIATION_FAILED"
 VALIDATION_FAILED = "VALIDATION_FAILED"
@@ -31,7 +34,9 @@ def escalation_reason(state: RecoveryState) -> tuple:
     policy = state.get("policy") or {}
     if policy.get("passed") is True:  # approved, but there is nothing to execute
         return GATE_PASSED_WITHOUT_ACTION, ["the policy gate passed but set no action"]
-    return POLICY_GATE_REJECTED, policy.get("reasons") or []
+    # The gate says whether it stopped a fix or there was none to stop (policy.outcome).
+    reason = POLICY_OUTCOME_REASONS.get(policy.get("outcome"), POLICY_GATE_REJECTED)
+    return reason, policy.get("reasons") or []
 
 
 def escalate(state: RecoveryState) -> dict:

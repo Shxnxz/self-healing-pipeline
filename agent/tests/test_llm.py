@@ -133,3 +133,16 @@ def test_a_cut_off_reply_says_which_settings_help(ollama):
         llm.chat_json("s", "u", SCHEMA)
     assert error.value.status == llm.INVALID_OUTPUT
     assert "DIAGNOSE_NUM_PREDICT" in error.value.detail and "DIAGNOSE_THINK" in error.value.detail
+
+
+def test_a_connection_that_breaks_mid_answer_is_unavailable_not_an_exception(monkeypatch):
+    """Anything else would leave Diagnose raising, and the graph would repeat the call."""
+    from http.client import IncompleteRead
+
+    def broken(payload):
+        raise IncompleteRead(b'{"done": tr')
+
+    monkeypatch.setattr(llm, "_post", broken)
+    with pytest.raises(llm.LLMError) as error:
+        llm.chat_json("s", "u", SCHEMA)
+    assert error.value.status == llm.UNAVAILABLE and "IncompleteRead" in error.value.detail

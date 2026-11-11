@@ -109,7 +109,9 @@ Runs only for failures the lookup could not match to a verified past fix.
 | `INVALID_OUTPUT` | the model answered something else than the JSON asked for | none |
 
 Diagnose never raises and never sets `action`. With no model running, every new
-failure is escalated with the reason `no usable diagnosis (UNAVAILABLE)`.
+failure is escalated with the reason `no usable diagnosis (UNAVAILABLE)`. A model
+that is down or times out is a result, not an exception, so the graph's retry of a
+raising step never repeats a 120 s model call.
 
 Qwen3 thinks before it answers unless told not to, and the thinking counts against
 `DIAGNOSE_NUM_PREDICT`, so a long one cuts the JSON off (`INVALID_OUTPUT`: "reply was
@@ -206,8 +208,9 @@ result and `policy.reasons` the ones that failed:
 | `ENGINEER_REQUESTED` | Diagnose itself proposed `ESCALATE` (the evidence did not single out a fix, or a mandatory field is empty); no fix was blocked |
 | `NO_DIAGNOSIS` | there was nothing to judge: model unreachable or its reply unusable |
 
-The escalation still reads `POLICY_GATE_REJECTED` for the last three; wording it per
-outcome belongs to Escalate (Task 106), which can read `policy.outcome`.
+Escalate uses it for the escalation's `reason`: `POLICY_GATE_REJECTED` only for
+`REJECTED`, and `ENGINEER_REQUESTED` or `NO_DIAGNOSIS` for the other two, so an
+engineer does not read a model asking for help as a blocked fix.
 
 ## How state is kept (`consumer.py`)
 

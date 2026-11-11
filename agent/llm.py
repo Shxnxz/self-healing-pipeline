@@ -6,6 +6,7 @@ complete JSON object raises LLMError: the caller never sees half an answer.
 """
 import json
 import re
+from http.client import HTTPException
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -66,6 +67,9 @@ def chat_json(system: str, user: str, schema: dict) -> dict:
                                     f"{config.DIAGNOSE_MODEL}" + (f": {detail}" if detail else "")) from exc
     except OSError as exc:    # refused, DNS, timeout
         raise LLMError(UNAVAILABLE, f"{config.DIAGNOSE_BASE_URL} not reachable ({exc})") from exc
+    except HTTPException as exc:  # the connection broke in the middle of the answer
+        raise LLMError(UNAVAILABLE, f"{config.DIAGNOSE_BASE_URL} gave no complete answer "
+                                    f"({type(exc).__name__}: {exc})") from exc
 
     try:
         body = json.loads(raw)
