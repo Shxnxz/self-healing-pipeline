@@ -67,9 +67,34 @@ def day_first_sources(raw: Optional[str] = None) -> List[str]:
     """Sources from DAY_FIRST_SOURCES (comma separated, may be empty), lower-cased."""
     if raw is None:
         raw = os.environ.get("DAY_FIRST_SOURCES", DEFAULT_DAY_FIRST_SOURCES)
-    if not raw.strip():
-        return []
-    return source_names(raw)
+    names: List[str] = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if not _SOURCE_NAME.match(name):
+            raise ValueError(
+                f"Invalid DAY_FIRST_SOURCES entry {part!r}: use source names from SOURCES, e.g. crash3"
+            )
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def check_day_first_sources(raw: Optional[str] = None, sources_raw: Optional[str] = None) -> None:
+    """Fail fast when DAY_FIRST_SOURCES names a source that is not in SOURCES.
+
+    A typo (crash03) or a renamed folder would otherwise switch the day-first
+    reading off without any error, and that source's dates would silently be read
+    month first again.
+    """
+    known = source_names(sources_raw)
+    unknown = [name for name in day_first_sources(raw) if name not in known]
+    if unknown:
+        raise ValueError(
+            f"DAY_FIRST_SOURCES lists {unknown}, which are not in SOURCES {known}. "
+            "Fix the name, or remove it if that folder no longer exists."
+        )
 
 
 def is_day_first(source: str, raw: Optional[str] = None) -> bool:

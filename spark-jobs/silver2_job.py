@@ -46,6 +46,7 @@ from pyspark.sql.types import (
 
 from common import build_spark, idempotent_append, wait_for_delta_table
 from sources import (
+    check_day_first_sources,
     checkpoint_path,
     is_day_first,
     shared_path,
@@ -93,10 +94,14 @@ MAX_ERROR_CHARS = 4000
 MAX_TRACE_CHARS = 8000
 
 # Supported additive date format strings, tried in order (first match wins).
-# Slash dates are ambiguous: 01/03/2021 is 3 January month first and 1 March day
-# first. Each source declares its order (sources.DAY_FIRST_SOURCES, default crash3);
-# the other order is kept only as a fallback for values that cannot be read the
-# preferred way (e.g. 25/12/2021 in a month-first source).
+# Slash and dash dates are ambiguous: 01/03/2021 is 3 January month first and
+# 1 March day first. Each source declares its order (sources.DAY_FIRST_SOURCES,
+# default crash3).
+#   - Day-first sources are strict: a value that is not a valid day-first date
+#     (e.g. 02/24/2021) is NOT re-read month first; it goes to quarantine, so a
+#     source that switches format gets noticed instead of half mis-parsed.
+#   - Month-first sources keep the day-first fallback they always had, for values
+#     that cannot be month first (e.g. 25/12/2021).
 _ISO_DATE_FORMATS = [
     "yyyy-MM-dd'T'HH:mm:ss.SSS",
     "yyyy-MM-dd'T'HH:mm:ss",
@@ -105,30 +110,21 @@ _ISO_DATE_FORMATS = [
     "yyyy/MM/dd HH:mm:ss",
     "yyyy/MM/dd",
 ]
-_MONTH_FIRST_FORMATS = ["M/d/yyyy h:mm:ss a", "M/d/yyyy H:mm:ss", "M/d/yyyy"]
-_DAY_FIRST_FORMATS = ["d/M/yyyy h:mm:ss a", "d/M/yyyy H:mm:ss", "d/M/yyyy"]
-_OTHER_DATE_FORMATS = ["dd-MM-yyyy", "yyyyMMdd"]
+_MONTH_FIRST_FORMATS = ["M/d/yyyy h:mm:ss a", "M/d/yyyy H:mm:ss", "M/d/yyyy", "MM-dd-yyyy"]
+_DAY_FIRST_FORMATS = ["d/M/yyyy h:mm:ss a", "d/M/yyyy H:mm:ss", "d/M/yyyy", "dd-MM-yyyy"]
+_OTHER_DATE_FORMATS = ["yyyyMMdd"]
 
 
-def date_formats(day_first: bool = False) -> List[str]:
-    """crash_date formats: ISO first, then slash dates in the source's order."""
-    slash = (
-        _DAY_FIRST_FORMATS + _MONTH_FIRST_FORMATS
-        if day_first
-        else _MONTH_FIRST_FORMATS + _DAY_FIRST_FORMATS
-    )
-    return _ISO_DATE_FORMATS + slash + _OTHER_DATE_FORMATS
+def date_formats(day_first: bool) -> List[str]:
+    """crash_date formats: ISO first, then slash/dash dates in the source's order."""
+    ordered = _DAY_FIRST_FORMATS if day_first else _MONTH_FIRST_FORMATS + _DAY_FIRST_FORMATS
+    return _ISO_DATE_FORMATS + ordered + _OTHER_DATE_FORMATS
 
 
-def timestamp_formats(day_first: bool = False) -> List[str]:
+def timestamp_formats(day_first: bool) -> List[str]:
     """date_police_notified formats: no fallback order, an unreadable value is flagged."""
     iso = [f for f in _ISO_DATE_FORMATS if f != "yyyy/MM/dd"]
     return iso + (_DAY_FIRST_FORMATS if day_first else _MONTH_FIRST_FORMATS)
-
-
-# Month-first defaults (sources not listed in DAY_FIRST_SOURCES)
-DATE_FORMATS = date_formats(day_first=False)
-TIMESTAMP_FORMATS = timestamp_formats(day_first=False)
 
 
 def _try_ts(col_name: str, fmt: str) -> Column:
@@ -176,18 +172,21 @@ def _fuzzy_audit_struct(
 def standardize_silver2(
     df: DataFrame,
     mapping_dict: Dict[str, Dict[str, str]],
-    day_first: bool = False,
+    *,
+    day_first: bool,
 ) -> DataFrame:
     """
     Apply native PySpark parsing chains and canonical reference lookups.
     Tracks all mapping and parsing failures in `columns_to_remediate`.
 
-    `day_first` reads slash dates as dd/MM/yyyy (sources.is_day_first).
+    `day_first` (required, keyword only) reads slash dates as dd/MM/yyyy; get it
+    from sources.is_day_first(source).
 
     Pure function of (Silver 1 row, mapping_dict, day_first): it is also what the
-    healing loop replays quarantined rows through. Pass
-    `day_first=is_day_first(row.target_table)` there, or a day-first source's
-    rows would be re-read month first.
+    healing loop replays quarantined rows through. Replay one target_table at a
+    time with `day_first=is_day_first(target_table)`, or a day-first source's rows
+    would be re-read month first. There is no default on purpose, so a caller
+    cannot forget it silently.
     """
     # Explicit bindings to input DataFrame columns to avoid projection alias shadowing
     record_id = df["record_id"]
@@ -481,7 +480,8 @@ def make_batch_processor(
     silver2_path: str,
     txn_app_id: Optional[str] = None,
     target_table: Optional[str] = None,
-    day_first: bool = False,
+    *,
+    day_first: bool,
 ):
     """
     Returns the foreachBatch function for one source.
@@ -501,7 +501,7 @@ def make_batch_processor(
         #    Anything that blows up here is a data/schema problem -> dead letter.
         transformed = None
         try:
-            transformed = standardize_silver2(batch_df, mapping_dict, day_first).persist()
+            transformed = standardize_silver2(batch_df, mapping_dict, day_first=day_first).persist()
             stats = transformed.agg(
                 F.count(F.lit(1)).alias("total"),
                 F.sum(F.when(F.size("columns_to_remediate") > 0, 1).otherwise(0)).alias("quarantined"),
@@ -594,6 +594,7 @@ def _require_spark_version(spark: SparkSession) -> None:
 def init_shared_tables(spark: SparkSession) -> None:
     """Create the shared reference and audit tables once, before any source query starts."""
     _require_spark_version(spark)
+    check_day_first_sources()
     init_ref_mappings(spark, REF_MAPPINGS_PATH)
     init_fuzzy_audit(spark, FUZZY_AUDIT_PATH)
 

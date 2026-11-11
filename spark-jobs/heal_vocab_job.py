@@ -248,8 +248,10 @@
 #     if q_df.count() == 0:
 #         return 0
 
-#     # Re-standardize the quarantined records
-#     re_standardized = standardize_silver2(q_df, mapping_dict)
+#     # Re-standardize the quarantined records. day_first is per source, so when
+#     # this comes back, replay one target_table at a time with
+#     # day_first=sources.is_day_first(target_table).
+#     re_standardized = standardize_silver2(q_df, mapping_dict, day_first=...)
 
 #     # Support columns_to_remediate or legacy unmapped_payload
 #     remed_col = (

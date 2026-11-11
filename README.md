@@ -25,10 +25,12 @@ The layout lives in `spark-jobs/sources.py`. `SOURCES` (default
 `crash1,crash2,crash3,crash4`) on the Spark services must name the same folders as
 the producer's `TABLES`; a source with no data blocks the layers after it.
 
-Slash dates are ambiguous (`01/03/2021`), so each source declares its order.
-`DAY_FIRST_SOURCES` (default `crash3`) lists the sources that write `dd/MM/yyyy`;
-every other source is read `MM/dd/yyyy`. Silver 2 tries the other order only for
-values that cannot be read the declared way (e.g. `25/12/2021` month first).
+Slash and dash dates are ambiguous (`01/03/2021`), so each source declares its
+order. `DAY_FIRST_SOURCES` (default `crash3`) lists the sources that write
+`dd/MM/yyyy`; every other source is read `MM/dd/yyyy`. Silver 2 refuses to start if
+`DAY_FIRST_SOURCES` names something that is not in `SOURCES`. Day-first sources are
+strict (a value like `02/24/2021` goes to quarantine); month-first sources still fall
+back to day first for values like `25/12/2021`.
 
 ## Prerequisites
 

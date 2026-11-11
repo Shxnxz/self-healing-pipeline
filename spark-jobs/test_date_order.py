@@ -39,9 +39,20 @@ def test_quarantine_target_table_resolves_to_its_source(monkeypatch):
 def test_day_first_sources_can_be_overridden_or_emptied():
     assert sources.day_first_sources("Crash3, crash4") == ["crash3", "crash4"]
     assert sources.day_first_sources("") == []
+    assert sources.day_first_sources(" , ,") == []  # leftover commas mean "none", not an error
     assert not sources.is_day_first("crash3", raw="")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="DAY_FIRST_SOURCES"):
         sources.day_first_sources("crash_3")
+
+
+def test_day_first_sources_must_be_listed_in_sources():
+    sources.check_day_first_sources("crash3", "crash1,crash2,crash3,crash4")
+    sources.check_day_first_sources("", "crash1")
+    # a typo or a renamed folder must stop Silver 2, not silently read month first
+    with pytest.raises(ValueError, match="crash03"):
+        sources.check_day_first_sources("crash03", "crash1,crash2,crash3,crash4")
+    with pytest.raises(ValueError, match="crash3"):
+        sources.check_day_first_sources("crash3", "crash1,crash2")
 
 
 # --- Silver 2 parsing chain (local Spark) ------------------------------------
@@ -104,8 +115,9 @@ def _parse(spark, silver2, mapping_dict, day_first, crash_dates, police=None):
         {"crash_date": d, "date_police_notified": (police[i] if police else None)}
         for i, d in enumerate(crash_dates)
     ]
-    out = silver2.standardize_silver2(_silver1_df(spark, rows), mapping_dict, day_first)
-    got = {r.record_id: r for r in out.select("record_id", "crash_date", "date_police_notified").collect()}
+    out = silver2.standardize_silver2(_silver1_df(spark, rows), mapping_dict, day_first=day_first)
+    cols = ("record_id", "crash_date", "date_police_notified", "columns_to_remediate")
+    got = {r.record_id: r for r in out.select(*cols).collect()}
     return [got[f"R{i}"] for i in range(len(rows))]
 
 
@@ -113,26 +125,37 @@ def test_format_lists_put_the_declared_order_first(silver2):
     month_first = silver2.date_formats(day_first=False)
     day_first = silver2.date_formats(day_first=True)
     assert month_first.index("M/d/yyyy") < month_first.index("d/M/yyyy")
-    assert day_first.index("d/M/yyyy") < day_first.index("M/d/yyyy")
-    # month-first defaults are unchanged for every other source
-    assert silver2.DATE_FORMATS == month_first
-    assert silver2.TIMESTAMP_FORMATS == silver2.timestamp_formats(day_first=False)
-    assert "d/M/yyyy" not in silver2.TIMESTAMP_FORMATS
+    assert month_first.index("MM-dd-yyyy") < month_first.index("dd-MM-yyyy")
+    # day-first sources are strict: no month-first fallback
+    assert "M/d/yyyy" not in day_first and "MM-dd-yyyy" not in day_first
+    assert "d/M/yyyy" not in silver2.timestamp_formats(day_first=False)
+    assert "M/d/yyyy" not in silver2.timestamp_formats(day_first=True)
+
+
+def test_day_first_has_no_default(spark, silver2, mapping_dict):
+    """A replay that forgets the order must fail loudly, not re-read Crash3 month first."""
+    df = _silver1_df(spark, [{"crash_date": "01/03/2021"}])
+    with pytest.raises(TypeError):
+        silver2.standardize_silver2(df, mapping_dict)
+    with pytest.raises(TypeError):
+        silver2.make_batch_processor(spark, "/tmp/unused", target_table="silver2_crash3")
 
 
 def test_day_first_source_reads_slash_dates_day_first(spark, silver2, mapping_dict):
     rows = _parse(
         spark, silver2, mapping_dict, True,
-        ["01/03/2021", "24/02/2021", "9/5/2022", "02/24/2021", "2021-07-04"],
-        police=["01/03/2021 17:22:00", "2021-02-24T15:00:00.000", None, None, None],
+        ["01/03/2021", "24/02/2021", "9/5/2022", "2021-07-04", "01-03-2021", "02/24/2021"],
+        police=["01/03/2021 17:22:00", "2021-02-24T15:00:00.000", None, None, None, None],
     )
     assert [r.crash_date for r in rows] == [
         "2021-03-01",  # was 2021-01-03 before the fix
         "2021-02-24",
         "2022-05-09",
-        "2021-02-24",  # cannot be day first -> month-first fallback
         "2021-07-04",  # ISO untouched
+        "2021-03-01",  # dash dates follow the declared order too
+        None,          # not a valid day-first date: quarantined, not re-read month first
     ]
+    assert rows[5].columns_to_remediate == {"crash_date": "02/24/2021"}
     assert rows[0].date_police_notified == "2021-03-01 17:22:00"
     assert rows[1].date_police_notified == "2021-02-24 15:00:00"
 
@@ -140,10 +163,13 @@ def test_day_first_source_reads_slash_dates_day_first(spark, silver2, mapping_di
 def test_month_first_sources_are_unchanged(spark, silver2, mapping_dict):
     rows = _parse(
         spark, silver2, mapping_dict, False,
-        ["01/03/2021", "25/12/2021", "2021/07/04"],
-        police=["09/05/2023 07:42:00 PM", None, None],
+        ["01/03/2021", "25/12/2021", "2021/07/04", "01-03-2021", "25-12-2021"],
+        police=["09/05/2023 07:42:00 PM", None, None, None, None],
     )
-    assert [r.crash_date for r in rows] == ["2021-01-03", "2021-12-25", "2021-07-04"]
+    # 25/12/2021 and 25-12-2021 cannot be month first: the day-first fallback reads them
+    assert [r.crash_date for r in rows] == [
+        "2021-01-03", "2021-12-25", "2021-07-04", "2021-01-03", "2021-12-25",
+    ]
     assert rows[0].date_police_notified == "2023-09-05 19:42:00"
 
 
@@ -156,7 +182,7 @@ def test_real_crash3_dates_agree_with_crash_month_and_weekday(spark, silver2, ma
         rows = [r for _, r in zip(range(3000), reader)]
 
     df = _silver1_df(spark, rows)
-    out = silver2.standardize_silver2(df, mapping_dict, sources.is_day_first("crash3"))
+    out = silver2.standardize_silver2(df, mapping_dict, day_first=sources.is_day_first("crash3"))
     parsed = out.select("record_id", "crash_date", "crash_month", "crash_day_of_week",
                         "columns_to_remediate").collect()
 
