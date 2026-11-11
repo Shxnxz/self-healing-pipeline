@@ -23,33 +23,39 @@ EVIDENCE_COLUMNS = (
 )
 
 
-def _read(path: str, columns: List[str], column: str, values: list) -> List[dict]:
-    """Rows of a Delta table where `column` is one of `values`."""
-    import pyarrow.dataset as ds
-    from deltalake import DeltaTable
+# path -> (Delta table version, {column: [canonical values]}). The table is tiny and
+# both Diagnose and the gate ask for every failure of a stack, so its files are
+# scanned again only when a commit changed it.
+_canonical_cache: dict = {}
 
-    table = DeltaTable(path)
-    available = {field.name for field in table.schema().fields}
-    if column not in available:
-        return []
+
+def _scan(table, columns: List[str], **kwargs) -> List[dict]:
     # Single-threaded on purpose: these reads are tiny, and a threaded scan of a
     # table with several files can keep the Python process from exiting.
-    return table.to_pyarrow_dataset().to_table(
-        columns=[c for c in columns if c in available],
-        filter=ds.field(column).isin(values), use_threads=False,
-    ).to_pylist()
+    return table.to_pyarrow_dataset().to_table(columns=columns, use_threads=False, **kwargs).to_pylist()
 
 
 def canonical_values(column: Optional[str], path: Optional[str] = None) -> List[str]:
     """Canonical values of a closed-vocabulary column, sorted. [] when it has none."""
+    from deltalake import DeltaTable
+
     if not column:
         return []
+    path = path or config.REF_MAPPINGS_PATH
     try:
-        rows = _read(path or config.REF_MAPPINGS_PATH, ["canonical_value"], "field_name", [column])
+        table = DeltaTable(path)  # reads the transaction log only
+        cached = _canonical_cache.get(path)
+        if cached is None or cached[0] != table.version():
+            by_column: dict = {}
+            for row in _scan(table, ["field_name", "canonical_value"]):
+                if row.get("field_name") and row.get("canonical_value"):
+                    by_column.setdefault(row["field_name"], set()).add(row["canonical_value"])
+            cached = (table.version(), {name: sorted(values) for name, values in by_column.items()})
+            _canonical_cache[path] = cached
     except Exception as exc:  # table not created yet, volume not mounted, ...
         print(f"[agent] canonical values of {column} not readable: {exc}", flush=True)
         return []
-    return sorted({row["canonical_value"] for row in rows if row.get("canonical_value")})
+    return list(cached[1].get(column, []))
 
 
 def sample_records(failure: dict, limit: Optional[int] = None, path: Optional[str] = None) -> List[dict]:
@@ -60,8 +66,11 @@ def sample_records(failure: dict, limit: Optional[int] = None, path: Optional[st
     if not ids or limit <= 0:
         return []
     try:
-        rows = _read(path or config.QUARANTINE_PATH, ["record_id", "raw_record", "columns_to_remediate"],
-                     "record_id", ids)
+        import pyarrow.dataset as ds
+        from deltalake import DeltaTable
+
+        rows = _scan(DeltaTable(path or config.QUARANTINE_PATH),
+                     ["record_id", "raw_record", "columns_to_remediate"], filter=ds.field("record_id").isin(ids))
     except Exception as exc:
         print(f"[agent] sample records not readable: {exc}", flush=True)
         return []

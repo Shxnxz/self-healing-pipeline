@@ -19,7 +19,8 @@ def ollama(monkeypatch):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             server.requests.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
-            status, body = server.answer
+            answer = server.answer
+            status, body = answer(server.requests[-1][1]) if callable(answer) else answer
             self.send_response(status)
             self.end_headers()
             self.wfile.write(body if isinstance(body, bytes) else json.dumps(body).encode())
@@ -75,7 +76,7 @@ def test_a_model_that_was_never_pulled_is_unavailable(ollama):
     with pytest.raises(llm.LLMError) as error:
         llm.chat_json("s", "u", SCHEMA)
     assert error.value.status == llm.UNAVAILABLE and "HTTP 404" in error.value.detail
-    assert "qwen3:test" in error.value.detail
+    assert "model 'qwen3:test' not found" in error.value.detail and len(ollama.requests) == 1
 
 
 def test_no_server_is_unavailable(monkeypatch):
@@ -83,3 +84,52 @@ def test_no_server_is_unavailable(monkeypatch):
     with pytest.raises(llm.LLMError) as error:
         llm.chat_json("s", "u", SCHEMA)
     assert error.value.status == llm.UNAVAILABLE and "not reachable" in error.value.detail
+
+
+# --- thinking (Qwen3 thinks by default, and the thinking counts against num_predict) ------
+def test_thinking_is_switched_off_by_default(ollama):
+    ollama.answer = reply('{"action": "ESCALATE"}')
+    llm.chat_json("s", "u", SCHEMA)
+    assert ollama.requests[0][1]["think"] is False
+
+
+@pytest.mark.parametrize("setting, sent", [(True, True), (None, "absent")])
+def test_thinking_follows_the_setting(ollama, monkeypatch, setting, sent):
+    monkeypatch.setattr(config, "DIAGNOSE_THINK", setting)
+    ollama.answer = reply('{"action": "ESCALATE"}', )
+    llm.chat_json("s", "u", SCHEMA)
+    assert ollama.requests[0][1].get("think", "absent") == sent
+
+
+def test_thinking_returned_in_its_own_field_is_not_the_answer(ollama, monkeypatch):
+    monkeypatch.setattr(config, "DIAGNOSE_THINK", True)
+    ollama.answer = (200, {"done": True, "message": {"role": "assistant", "thinking": "June or {July}?",
+                                                     "content": '{"action": "ADD_VARIANT"}'}})
+    assert llm.chat_json("s", "u", SCHEMA) == {"action": "ADD_VARIANT"}
+
+
+def test_a_model_without_a_thinking_mode_is_asked_again_without_the_field(ollama):
+    def answer(body):
+        if "think" in body:
+            return 400, {"error": '"qwen3:test" does not support thinking'}
+        return reply('{"action": "ESCALATE"}')
+
+    ollama.answer = answer
+    assert llm.chat_json("s", "u", SCHEMA) == {"action": "ESCALATE"}
+    assert ["think" in body for _, body in ollama.requests] == [True, False]
+
+
+def test_any_other_bad_request_is_reported_once_with_what_ollama_said(ollama):
+    ollama.answer = (400, {"error": "invalid format: schema too deep"})
+    with pytest.raises(llm.LLMError) as error:
+        llm.chat_json("s", "u", SCHEMA)
+    assert error.value.status == llm.UNAVAILABLE and len(ollama.requests) == 1
+    assert "HTTP 400" in error.value.detail and "schema too deep" in error.value.detail
+
+
+def test_a_cut_off_reply_says_which_settings_help(ollama):
+    ollama.answer = reply("", done_reason="length")
+    with pytest.raises(llm.LLMError) as error:
+        llm.chat_json("s", "u", SCHEMA)
+    assert error.value.status == llm.INVALID_OUTPUT
+    assert "DIAGNOSE_NUM_PREDICT" in error.value.detail and "DIAGNOSE_THINK" in error.value.detail

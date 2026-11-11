@@ -2,6 +2,7 @@
 import pytest
 
 from agent import llm, reference
+from agent.tests import helpers
 
 
 @pytest.fixture(autouse=True)
@@ -13,7 +14,7 @@ def offline(monkeypatch, request):
         raise llm.LLMError(llm.UNAVAILABLE, "no model in tests")
 
     monkeypatch.setattr(llm, "chat_json", no_model)
-    monkeypatch.setattr(reference, "canonical_values", lambda column, path=None: [])
+    monkeypatch.setattr(reference, "canonical_values", helpers.canonical_values)
     monkeypatch.setattr(reference, "sample_records", lambda failure, limit=None, path=None: [])
 
 

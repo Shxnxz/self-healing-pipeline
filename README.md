@@ -173,7 +173,11 @@ Diagnose asks a reasoning model (Qwen on Ollama, `DIAGNOSE_MODEL`) for a root ca
 and one fix out of a pre-approved action list. The policy gate lets the fix run only
 when the model's confidence reaches `POLICY_CONFIDENCE_THRESHOLD` (0.85) and the
 action is in the safe set (today only `ADD_VARIANT`); everything else goes to an
-engineer with the reasons.
+engineer with the reasons. Where a record can decide the value (`crash_month` and
+`crash_day_of_week` against `crash_date`) the gate checks it against the quarantined
+records; where nothing can, the stricter `POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD`
+(0.95) applies. `docker compose exec recovery-agent python -m agent.check_model`
+confirms the model answers.
 
 Remediate and the steps after it are still stubs that change nothing, so every
 failure currently ends `ESCALATED`. Unit tests: `python -m pytest agent`.
