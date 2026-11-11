@@ -251,8 +251,30 @@ services:
       neo4j-init:
         condition: service_completed_successfully
 
+  # --- Recovery agent (LangGraph loop) -----------------------------------
+  # Consumes recovery.lookup and runs one LangGraph workflow per failure:
+  # deterministic lookup -> diagnose -> policy gate -> remediate -> validate ->
+  # escalate / learn. The steps after the lookup are stubs for now: nothing is
+  # changed and every failure ends ESCALATED. See agent/README.md.
+  recovery-agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    container_name: recovery-agent
+    restart: on-failure
+    volumes:
+      - agent-state:/state
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      LOOKUP_OUTPUT_TOPIC: recovery.lookup
+      AGENT_CHECKPOINT_PATH: /state/recovery_checkpoints.sqlite
+    depends_on:
+      kafka:
+        condition: service_healthy
+
 volumes:
   ivy-cache:
   neo4j-data:
   neo4j-logs:
   lookup-state:
+  agent-state:

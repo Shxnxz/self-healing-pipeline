@@ -105,7 +105,7 @@ Everything else goes to **diagnose**.
 
 ## Consuming the output
 
-The next step of the healing loop (e.g. a LangGraph agent) reads `recovery.lookup`
+The recovery agent (`agent/`, see [agent/README.md](../agent/README.md)) reads `recovery.lookup`
 and works through `stack` from the top: items with `route: remediate` carry the
 past fix in `incident_context.match` (`action`, `action_params`); items with
 `route: diagnose` carry the lineage and nearest incidents for the reasoning LLM.
