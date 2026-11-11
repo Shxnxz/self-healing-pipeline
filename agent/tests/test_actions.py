@@ -1,5 +1,6 @@
 """The pre-approved action set: python -m pytest agent/tests"""
 from agent import actions
+from agent.executors import EXECUTORS
 from agent.tests.helpers import MONTHS, schema_item, stack_item
 
 JULE = stack_item()["failure"]
@@ -9,6 +10,11 @@ RENAMED = schema_item()["failure"]
 def test_only_add_variant_runs_without_an_engineer():
     assert actions.SAFE_ACTIONS == {"ADD_VARIANT"}
     assert set(actions.CATALOGUE) == {"ADD_VARIANT", "RENAME_COLUMN", "ESCALATE"}
+
+
+def test_every_safe_action_can_be_executed():
+    # Otherwise the policy gate would pass fixes that Remediate can only fail.
+    assert actions.SAFE_ACTIONS <= set(EXECUTORS) <= set(actions.CATALOGUE)
 
 
 def test_settings_can_narrow_the_safe_set_but_never_widen_it():

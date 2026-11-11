@@ -9,6 +9,12 @@
 Both answer "nothing" when a table is missing or unreadable. Without canonical
 values the policy gate cannot approve ADD_VARIANT, so an unreadable table sends the
 failure to an engineer instead of stopping the agent.
+
+  failure_records(failure)   every quarantined record that belongs to the failure and
+                             is still waiting: the group Remediate stages. Unlike the
+                             two above it raises when the table cannot be read, because
+                             "no records" and "could not look" must not be confused
+                             when something is about to be executed.
 """
 from typing import List, Optional
 
@@ -77,3 +83,68 @@ def sample_records(failure: dict, limit: Optional[int] = None, path: Optional[st
         raw = row.get("raw_record") or {}
         samples.append({name: raw[name] for name in EVIDENCE_COLUMNS if raw.get(name) is not None})
     return samples[:limit]
+
+
+# healing_status values of a quarantined row that is still waiting for a fix. The
+# trigger may mark a group IN_PROGRESS when it picks it up (spec section 3); a
+# RESOLVED row is finished and is never staged again.
+WAITING = ("PENDING", "IN_PROGRESS")
+_PER_SOURCE_LAYERS = ("bronze", "silver1", "silver2")
+
+
+def _folder_of(row: dict) -> Optional[str]:
+    """The folder a quarantine row belongs to, as lookup/failures.py groups it:
+    "silver2_crash3" -> "crash3", else the producer's table_name."""
+    layer, sep, rest = (row.get("target_table") or "").partition("_")
+    if sep and layer in _PER_SOURCE_LAYERS and rest and "_" not in rest and rest != "quarantine":
+        return rest
+    return row.get("table_name")
+
+
+def _key(value) -> str:
+    return (value or "").strip().upper()
+
+
+def failure_batches(failure: dict) -> List[str]:
+    """The Silver 2 micro-batches the failure was found in (lookup/failures.py)."""
+    batches = (failure.get("evidence") or {}).get("quarantine_batches")
+    if not batches and failure.get("batch_id"):
+        batches = str(failure["batch_id"]).split(",")
+    return sorted({str(b).strip() for b in batches or [] if str(b).strip()})
+
+
+def failure_records(failure: dict, path: Optional[str] = None) -> dict:
+    """The waiting quarantine rows of one failure: same folder, column, raw value
+    (trimmed, upper-cased) and micro-batches as the group the scanner published.
+
+    Returns {"version": Delta version read, "rows": [{"record_id", "target_table",
+    "other_failures": the row also fails another column}]}. Raises if the table
+    cannot be read.
+    """
+    import pyarrow.dataset as ds
+    from deltalake import DeltaTable
+
+    column, value = failure.get("column_name"), _key(failure.get("raw_value"))
+    folder, batches = _key(failure.get("folder")), failure_batches(failure)
+    table = DeltaTable(path or config.QUARANTINE_PATH)
+    available = {field.name for field in table.schema().fields}
+    wanted = ["record_id", "table_name", "target_table", "silver2_batch_id", "columns_to_remediate",
+              "healing_status"]
+    # raw_record is left out on purpose: it is the wide part of the table.
+    scanned = table.to_pyarrow_dataset().to_table(
+        columns=[c for c in wanted if c in available],
+        filter=ds.field("silver2_batch_id").isin(batches) if batches and "silver2_batch_id" in available else None,
+        use_threads=False,
+    ).to_pylist()
+
+    rows = []
+    for row in scanned:
+        failing = row.get("columns_to_remediate") or {}
+        failing = failing if isinstance(failing, dict) else dict(failing)
+        if (row.get("healing_status") or "PENDING") not in WAITING or _key(_folder_of(row)) != folder:
+            continue
+        if not column or column not in failing or _key(failing[column]) != value:
+            continue
+        rows.append({"record_id": row.get("record_id"), "target_table": row.get("target_table"),
+                     "other_failures": len(failing) > 1})
+    return {"version": table.version(), "rows": rows}

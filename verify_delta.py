@@ -10,6 +10,7 @@ Usage:
     python verify_delta.py bronze_crash1
     python verify_delta.py silver2_crash3
     python verify_delta.py gold
+    python verify_delta.py remediation_audit
 """
 
 import sys
@@ -32,6 +33,7 @@ TABLES = {
     "audit": "./delta/silver2_fuzzy_audit",
     "dead_letter": "./delta/silver2_dead_letter",
     "silver2_dead_letter": "./delta/silver2_dead_letter",
+    "remediation_audit": "./delta/remediation_audit",
     "gold": "./delta/gold",
     # Legacy aliases
     "silver_cars": "./delta/silver_cars",

@@ -4,10 +4,12 @@ from pathlib import Path
 
 import pytest
 
+from agent import reference
 from agent.graph import build_graph
 from agent.state import NOT_IMPLEMENTED, initial_state
-from agent.tests.helpers import (PAST_FIX, diagnose_july, gate_passes, gate_passes_without_action,
-                                 path, remediate_ok, stack_item, validate_fails, validate_ok)
+from agent.tests.helpers import (PAST_FIX, canonical_values, diagnose_july, gate_passes,
+                                 gate_passes_without_action, jule_quarantine, path, remediate_ok, stack_item,
+                                 validate_fails, validate_ok)
 
 
 def run(item, **nodes):
@@ -28,7 +30,7 @@ def test_graph_has_the_edges_of_the_spec():
     }
 
 
-# --- with the stubs: nothing is fixed, everything reaches an engineer --------------
+# --- with the steps built so far: nothing is released, everything reaches an engineer
 def test_new_failure_is_diagnosed_then_escalated_by_the_gate():
     state = run(stack_item(route="diagnose"))
     assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
@@ -45,11 +47,23 @@ def test_known_failure_skips_the_llm_and_carries_the_past_fix():
     assert "diagnosis" not in state
 
 
-def test_stub_remediate_never_claims_a_fix():
+def test_remediate_that_cannot_execute_never_claims_a_fix():
+    # Nothing is readable in this test, so the reused fix cannot be checked or staged.
     state = run(stack_item(route="remediate", match=PAST_FIX))
-    assert state["execution"]["status"] == NOT_IMPLEMENTED
+    assert state["execution"]["status"] == "FAILED" and state["execution"]["rows_affected"] == 0
     assert state["escalation"]["reason"] == "REMEDIATION_FAILED"
+    assert state["escalation"]["details"] == state["execution"]["reasons"] != []
     assert state["status"] == "ESCALATED" and state["learned"]["written"] is False
+
+
+def test_executed_fix_goes_to_validate_which_is_still_a_stub(tmp_path, monkeypatch):
+    monkeypatch.setattr(reference, "canonical_values", canonical_values)
+    jule_quarantine(tmp_path / "silver2_quarantine")
+    state = run(stack_item(route="remediate", match=PAST_FIX))
+    assert path(state) == ["deterministic_lookup", "remediate", "validate", "escalate", "learn"]
+    assert state["execution"]["status"] == "SUCCESS" and state["execution"]["rows_affected"] == 10
+    assert state["validation"]["status"] == NOT_IMPLEMENTED
+    assert state["escalation"]["reason"] == "VALIDATION_FAILED" and state["status"] == "ESCALATED"
 
 
 def test_remediate_verdict_without_a_past_fix_is_diagnosed():

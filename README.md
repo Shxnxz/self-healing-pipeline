@@ -175,8 +175,15 @@ when the model's confidence reaches `POLICY_CONFIDENCE_THRESHOLD` (0.85) and the
 action is in the safe set (today only `ADD_VARIANT`); everything else goes to an
 engineer with the reasons.
 
-Remediate and the steps after it are still stubs that change nothing, so every
-failure currently ends `ESCALATED`. Unit tests: `python -m pytest agent`.
+Remediate executes an approved fix exactly once: it checks the audit table first,
+stages the failure's quarantined records with the proposed mapping, and writes one
+audit record (action, parameters, affected records, timestamp) to the Delta table
+`delta/remediation_audit`. Staging changes nothing in Silver 2, the quarantine or the
+reference table. Print the records with
+`docker compose exec recovery-agent python -m agent.audit`.
+
+Validate and the steps after it are still stubs, so every failure currently ends
+`ESCALATED`. Unit tests: `python -m pytest agent`.
 
 ## Swapping in the real dataset later
 

@@ -12,6 +12,7 @@ def stack_item(failure_id="f1", route="diagnose", match=None, rank=1, value="Jul
             "failure_id": failure_id, "source": "QUARANTINE", "failure_type": "UNRESOLVED_VALUE",
             "family": "VALUE", "folder": "Crash1", "column_name": "crash_month",
             "raw_value": value, "signature_value": value, "rows_affected": 10, "trusted": True,
+            "batch_id": "7", "evidence": {"quarantine_batches": ["7"]},
         },
         "lineage_context": {"origin_table": "silver1_crash1", "detected_table": "silver2_crash1",
                             "blast_radius": {"score": 42.0, "tier": "P2"}},
@@ -110,3 +111,30 @@ class FakeModel:
 
 JULY_REPLY = {"hypothesis": "Typo of July: both sample records have a crash_date in July.",
               "action": "ADD_VARIANT", "canonical_value": "JULY", "confidence": 0.93}
+
+
+# --- Task 104: a quarantine table like silver2_job.py writes it ----------------------
+def quarantine_row(record_id, failing, batch="7", table="silver2_crash1", status="PENDING"):
+    return {"record_id": record_id, "table_name": "Crash1", "target_table": table, "silver2_batch_id": batch,
+            "columns_to_remediate": list(failing.items()), "healing_status": status,
+            "raw_record": {"crash_date": "07/04/2019", "crash_month": failing.get("crash_month")}}
+
+
+def write_quarantine(path, rows):
+    """Write `rows` (see quarantine_row) as a Delta table and return its path."""
+    import pyarrow as pa
+    from deltalake import write_deltalake
+
+    schema = pa.schema([
+        ("record_id", pa.string()), ("table_name", pa.string()), ("target_table", pa.string()),
+        ("silver2_batch_id", pa.string()), ("columns_to_remediate", pa.map_(pa.string(), pa.string())),
+        ("healing_status", pa.string()),
+        ("raw_record", pa.struct([("crash_date", pa.string()), ("crash_month", pa.string())])),
+    ])
+    write_deltalake(str(path), pa.Table.from_pylist(rows, schema=schema), mode="append")
+    return str(path)
+
+
+def jule_quarantine(path, rows=10):
+    """The quarantine behind stack_item(): `rows` records of Crash1 with crash_month = Jule."""
+    return write_quarantine(path, [quarantine_row(f"r{n:02d}", {"crash_month": "Jule"}) for n in range(rows)])

@@ -9,18 +9,18 @@ lookup/ service --> kafka: recovery.lookup --> recovery-agent --> one LangGraph 
                                                     +-- SQLite checkpoints (volume agent-state)
 ```
 
-The graph, its routing, the saved state, the Kafka consumer, **Diagnose** and the
-**policy gate** are real. Remediate and the steps after it are still stubs that
-change nothing and fail closed, so today every failure still ends `ESCALATED`: a
-diagnosis that passes the gate reaches the Remediate stub, which reports that it
-did nothing. Each stub is replaced by its own task:
+The graph, its routing, the saved state, the Kafka consumer, **Diagnose**, the
+**policy gate** and **Remediate** are real. Validate and the steps after it are
+still stubs that change nothing and fail closed, so today every failure still ends
+`ESCALATED`: a fix that passes the gate is staged and audited by Remediate, then
+the Validate stub does not pass it. Each stub is replaced by its own task:
 
 | Node | File | Built in | Behaviour today |
 |---|---|---|---|
 | `deterministic_lookup` | `nodes/deterministic_lookup.py` | Task 102 | real: reads the lookup verdict, sets the route |
 | `diagnose` | `nodes/diagnose.py` | Task 103 | real: asks the reasoning model for a cause and one fix |
 | `policy_gate` | `nodes/policy_gate.py` | Task 103 | real: confidence threshold and safe-action set |
-| `remediate` | `nodes/remediate.py` | Task 104 | stub: executes nothing, reports `NOT_IMPLEMENTED` |
+| `remediate` | `nodes/remediate.py` | Task 104 | real: idempotency check, stages the fix, writes the audit record |
 | `validate` | `nodes/validate.py` | Task 105 | stub: does not pass |
 | `escalate` | `nodes/escalate.py` | Task 106 | stub: records why it was escalated, asks nobody |
 | `learn` | `nodes/learn.py` | Task 107 | stub: writes nothing to Neo4j |
@@ -57,7 +57,7 @@ its own keys:
 | `deterministic_lookup` | `route`, `action` (when a past fix is reused) |
 | `diagnose` | `diagnosis` = `{status, hypothesis, confidence, proposed_action, model, allowed_actions, evidence, reasons}` |
 | `policy_gate` | `policy` = `{passed, reasons, checks, threshold, safe_actions}`, and `action` when it passes |
-| `remediate` | `execution` = `{status: SUCCESS or FAILED, ...}` |
+| `remediate` | `execution` = `{status: SUCCESS or FAILED, execution_id, action, action_params, source, target_table, overlay, rows_expected, rows_affected, rows_with_other_failures, sample_record_ids, quarantine_version, executed_at, idempotent_replay, audit, reasons}` |
 | `validate` | `validation` = `{passed, reasons}` |
 | `escalate` | `escalation` = `{status, reason, details}`, `status` |
 | `learn` | `learned`, `status` |
@@ -145,6 +145,97 @@ The gate cannot tell whether a confident, safe proposal is *correct*: a model th
 says `Jule` is July at 0.95 passes. Catching that is Validate's job (Task 105), and
 the threshold should be calibrated on labelled cases in the evaluation (Task 111).
 
+## Remediate (`nodes/remediate.py`, spec RD1, RD2, RD3, TA2)
+
+Runs for an `action` that came from the policy gate or from a reused past fix, in
+the fixed order of the spec:
+
+1. **Idempotency check.** `execution_id` is a hash of the failure, the action and
+   its parameters. If the audit table already holds that id, this exact fix was
+   executed before: the recorded result is returned (`idempotent_replay: true`) and
+   nothing runs again. This is what protects a workflow that resumes at Remediate
+   because the agent stopped after executing but before LangGraph saved the node.
+   A failed execution is not retried either: the first outcome stands and goes to
+   an engineer. If the audit table cannot be read, nothing is executed.
+2. **Execute.** The executor of the action (`executors.py`), see below.
+3. **Audit record.** One row in the audit table, for failed executions too.
+   `SUCCESS` is claimed only after that row is committed.
+
+Remediate never raises. Everything that is not `SUCCESS` goes to Escalate with
+`execution.reasons`: an action with no executor, parameters that no longer fit, a
+quarantine that cannot be read, no record left to fix, an audit record that cannot
+be written.
+
+### What executing `ADD_VARIANT` means (`executors.py`)
+
+It **stages** the fix, it does not release it:
+
+- The parameters are checked again against `ref_canonical_mappings` (a reused past
+  fix never went through the policy gate).
+- The failure's group is collected from `silver2_quarantine`: every record still
+  waiting (`PENDING` or `IN_PROGRESS`) with the same folder, column and raw value
+  (trimmed, upper-cased), from the micro-batches the failure was found in. These are
+  exactly the rows the scanner grouped into the failure.
+- The overlay `{"crash_month": {"JULE": "JULY"}}` is built. It is the shape
+  `ref_mappings.overlay_mappings()` takes, so Validate can apply it on top of the
+  reference table when it re-runs `standardize_silver2` on the staged records.
+
+Nothing in Silver 2, the quarantine or `ref_canonical_mappings` changes. The agent
+mounts `./delta` read only and can write only `delta/remediation_audit`. A wrong
+fix is therefore undone by discarding the staged group, which is what makes the
+action safe. The records reach Silver 2 only after Validate passes (Task 105), and
+the mapping reaches the reference table only through Learn's promotion (Task 107).
+
+`RENAME_COLUMN` has no executor: even as a verified past fix it fails here and goes
+to an engineer. A test checks that every safe action has an executor.
+
+### The audit table (`audit.py`, `delta/remediation_audit`)
+
+A Delta table written without Spark, one row and one commit per execution. Only the
+agent writes it; Spark and `verify_delta.py remediation_audit` can read it.
+
+| Column | Meaning |
+|---|---|
+| `execution_id` | idempotency key: hash of failure, action and parameters |
+| `failure_id`, `lookup_id` | the workflow it belongs to (`python -m agent.show <failure_id>`) |
+| `action`, `action_params` | what was executed, parameters as JSON |
+| `action_source`, `incident_id`, `confidence` | `DIAGNOSIS` with the model's confidence, or `INCIDENT` with the past incident |
+| `status`, `reasons` | `SUCCESS`, or `FAILED` with why |
+| `target_table`, `column_name`, `raw_value` | where the failure is |
+| `overlay` | the staged mapping, as JSON |
+| `rows_expected`, `rows_affected` | rows the failure reported, rows staged |
+| `rows_with_other_failures` | staged rows that also fail another column, so they stay quarantined after this fix |
+| `record_ids` | the affected records |
+| `quarantine_version` | Delta version of the quarantine that was read |
+| `started_at`, `executed_at` | execution timestamp (UTC) |
+
+The row is the only thing Remediate writes and it is one Delta commit, so the
+staged group and its audit record cannot exist without each other.
+
+```bash
+docker compose exec recovery-agent python -m agent.audit                  # latest 20 executions
+docker compose exec recovery-agent python -m agent.audit <execution_id>   # one, with its record ids
+docker compose exec recovery-agent python -m agent.audit <failure_id>
+```
+
+### What the next tasks take from it
+
+- **Validate (105)** reads `execution.overlay` and the staged records:
+  `audit.find(execution["execution_id"])["record_ids"]` with `target_table` (the
+  state keeps only five sample ids). Joining them to the quarantine on
+  `record_id` + `target_table` and replaying `raw_record` through
+  `standardize_silver2` with the overlay was tried on real tables: the targeted
+  column resolves, and rows counted in `rows_with_other_failures` keep their other
+  failure. Releasing the valid rows into Silver 2 and marking the quarantine rows
+  `RESOLVED` is still to be built, after validation.
+- **Escalate (106)** gets `execution.reasons` for a failed execution.
+- **Pipeline cleanups (109)**: Remediate does not change `healing_status`. It accepts
+  rows the trigger has marked `IN_PROGRESS` and never stages a `RESOLVED` row.
+
+One agent consumes `recovery.lookup` today. Two agents working on the same failure
+at the same moment could both pass the idempotency check; if the agent is ever
+scaled out, the check needs a lock.
+
 ## How state is kept (`consumer.py`)
 
 LangGraph saves the state after every node in SQLite, under
@@ -167,13 +258,14 @@ docker compose logs -f recovery-agent
 
 ```
 [agent] lookup 66b035e5-...: 2 failure(s)
-[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > remediate > escalate > learn)
+[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > remediate > validate > escalate > learn)
 [agent] 289b9d3430ea286e new       P3 crash1:weather_condition value='MISTY DARK' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > escalate > learn)
 ```
 
-The first failure passed the gate (it reached `remediate`, still a stub); the
-second was stopped by it. Diagnose needs Ollama with the model pulled
-(`ollama pull qwen3:8b`); without it both lines end at `policy_gate > escalate`.
+The first failure passed the gate and was staged by `remediate` (it reached
+`validate`, still a stub); the second was stopped by the gate. A path that ends
+`remediate > escalate` is a failed execution. Diagnose needs Ollama with the model
+pulled (`ollama pull qwen3:8b`); without it both lines end at `policy_gate > escalate`.
 
 The first word is the `failure_id`. Print everything saved for that workflow:
 
@@ -197,13 +289,18 @@ Compose passes `DIAGNOSE_MODEL`, `DIAGNOSE_BASE_URL` and the two `POLICY_` setti
 from `.env` (see `.env.example`). The model's context and reply size are
 `DIAGNOSE_NUM_CTX` (8192) and `DIAGNOSE_NUM_PREDICT` (1024).
 
+`REMEDIATION_AUDIT_PATH` (`/data/delta/remediation_audit`) is the audit table;
+Compose mounts `./delta/remediation_audit` writable inside the read-only `./delta`.
+
 To start from empty state, remove the volume:
 `docker compose rm -sf recovery-agent && docker volume rm self-healing-pipeline_agent-state`.
+The audit table is kept, so a failure that comes back is still not executed twice.
+Deleting `delta/` removes it together with the pipeline's tables.
 
 ## Tests
 
-No Kafka, Neo4j or model needed: the model is a fake, and the Delta reader runs on
-small tables written to a temp folder. From the repo root:
+No Kafka, Neo4j, Spark or model needed: the model is a fake, and the Delta reader
+and the audit table run on small tables written to a temp folder. From the repo root:
 
 ```bash
 pip install -r agent/requirements.txt pytest

@@ -38,3 +38,8 @@ POLICY_CONFIDENCE_THRESHOLD = float(os.environ.get("POLICY_CONFIDENCE_THRESHOLD"
 # in agent/actions.py. It cannot add an action to the safe set.
 _safe = os.environ.get("POLICY_SAFE_ACTIONS", "").strip()
 POLICY_SAFE_ACTIONS = None if not _safe else [a for a in _safe.split(",") if a.strip().upper() != "NONE"]
+
+# --- Remediate (spec RD1, RD2, TA2) --------------------------------------------
+# The audit table: one row per execution, written by the agent and by nothing else.
+# It is the only table Remediate writes; the pipeline's own tables stay read only.
+REMEDIATION_AUDIT_PATH = os.environ.get("REMEDIATION_AUDIT_PATH", "/data/delta/remediation_audit")

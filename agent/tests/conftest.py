@@ -1,7 +1,14 @@
 """No test may reach a real model or the pipeline's Delta tables by accident."""
 import pytest
 
-from agent import llm, reference
+from agent import config, llm, reference
+
+
+@pytest.fixture(autouse=True)
+def temp_tables(monkeypatch, tmp_path):
+    """Remediate writes its audit table: keep it, and the quarantine it reads, in the test's own folder."""
+    monkeypatch.setattr(config, "REMEDIATION_AUDIT_PATH", str(tmp_path / "remediation_audit"))
+    monkeypatch.setattr(config, "QUARANTINE_PATH", str(tmp_path / "silver2_quarantine"))
 
 
 @pytest.fixture(autouse=True)

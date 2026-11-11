@@ -5,8 +5,9 @@ accepted. The policy gate lets an action run without an engineer only when it is
 marked `safe`: its effect can be undone and it cannot touch records outside the
 failure group. Everything else is still a useful proposal, but an engineer decides.
 
-Diagnose, the policy gate and (Task 104) Remediate share this module, so the model's
-vocabulary, the safe set and what gets executed cannot drift apart.
+Diagnose, the policy gate and Remediate share this module, so the model's vocabulary,
+the safe set and what gets executed cannot drift apart. What executing an action
+means is in agent/executors.py; an action without an executor there cannot run.
 
 `action_params` per action (the same shape the incident memory stores, so a reused
 past fix and a fresh diagnosis look alike to Remediate):
