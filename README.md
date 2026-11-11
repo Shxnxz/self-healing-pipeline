@@ -28,7 +28,8 @@ the producer's `TABLES`; a source with no data blocks the layers after it.
 Slash and dash dates are ambiguous (`01/03/2021`), so each source declares its
 order. `DAY_FIRST_SOURCES` (default `crash3`) lists the sources that write
 `dd/MM/yyyy`; every other source is read `MM/dd/yyyy`. Silver 2 refuses to start if
-`DAY_FIRST_SOURCES` names something that is not in `SOURCES`. Day-first sources are
+`DAY_FIRST_SOURCES` is set to something that is not in `SOURCES` (the default `crash3`
+is exempt, so a run with `SOURCES=crash4` needs no change). Day-first sources are
 strict (a value like `02/24/2021` goes to quarantine); month-first sources still fall
 back to day first for values like `25/12/2021`.
 

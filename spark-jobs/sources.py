@@ -87,9 +87,18 @@ def check_day_first_sources(raw: Optional[str] = None, sources_raw: Optional[str
     A typo (crash03) or a renamed folder would otherwise switch the day-first
     reading off without any error, and that source's dates would silently be read
     month first again.
+
+    The built-in default (crash3) is exempt: it is allowed to name a folder that is
+    not running, so a subset run such as SOURCES=crash4 works without also setting
+    DAY_FIRST_SOURCES. docker-compose passes the same default, so it is exempt too.
     """
+    if raw is None:
+        raw = os.environ.get("DAY_FIRST_SOURCES", DEFAULT_DAY_FIRST_SOURCES)
+    names = day_first_sources(raw)
+    if names == day_first_sources(DEFAULT_DAY_FIRST_SOURCES):
+        return
     known = source_names(sources_raw)
-    unknown = [name for name in day_first_sources(raw) if name not in known]
+    unknown = [name for name in names if name not in known]
     if unknown:
         raise ValueError(
             f"DAY_FIRST_SOURCES lists {unknown}, which are not in SOURCES {known}. "

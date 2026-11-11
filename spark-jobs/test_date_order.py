@@ -51,8 +51,23 @@ def test_day_first_sources_must_be_listed_in_sources():
     # a typo or a renamed folder must stop Silver 2, not silently read month first
     with pytest.raises(ValueError, match="crash03"):
         sources.check_day_first_sources("crash03", "crash1,crash2,crash3,crash4")
-    with pytest.raises(ValueError, match="crash3"):
-        sources.check_day_first_sources("crash3", "crash1,crash2")
+    with pytest.raises(ValueError, match="crash1"):
+        sources.check_day_first_sources("crash3,crash1", "crash3,crash4")
+
+
+def test_default_day_first_source_does_not_block_subset_runs(monkeypatch):
+    """README "Replay one partition": SOURCES=crash4 must start without touching DAY_FIRST_SOURCES."""
+    monkeypatch.setenv("SOURCES", "crash4")
+    monkeypatch.delenv("DAY_FIRST_SOURCES", raising=False)
+    sources.check_day_first_sources()
+    # docker-compose always passes the default value explicitly
+    monkeypatch.setenv("DAY_FIRST_SOURCES", "crash3")
+    sources.check_day_first_sources()
+    assert not sources.is_day_first("crash4")
+    # a typo is still caught
+    monkeypatch.setenv("DAY_FIRST_SOURCES", "crash03")
+    with pytest.raises(ValueError, match="crash03"):
+        sources.check_day_first_sources()
 
 
 # --- Silver 2 parsing chain (local Spark) ------------------------------------
