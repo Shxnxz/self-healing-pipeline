@@ -10,8 +10,8 @@ Who writes what. Each node returns only its own keys:
   consumer              lookup_id, failure_id, failure, lineage_context,
                         incident_context, priority, lookup_route, route_reason
   deterministic_lookup  route, action (when a verified past fix is reused)
-  diagnose              diagnosis   {hypothesis, confidence, proposed_action}
-  policy_gate           policy      {passed, reasons}, action (when it passes)
+  diagnose              diagnosis   {status, hypothesis, confidence, proposed_action, ...}
+  policy_gate           policy      {passed, reasons, checks, ...}, action (when it passes)
   remediate             execution   {status, ...}
   validate              validation  {passed, reasons}
   escalate              escalation  {status, reason, details}, status

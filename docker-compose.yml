@@ -254,8 +254,10 @@ services:
   # --- Recovery agent (LangGraph loop) -----------------------------------
   # Consumes recovery.lookup and runs one LangGraph workflow per failure:
   # deterministic lookup -> diagnose -> policy gate -> remediate -> validate ->
-  # escalate / learn. The steps after the lookup are stubs for now: nothing is
-  # changed and every failure ends ESCALATED. See agent/README.md.
+  # escalate / learn. Diagnose asks the reasoning model (Qwen on Ollama) and the
+  # policy gate decides whether its proposal may run. Remediate and the steps after
+  # it are still stubs: nothing is changed and every failure ends ESCALATED.
+  # See agent/README.md.
   recovery-agent:
     build:
       context: .
@@ -264,10 +266,17 @@ services:
     restart: on-failure
     volumes:
       - agent-state:/state
+      - ./delta:/data/delta:ro # canonical values and quarantined records, read only
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       LOOKUP_OUTPUT_TOPIC: recovery.lookup
       AGENT_CHECKPOINT_PATH: /state/recovery_checkpoints.sqlite
+      REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
+      QUARANTINE_PATH: /data/delta/silver2_quarantine
+      DIAGNOSE_MODEL: ${DIAGNOSE_MODEL:-qwen3:8b}
+      DIAGNOSE_BASE_URL: ${DIAGNOSE_BASE_URL:-http://host.docker.internal:11434}
+      POLICY_CONFIDENCE_THRESHOLD: ${POLICY_CONFIDENCE_THRESHOLD:-0.85}
+      POLICY_SAFE_ACTIONS: ${POLICY_SAFE_ACTIONS:-}
     depends_on:
       kafka:
         condition: service_healthy

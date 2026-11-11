@@ -169,9 +169,14 @@ The state of every workflow is saved after each step (SQLite, volume `agent-stat
 so a crashed workflow resumes and a redelivered one is skipped. See
 [agent/README.md](agent/README.md).
 
-Only the graph, routing, state and consumer exist so far. The steps after the lookup
-are stubs that change nothing, so every failure currently ends `ESCALATED`.
-Unit tests: `python -m pytest agent`.
+Diagnose asks a reasoning model (Qwen on Ollama, `DIAGNOSE_MODEL`) for a root cause
+and one fix out of a pre-approved action list. The policy gate lets the fix run only
+when the model's confidence reaches `POLICY_CONFIDENCE_THRESHOLD` (0.85) and the
+action is in the safe set (today only `ADD_VARIANT`); everything else goes to an
+engineer with the reasons.
+
+Remediate and the steps after it are still stubs that change nothing, so every
+failure currently ends `ESCALATED`. Unit tests: `python -m pytest agent`.
 
 ## Swapping in the real dataset later
 

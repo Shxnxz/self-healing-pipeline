@@ -66,3 +66,47 @@ def gate_passes(state):
 
 def gate_passes_without_action(state):
     return {"policy": {"passed": True, "reasons": []}, "trace": trace("policy_gate")}
+
+
+# --- Task 103: what the Delta readers and the reasoning model return ---------------
+MONTHS = ["APRIL", "AUGUST", "DECEMBER", "FEBRUARY", "JANUARY", "JULY", "JUNE", "MARCH", "MAY",
+          "NOVEMBER", "OCTOBER", "SEPTEMBER"]
+CANONICAL = {"crash_month": MONTHS, "weather_condition": ["CLEAR", "CLOUDY", "FOG", "RAIN", "SNOW", "UNKNOWN"]}
+
+
+def canonical_values(column, path=None):
+    return CANONICAL.get(column, [])
+
+
+def july_samples(failure, limit=None, path=None):
+    return [{"crash_date": "07/04/2019 10:15:00 PM", "crash_month": "Jule"},
+            {"crash_date": "07/21/2019 08:00:00 AM", "crash_month": "Jule"}]
+
+
+def schema_item(failure_id="s1", trusted=True):
+    """A Silver 1 schema failure as the Qwen triage hands it over: two renamed columns."""
+    item = stack_item(failure_id=failure_id)
+    item["failure"].update({
+        "source": "QWEN", "failure_type": "SCHEMA_MISMATCH", "family": "SCHEMA", "column_name": None,
+        "raw_value": None, "trusted": trusted, "expected_only": ["crash_date", "weather_condition"],
+        "source_only": ["CrashDate", "Weather"],
+        "signature_value": "EXPECTED_ONLY=crash_date,weather_condition;SOURCE_ONLY=CrashDate,Weather",
+    })
+    return item
+
+
+class FakeModel:
+    """Stands in for llm.chat_json: answers with `reply` and keeps what it was asked."""
+
+    def __init__(self, reply=None, error=None):
+        self.reply, self.error, self.calls = reply, error, []
+
+    def __call__(self, system, user, schema):
+        self.calls.append({"system": system, "user": user, "schema": schema})
+        if self.error:
+            raise self.error
+        return self.reply
+
+
+JULY_REPLY = {"hypothesis": "Typo of July: both sample records have a crash_date in July.",
+              "action": "ADD_VARIANT", "canonical_value": "JULY", "confidence": 0.93}
