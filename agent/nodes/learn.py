@@ -18,5 +18,6 @@ def learn(state: RecoveryState) -> dict:
                     "reasons": ["learn is not built yet (Task 107); no incident was stored"]},
         # Escalate has already set the status when the failure went to an engineer.
         "status": state.get("status") or STATUS_RESOLVED,
+        "stubbed": [NAME],
         "trace": [step(NAME, "stub: nothing stored (Task 107)")],
     }

@@ -316,6 +316,7 @@ def test_a_model_that_asks_for_an_engineer_reaches_one_without_a_blocked_fix():
     state = run(stack_item(), reply)
     assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
     assert state["policy"]["outcome"] == "ENGINEER_REQUESTED"
+    assert state["escalation"]["reason"] == "ENGINEER_REQUESTED"
     assert state["escalation"]["details"] == [
         "the model asked for an engineer: The records point to June and July alike."]
 

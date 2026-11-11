@@ -13,8 +13,10 @@ The fixed sequence of the spec:
   1. Idempotency check   `execution_id` = hash of (failure, action, parameters). If
                          the audit table already holds a SUCCESS for it, the fix was
                          executed before (the agent stopped before LangGraph saved
-                         this node, and the workflow resumed here). The recorded
-                         result is returned and nothing is executed again. A FAILED
+                         this node and the workflow resumed here, the graph retried
+                         the step, or the consumer ran the failure again because a
+                         later step was a stub). The recorded result is returned
+                         and nothing is executed again. A FAILED
                          attempt staged nothing, so it does not count as executed:
                          the fix runs again, and the new attempt is audited too.
   2. Execute             the action's executor (agent/executors.py). For ADD_VARIANT:

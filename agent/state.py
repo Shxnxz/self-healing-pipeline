@@ -16,6 +16,8 @@ Who writes what. Each node returns only its own keys:
   validate              validation  {passed, reasons}
   escalate              escalation  {status, reason, details}, status
   learn                 learned     {written, ...}, status
+  a stub                stubbed     its own name, until the step is built
+  the graph             error       {node, error, attempts} when a step kept raising
 
 `action` is the only thing Remediate executes, and only two nodes may set it:
 deterministic_lookup (a fix that already worked) and policy_gate (a proposal that
@@ -36,6 +38,7 @@ EXECUTION_FAILED = "FAILED"
 # Final status of a workflow.
 STATUS_RESOLVED = "RESOLVED"    # fixed and validated without an engineer
 STATUS_ESCALATED = "ESCALATED"  # handed to an engineer
+STATUS_FAILED = "FAILED"        # escalate or learn itself kept raising: nobody has the case
 
 # Marker a stub node leaves so nobody mistakes its output for a real result.
 NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
@@ -62,7 +65,11 @@ class RecoveryState(TypedDict, total=False):
     escalation: dict
     learned: dict
     status: str
+    error: dict              # the step that kept raising (agent/graph.py: guarded)
     trace: Annotated[list, operator.add]  # one entry per node visited, in order
+    # Stub steps this workflow went through. Not empty = nothing was really done, so
+    # the consumer runs the failure again when it is delivered again.
+    stubbed: Annotated[list, operator.add]
 
 
 def initial_state(lookup_id: Optional[str], item: dict) -> RecoveryState:

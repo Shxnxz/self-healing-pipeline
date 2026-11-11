@@ -7,7 +7,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agent.consumer import describe, process_lookup, run
 from agent.graph import build_graph, open_checkpointer
 from agent.show import saved_state
-from agent.tests.helpers import PAST_FIX, lookup_message, path, remediate_ok, stack_item, trace
+from agent.tests.helpers import (PAST_FIX, REUSE_PATH_BUILT, Killed, lookup_message, path, remediate_ok,
+                                 stack_item, trace)
 
 
 def thread(failure_id):
@@ -32,12 +33,35 @@ def test_redelivered_message_does_not_run_a_workflow_twice():
         calls.append(state["failure_id"])
         return remediate_ok(state)
 
-    graph = build_graph(InMemorySaver(), nodes={"remediate": counting_remediate})
+    graph = build_graph(InMemorySaver(), nodes={**REUSE_PATH_BUILT, "remediate": counting_remediate})
     message = lookup_message(stack_item("f1", route="remediate", match=PAST_FIX))
     first = process_lookup(graph, message)
     again = process_lookup(graph, message)
     assert calls == ["f1"]
-    assert again[0]["delivery"] == "duplicate" and again[0]["state"]["status"] == first[0]["state"]["status"]
+    assert first[0]["state"]["status"] == "RESOLVED"
+    assert again[0]["delivery"] == "duplicate" and again[0]["state"]["status"] == "RESOLVED"
+
+
+def test_failure_handled_by_stubs_is_run_again_once_the_steps_are_built(tmp_path):
+    """A workflow that ended on a stub did nothing, so it must not count as done."""
+    db = str(tmp_path / "checkpoints.sqlite")
+    message = lookup_message(stack_item("f1", route="remediate", match=PAST_FIX))
+
+    before = open_checkpointer(db)
+    (stubbed,) = process_lookup(build_graph(before), message)
+    before.conn.close()
+    assert stubbed["delivery"] == "new" and stubbed["state"]["status"] == "ESCALATED"
+
+    after = open_checkpointer(db)
+    built = build_graph(after, nodes=REUSE_PATH_BUILT)
+    (rerun,) = process_lookup(built, message)
+    (again,) = process_lookup(built, message)
+    after.conn.close()
+    assert rerun["delivery"] == "rerun" and rerun["state"]["status"] == "RESOLVED"
+    # a clean run, with nothing left over from the stub run
+    assert path(rerun["state"]) == ["deterministic_lookup", "remediate", "validate", "learn"]
+    assert "escalation" not in rerun["state"] and rerun["state"]["stubbed"] == []
+    assert again["delivery"] == "duplicate"
 
 
 def test_workflow_resumes_after_a_crash_from_the_node_that_failed(tmp_path):
@@ -49,16 +73,16 @@ def test_workflow_resumes_after_a_crash_from_the_node_that_failed(tmp_path):
         ran.append("remediate")
         return remediate_ok(state)
 
-    def validate_crashes(state):
-        raise RuntimeError("Spark is down")
+    def validate_killed(state):
+        raise Killed()
 
     def validate_works(state):
         return {"validation": {"passed": True, "reasons": []}, "trace": trace("validate")}
 
     message = lookup_message(stack_item("f1", route="remediate", match=PAST_FIX))
     before = open_checkpointer(db)
-    crashing = build_graph(before, nodes={"remediate": remediate_once, "validate": validate_crashes})
-    with pytest.raises(RuntimeError):
+    crashing = build_graph(before, nodes={"remediate": remediate_once, "validate": validate_killed})
+    with pytest.raises(Killed):
         process_lookup(crashing, message)
     before.conn.close()
 
@@ -85,6 +109,7 @@ def test_describe_shows_the_failure_the_outcome_and_the_path():
     line = describe(summary)
     assert "f1" in line and "Crash1:crash_month" in line and "'Jule'" in line
     assert "ESCALATED (deterministic_lookup > diagnose > policy_gate > escalate > learn)" in line
+    assert line.endswith("[stubs: escalate, learn]")   # Diagnose and the gate are real since Task 103
 
 
 def test_saved_state_can_be_read_back_by_failure_id():
@@ -115,12 +140,26 @@ class FakeMessage:
 
 
 class FakeConsumer:
+    """Like Kafka: a paused consumer gets nothing from poll(), but the poll still counts."""
+
     def __init__(self, values):
         self.pending = [FakeMessage(v, i) for i, v in enumerate(values)]
-        self.committed = []
+        self.committed, self.paused, self.polls_while_paused = [], False, 0
 
     def poll(self, timeout):
+        if self.paused:
+            self.polls_while_paused += 1
+            return None
         return self.pending.pop(0) if self.pending else None
+
+    def assignment(self):
+        return ["recovery.lookup[0]"]
+
+    def pause(self, partitions):
+        self.paused = True
+
+    def resume(self, partitions):
+        self.paused = False
 
     def commit(self, message, asynchronous):
         self.committed.append(message.offset())
@@ -137,12 +176,40 @@ def test_poll_loop_commits_each_message_after_its_stack_is_handled():
     assert graph.get_state(thread("f2")).values["status"] == "ESCALATED"
 
 
-def test_poll_loop_does_not_commit_a_message_whose_workflow_crashed():
-    def remediate_crashes(state):
+def test_poll_loop_keeps_polling_kafka_while_it_works_through_a_long_stack():
+    """One poll per workflow keeps the agent in the group; paused, so no stack is taken early."""
+    graph = build_graph(InMemorySaver())
+    stack = [stack_item(f"f{i}", rank=i) for i in range(1, 6)]
+    consumer = FakeConsumer([json.dumps(lookup_message(*stack)).encode(),
+                             json.dumps(lookup_message(stack_item("g1"), lookup_id="L2")).encode()])
+    run(consumer, graph, max_messages=1)
+    assert consumer.polls_while_paused == 5 and consumer.paused is False
+    assert consumer.committed == [0] and len(consumer.pending) == 1  # the second stack was left alone
+    run(consumer, graph, max_messages=1)
+    assert consumer.committed == [0, 1]
+
+
+def test_step_that_always_raises_does_not_block_the_messages_behind_it():
+    def remediate_broken(state):
         raise RuntimeError("boom")
 
-    graph = build_graph(InMemorySaver(), nodes={"remediate": remediate_crashes})
+    graph = build_graph(InMemorySaver(), nodes={"remediate": remediate_broken}, retry_seconds=0)
+    consumer = FakeConsumer([
+        json.dumps(lookup_message(stack_item("f1", route="remediate", match=PAST_FIX))).encode(),
+        json.dumps(lookup_message(stack_item("f2"), lookup_id="L2")).encode(),
+    ])
+    run(consumer, graph, max_messages=2)
+    assert consumer.committed == [0, 1]
+    assert graph.get_state(thread("f1")).values["escalation"]["reason"] == "STEP_FAILED"
+    assert graph.get_state(thread("f2")).values["status"] == "ESCALATED"
+
+
+def test_poll_loop_does_not_commit_a_message_when_the_agent_dies_mid_workflow():
+    def remediate_killed(state):
+        raise Killed()
+
+    graph = build_graph(InMemorySaver(), nodes={"remediate": remediate_killed})
     consumer = FakeConsumer([json.dumps(lookup_message(stack_item("f1", route="remediate", match=PAST_FIX))).encode()])
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Killed):
         run(consumer, graph, max_messages=1)
     assert consumer.committed == []

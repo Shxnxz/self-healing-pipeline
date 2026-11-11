@@ -11,8 +11,8 @@ from agent.consumer import run_workflow
 from agent.graph import build_graph
 from agent.nodes.remediate import make_remediate, remediate
 from agent.state import initial_state
-from agent.tests.helpers import (PAST_FIX, canonical_values, jule_quarantine, path, quarantine_row, schema_item,
-                                 stack_item, write_quarantine)
+from agent.tests.helpers import (PAST_FIX, Killed, canonical_values, jule_quarantine, path, quarantine_row,
+                                 schema_item, stack_item, write_quarantine)
 
 JULY = {"action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"}, "source": "DIAGNOSIS",
         "incident_id": None}
@@ -194,12 +194,12 @@ def test_workflow_that_stopped_after_executing_resumes_without_executing_again()
         out = real(state)
         runs.append(out["execution"])
         if len(runs) == 1:
-            raise RuntimeError("agent stopped before the checkpoint")
+            raise Killed()                             # the process dies: no retry, nothing saved
         return out
 
     graph = build_graph(InMemorySaver(), nodes={"remediate": dies_after_the_first_execution})
     item = stack_item(route="remediate", match=PAST_FIX)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Killed):
         run_workflow(graph, "L1", item)
     assert len(audit_rows()) == 1                      # the execution happened and is recorded
 
@@ -209,6 +209,42 @@ def test_workflow_that_stopped_after_executing_resumes_without_executing_again()
     assert len(audit_rows()) == 1                      # not executed, and not recorded, twice
     assert summary["state"]["execution"]["status"] == "SUCCESS"
     assert path(summary["state"])[:3] == ["deterministic_lookup", "remediate", "validate"]
+
+
+def test_a_step_retry_after_the_fix_was_executed_does_not_execute_it_again():
+    """The graph retries a step that raises (agent/graph.py guarded), so Remediate can be
+    called twice inside one workflow. The second call finds the audit record."""
+    jule_quarantine(config.QUARANTINE_PATH)
+    real, runs = make_remediate(), []
+
+    def raises_after_the_first_execution(state):
+        out = real(state)
+        runs.append(out["execution"])
+        if len(runs) == 1:
+            raise RuntimeError("lost the connection after the commit")
+        return out
+
+    graph = build_graph(InMemorySaver(), nodes={"remediate": raises_after_the_first_execution}, retry_seconds=0)
+    summary = run_workflow(graph, "L1", stack_item(route="remediate", match=PAST_FIX))
+    assert len(runs) == 2 and runs[1]["idempotent_replay"] is True
+    assert len(audit_rows()) == 1 and summary["state"]["execution"]["status"] == "SUCCESS"
+    assert "error" not in summary["state"]
+
+
+def test_a_failure_rerun_because_a_later_step_is_a_stub_is_not_executed_again():
+    """Validate is still a stub, so the consumer runs the whole workflow again when the
+    failure is published again. Remediate is real and has already staged the fix."""
+    jule_quarantine(config.QUARANTINE_PATH)
+    graph = build_graph(InMemorySaver())
+    item = stack_item(route="remediate", match=PAST_FIX)
+    first = run_workflow(graph, "L1", item)
+    assert first["delivery"] == "new" and first["state"]["execution"]["idempotent_replay"] is False
+    assert "remediate" not in first["state"]["stubbed"]
+
+    again = run_workflow(graph, "L2", item)
+    assert again["delivery"] == "rerun" and again["state"]["execution"]["idempotent_replay"] is True
+    assert again["state"]["execution"]["executed_at"] == first["state"]["execution"]["executed_at"]
+    assert len(audit_rows()) == 1
 
 
 def test_a_failed_attempt_does_not_block_the_fix_once_the_cause_is_gone():

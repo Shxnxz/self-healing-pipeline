@@ -187,7 +187,9 @@ reference table. Print the records with
 `docker compose exec recovery-agent python -m agent.audit`.
 
 Validate and the steps after it are still stubs, so every failure currently ends
-`ESCALATED`. Unit tests: `python -m pytest agent`.
+`ESCALATED`. A failure that ended on a stub is run again when it is published again
+after the step is built; a fix Remediate already staged is then not executed a
+second time. Unit tests: `python -m pytest agent`.
 
 ## Swapping in the real dataset later
 
