@@ -68,6 +68,24 @@ def gate_passes_without_action(state):
     return {"policy": {"passed": True, "reasons": []}, "trace": trace("policy_gate")}
 
 
+def learn_ok(state):
+    return {"learned": {"written": True, "incident_id": "i9"},
+            "status": state.get("status") or "RESOLVED", "trace": trace("learn")}
+
+
+def escalate_ok(state):
+    return {"escalation": {"status": "PENDING_REVIEW", "reason": "asked"}, "status": "ESCALATED",
+            "trace": trace("escalate")}
+
+
+# Every step on the reuse path built: lookup > remediate > validate > learn.
+REUSE_PATH_BUILT = {"remediate": remediate_ok, "validate": validate_ok, "learn": learn_ok}
+
+
+class Killed(BaseException):
+    """The process dying in the middle of a step (not an error a step can be retried on)."""
+
+
 # --- Task 103: what the Delta readers and the reasoning model return ---------------
 MONTHS = ["APRIL", "AUGUST", "DECEMBER", "FEBRUARY", "JANUARY", "JULY", "JUNE", "MARCH", "MAY",
           "NOVEMBER", "OCTOBER", "SEPTEMBER"]

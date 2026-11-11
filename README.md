@@ -180,7 +180,8 @@ records; where nothing can, the stricter `POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD
 confirms the model answers.
 
 Remediate and the steps after it are still stubs that change nothing, so every
-failure currently ends `ESCALATED`. Unit tests: `python -m pytest agent`.
+failure currently ends `ESCALATED`. A failure that ended on a stub is run again when
+it is published again after the step is built. Unit tests: `python -m pytest agent`.
 
 ## Swapping in the real dataset later
 

@@ -46,6 +46,14 @@ flowchart TD
 `python -m agent.graph` prints the diagram of the graph as compiled, and a test
 checks these edges.
 
+**A step that raises does not stop the agent.** The graph retries it
+(`AGENT_NODE_MAX_ATTEMPTS`, default 3, waiting `AGENT_NODE_RETRY_SECONDS` and then
+twice as long). If it still raises, the error is saved in `error` and the failure
+goes to Escalate with reason `STEP_FAILED`. This is also why `deterministic_lookup`
+and `diagnose` have an edge to `escalate` that the diagram leaves out. If Escalate
+or Learn itself keeps raising, the workflow ends with status `FAILED`. Because of
+the retry, **a step must be safe to run more than once**.
+
 ## State of a workflow (`state.py`)
 
 One workflow handles one item of a `recovery.lookup` stack. Each node returns only
@@ -62,6 +70,8 @@ its own keys:
 | `escalate` | `escalation` = `{status, reason, details}`, `status` |
 | `learn` | `learned`, `status` |
 | every node | one `trace` entry, so the path can be read back |
+| a stub | its name in `stubbed`. Delete that line when you build the step |
+| the graph | `error` = `{node, error, attempts}` when a step kept raising |
 
 `action` (`{action, action_params, source, incident_id}`) is the only thing Remediate
 executes. Only two nodes may set it: `deterministic_lookup` (a fix that already
@@ -205,12 +215,29 @@ LangGraph saves the state after every node in SQLite, under
 `thread_id = failure.failure_id`. For each stack item the agent does one of:
 
 - **new**: no saved state, start the workflow.
-- **resumed**: the workflow stopped part-way (the agent crashed): continue from the
-  last finished node. Nodes that already ran are not run again.
-- **duplicate**: the workflow already ended: skip it. Kafka delivers at least once.
+- **resumed**: the workflow stopped part-way (the agent was killed): continue from
+  the last finished node. Nodes that already ran are not run again.
+- **duplicate**: the workflow ended and every step it went through was real: skip
+  it. Kafka delivers at least once.
+- **rerun**: the workflow ended on a stub (`stubbed` is not empty). Nothing was
+  really done, so the saved state is dropped and the failure runs again.
 
-The Kafka offset is committed after the whole stack was handled. If a node raises,
-the agent exits without committing, Compose restarts it and the message comes back.
+The Kafka offset is committed after the whole stack was handled. While a stack is
+being worked the agent pauses the partition and polls Kafka after every workflow,
+so a long stack does not get it dropped from the consumer group.
+
+### Failures seen while steps are still stubs
+
+A failure that passes through today ends `ESCALATED` on the stubs, and nobody is
+told. It is not lost for good: it stays `PENDING` in `silver2_quarantine`, and
+because of **rerun** it is handled properly the next time it is published. After a
+step is built, publish the open failures again by resetting the scanner:
+
+```bash
+docker compose rm -sf lookup-scanner
+docker volume rm self-healing-pipeline_lookup-state
+docker compose up -d lookup-scanner
+```
 
 ## Run it
 
@@ -221,8 +248,8 @@ docker compose logs -f recovery-agent
 
 ```
 [agent] lookup 66b035e5-...: 2 failure(s)
-[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > remediate > escalate > learn)
-[agent] 289b9d3430ea286e new       P3 crash1:weather_condition value='MISTY DARK' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > escalate > learn)
+[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > remediate > escalate > learn) [stubs: remediate, escalate, learn]
+[agent] 289b9d3430ea286e new       P3 crash1:weather_condition value='MISTY DARK' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > escalate > learn) [stubs: escalate, learn]
 ```
 
 The first failure passed the gate (it reached `remediate`, still a stub); the
@@ -236,7 +263,8 @@ docker compose exec recovery-agent python -m agent.show fd95d1c4c9991007
 ```
 
 Settings (`config.py`): `LOOKUP_OUTPUT_TOPIC`, `AGENT_CONSUMER_GROUP`,
-`AGENT_CHECKPOINT_PATH`, `AGENT_MAX_POLL_INTERVAL_MS`, and for Diagnose and the gate:
+`AGENT_CHECKPOINT_PATH`, `AGENT_MAX_POLL_INTERVAL_MS`, `AGENT_NODE_MAX_ATTEMPTS`,
+`AGENT_NODE_RETRY_SECONDS`, and for Diagnose and the gate:
 
 | Setting | Default | Meaning |
 |---|---|---|

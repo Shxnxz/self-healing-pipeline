@@ -4,14 +4,18 @@ from pathlib import Path
 
 import pytest
 
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt
+
 from agent.graph import build_graph
 from agent.state import NOT_IMPLEMENTED, initial_state
-from agent.tests.helpers import (PAST_FIX, diagnose_july, gate_passes, gate_passes_without_action,
-                                 path, remediate_ok, stack_item, validate_fails, validate_ok)
+from agent.tests.helpers import (PAST_FIX, diagnose_july, escalate_ok, gate_passes,
+                                 gate_passes_without_action, learn_ok, path, remediate_ok, stack_item,
+                                 trace, validate_fails, validate_ok)
 
 
 def run(item, **nodes):
-    return build_graph(nodes=nodes).invoke(initial_state("L1", item))
+    return build_graph(nodes=nodes, retry_seconds=0).invoke(initial_state("L1", item))
 
 
 def test_graph_has_the_edges_of_the_spec():
@@ -25,6 +29,8 @@ def test_graph_has_the_edges_of_the_spec():
         ("validate", "learn"), ("validate", "escalate"),
         ("escalate", "learn"),
         ("learn", "__end__"),
+        # a step that keeps raising goes to the engineer from anywhere
+        ("deterministic_lookup", "escalate"), ("diagnose", "escalate"),
     }
 
 
@@ -50,6 +56,14 @@ def test_stub_remediate_never_claims_a_fix():
     assert state["execution"]["status"] == NOT_IMPLEMENTED
     assert state["escalation"]["reason"] == "REMEDIATION_FAILED"
     assert state["status"] == "ESCALATED" and state["learned"]["written"] is False
+
+
+def test_stubs_mark_the_workflow_so_it_is_not_taken_for_a_real_result():
+    state = run(stack_item(route="diagnose"))
+    assert state["stubbed"] == ["escalate", "learn"]   # Diagnose and the gate are real since Task 103
+    built = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok,
+                validate=validate_ok, learn=learn_ok)
+    assert built["stubbed"] == []
 
 
 def test_remediate_verdict_without_a_past_fix_is_diagnosed():
@@ -106,6 +120,7 @@ def test_gate_that_passes_without_an_action_still_escalates():
     state = run(stack_item(route="diagnose"), diagnose=diagnose_july,
                 policy_gate=gate_passes_without_action, remediate=remediate_ok)
     assert "remediate" not in path(state) and state["status"] == "ESCALATED"
+    assert state["escalation"]["reason"] == "GATE_PASSED_WITHOUT_ACTION"  # not "rejected"
 
 
 def test_failed_validation_is_escalated():
@@ -113,6 +128,69 @@ def test_failed_validation_is_escalated():
     assert path(state) == ["deterministic_lookup", "remediate", "validate", "escalate", "learn"]
     assert state["escalation"] == {"status": "PENDING_REVIEW", "reason": "VALIDATION_FAILED",
                                    "details": ["new failure in weather_condition"]}
+
+
+# --- a step that raises must not stop the agent ---------------------------------------
+def test_step_that_keeps_raising_is_retried_then_escalated():
+    calls = []
+
+    def remediate_broken(state):
+        calls.append(1)
+        raise RuntimeError("Spark is down")
+
+    state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_broken)
+    assert len(calls) == 3
+    assert path(state) == ["deterministic_lookup", "remediate", "escalate", "learn"]
+    assert state["error"] == {"node": "remediate", "error": "RuntimeError: Spark is down", "attempts": 3}
+    assert state["escalation"]["reason"] == "STEP_FAILED"
+    assert "remediate: RuntimeError: Spark is down" in state["escalation"]["details"][0]
+    assert state["status"] == "ESCALATED" and "execution" not in state
+
+
+def test_step_that_raises_once_then_works_is_not_escalated():
+    calls = []
+
+    def remediate_flaky(state):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("Neo4j restarting")
+        return remediate_ok(state)
+
+    state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_flaky,
+                validate=validate_ok, learn=learn_ok)
+    assert len(calls) == 2 and "error" not in state and state["status"] == "RESOLVED"
+
+
+def test_broken_diagnose_goes_to_the_engineer_not_to_the_gate():
+    def diagnose_broken(state):
+        raise TimeoutError("LLM did not answer")
+
+    state = run(stack_item(route="diagnose"), diagnose=diagnose_broken)
+    assert path(state) == ["deterministic_lookup", "diagnose", "escalate", "learn"]
+    assert state["escalation"]["reason"] == "STEP_FAILED"
+
+
+def test_broken_escalate_ends_the_workflow_as_failed():
+    """Nothing is left to catch it, but the workflow still ends so the agent moves on."""
+    def escalate_broken(state):
+        raise RuntimeError("cannot reach the review queue")
+
+    state = run(stack_item(route="diagnose"), escalate=escalate_broken, learn=learn_ok)
+    assert state["status"] == "FAILED" and state["error"]["node"] == "escalate"
+    assert path(state)[-2:] == ["escalate", "learn"]
+
+
+def test_interrupt_in_a_step_still_pauses_the_workflow():
+    """Task 106 will wait for the engineer with interrupt(); the retry guard must not eat it."""
+    def escalate_waits(state):
+        decision = interrupt({"ask": "approve?"})
+        return {**escalate_ok(state), "escalation": {"status": "RESOLVED", "decision": decision}}
+
+    graph = build_graph(InMemorySaver(), nodes={"escalate": escalate_waits, "learn": learn_ok}, retry_seconds=0)
+    thread = {"configurable": {"thread_id": "f1"}}
+    paused = graph.invoke(initial_state("L1", stack_item("f1")), thread)
+    assert "__interrupt__" in paused and graph.get_state(thread).next == ("escalate",)
+    assert "error" not in graph.get_state(thread).values
 
 
 def test_unknown_node_name_is_rejected():

@@ -15,5 +15,6 @@ def validate(state: RecoveryState) -> dict:
     return {
         "validation": {"status": NOT_IMPLEMENTED, "passed": False,
                        "reasons": ["validate is not built yet (Task 105)"]},
+        "stubbed": [NAME],
         "trace": [step(NAME, "stub: not validated (Task 105)")],
     }
