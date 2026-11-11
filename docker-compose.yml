@@ -130,6 +130,8 @@ services:
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SOURCES: ${SOURCES:-crash1,crash2,crash3,crash4}
+      # Sources whose slash dates are dd/MM/yyyy (Crash3); the rest read MM/dd/yyyy.
+      DAY_FIRST_SOURCES: ${DAY_FIRST_SOURCES:-crash3}
       DELTA_ROOT: /data/delta
       CHECKPOINT_ROOT: /data/checkpoints
       SPARK_DRIVER_MEMORY: ${SILVER2_GOLD_DRIVER_MEMORY:-2g}

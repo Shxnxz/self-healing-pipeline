@@ -32,7 +32,7 @@ it is promoted) and just check that `columns_to_remediate` comes back empty.
 import os
 import traceback
 from itertools import chain
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -45,7 +45,14 @@ from pyspark.sql.types import (
 )
 
 from common import build_spark, idempotent_append, wait_for_delta_table
-from sources import checkpoint_path, shared_path, source_names, table_name, table_path
+from sources import (
+    checkpoint_path,
+    is_day_first,
+    shared_path,
+    source_names,
+    table_name,
+    table_path,
+)
 from ref_mappings import (
     ANCHOR_TO_CANONICAL,
     CANONICAL_ANCHORS,
@@ -85,37 +92,43 @@ MIN_SPARK_VERSION = (3, 4)
 MAX_ERROR_CHARS = 4000
 MAX_TRACE_CHARS = 8000
 
-# Supported additive date format strings.
-# Slash dates are read US-style (month first) because that is the source
-# convention; "d/M/yyyy" is only a fallback for values that cannot be month-first
-# (e.g. 25/12/2021). Ambiguous values like 03/04/2021 therefore parse as March 4.
-DATE_FORMATS = [
+# Supported additive date format strings, tried in order (first match wins).
+# Slash dates are ambiguous: 01/03/2021 is 3 January month first and 1 March day
+# first. Each source declares its order (sources.DAY_FIRST_SOURCES, default crash3);
+# the other order is kept only as a fallback for values that cannot be read the
+# preferred way (e.g. 25/12/2021 in a month-first source).
+_ISO_DATE_FORMATS = [
     "yyyy-MM-dd'T'HH:mm:ss.SSS",
     "yyyy-MM-dd'T'HH:mm:ss",
     "yyyy-MM-dd HH:mm:ss",
     "yyyy-MM-dd",
     "yyyy/MM/dd HH:mm:ss",
     "yyyy/MM/dd",
-    "M/d/yyyy h:mm:ss a",
-    "M/d/yyyy H:mm:ss",
-    "M/d/yyyy",
-    "d/M/yyyy H:mm:ss",
-    "d/M/yyyy",
-    "dd-MM-yyyy",
-    "yyyyMMdd",
 ]
+_MONTH_FIRST_FORMATS = ["M/d/yyyy h:mm:ss a", "M/d/yyyy H:mm:ss", "M/d/yyyy"]
+_DAY_FIRST_FORMATS = ["d/M/yyyy h:mm:ss a", "d/M/yyyy H:mm:ss", "d/M/yyyy"]
+_OTHER_DATE_FORMATS = ["dd-MM-yyyy", "yyyyMMdd"]
 
-# Supported additive timestamp format strings (same month-first convention)
-TIMESTAMP_FORMATS = [
-    "yyyy-MM-dd'T'HH:mm:ss.SSS",
-    "yyyy-MM-dd'T'HH:mm:ss",
-    "yyyy-MM-dd HH:mm:ss",
-    "yyyy-MM-dd",
-    "yyyy/MM/dd HH:mm:ss",
-    "M/d/yyyy h:mm:ss a",
-    "M/d/yyyy H:mm:ss",
-    "M/d/yyyy",
-]
+
+def date_formats(day_first: bool = False) -> List[str]:
+    """crash_date formats: ISO first, then slash dates in the source's order."""
+    slash = (
+        _DAY_FIRST_FORMATS + _MONTH_FIRST_FORMATS
+        if day_first
+        else _MONTH_FIRST_FORMATS + _DAY_FIRST_FORMATS
+    )
+    return _ISO_DATE_FORMATS + slash + _OTHER_DATE_FORMATS
+
+
+def timestamp_formats(day_first: bool = False) -> List[str]:
+    """date_police_notified formats: no fallback order, an unreadable value is flagged."""
+    iso = [f for f in _ISO_DATE_FORMATS if f != "yyyy/MM/dd"]
+    return iso + (_DAY_FIRST_FORMATS if day_first else _MONTH_FIRST_FORMATS)
+
+
+# Month-first defaults (sources not listed in DAY_FIRST_SOURCES)
+DATE_FORMATS = date_formats(day_first=False)
+TIMESTAMP_FORMATS = timestamp_formats(day_first=False)
 
 
 def _try_ts(col_name: str, fmt: str) -> Column:
@@ -160,13 +173,21 @@ def _fuzzy_audit_struct(
     ).otherwise(None)
 
 
-def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) -> DataFrame:
+def standardize_silver2(
+    df: DataFrame,
+    mapping_dict: Dict[str, Dict[str, str]],
+    day_first: bool = False,
+) -> DataFrame:
     """
     Apply native PySpark parsing chains and canonical reference lookups.
     Tracks all mapping and parsing failures in `columns_to_remediate`.
 
-    Pure function of (Silver 1 row, mapping_dict): it is also what the healing
-    loop replays quarantined rows through.
+    `day_first` reads slash dates as dd/MM/yyyy (sources.is_day_first).
+
+    Pure function of (Silver 1 row, mapping_dict, day_first): it is also what the
+    healing loop replays quarantined rows through. Pass
+    `day_first=is_day_first(row.target_table)` there, or a day-first source's
+    rows would be re-read month first.
     """
     # Explicit bindings to input DataFrame columns to avoid projection alias shadowing
     record_id = df["record_id"]
@@ -188,13 +209,13 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
 
     # 1. Native Date Parsing Chain
     parsed_crash_date = F.coalesce(
-        *[F.to_date(_try_ts("crash_date", fmt)) for fmt in DATE_FORMATS]
+        *[F.to_date(_try_ts("crash_date", fmt)) for fmt in date_formats(day_first)]
     )
     std_crash_date = F.date_format(parsed_crash_date, "yyyy-MM-dd")
 
     # 2. Native Timestamp Parsing Chain for date_police_notified
     parsed_police_ts = F.coalesce(
-        *[_try_ts("date_police_notified", fmt) for fmt in TIMESTAMP_FORMATS]
+        *[_try_ts("date_police_notified", fmt) for fmt in timestamp_formats(day_first)]
     )
     std_date_police_notified = F.date_format(parsed_police_ts, "yyyy-MM-dd HH:mm:ss")
 
@@ -460,6 +481,7 @@ def make_batch_processor(
     silver2_path: str,
     txn_app_id: Optional[str] = None,
     target_table: Optional[str] = None,
+    day_first: bool = False,
 ):
     """
     Returns the foreachBatch function for one source.
@@ -467,7 +489,8 @@ def make_batch_processor(
     Valid rows go to `silver2_path` (that source's own Silver 2 table); failures go
     to the shared quarantine / dead letter tables tagged with `target_table`, the
     Silver 2 table a healed row is replayed into. `txn_app_id` must be unique per
-    source (see TXN_APP_ID).
+    source (see TXN_APP_ID). `day_first` is that source's slash-date order
+    (sources.is_day_first).
     """
 
     def process_micro_batch(batch_df: DataFrame, batch_id: int):
@@ -478,7 +501,7 @@ def make_batch_processor(
         #    Anything that blows up here is a data/schema problem -> dead letter.
         transformed = None
         try:
-            transformed = standardize_silver2(batch_df, mapping_dict).persist()
+            transformed = standardize_silver2(batch_df, mapping_dict, day_first).persist()
             stats = transformed.agg(
                 F.count(F.lit(1)).alias("total"),
                 F.sum(F.when(F.size("columns_to_remediate") > 0, 1).otherwise(0)).alias("quarantined"),
@@ -594,8 +617,13 @@ def start(
         reader = reader.option("skipChangeCommits", "true")
     silver1_stream = reader.load(silver1_path)
 
+    day_first = is_day_first(source)
     batch_processor = make_batch_processor(
-        spark, silver2_path, txn_app_id=f"{TXN_APP_ID}_{source}", target_table=target_table
+        spark,
+        silver2_path,
+        txn_app_id=f"{TXN_APP_ID}_{source}",
+        target_table=target_table,
+        day_first=day_first,
     )
 
     # foreachBatch owns all writes, so no sink format is set on the writeStream
@@ -610,7 +638,8 @@ def start(
     print(
         f"[{target_table}] Streaming {silver1_path} -> {silver2_path} "
         f"(Quarantine: {QUARANTINE_PATH}, Audit: {FUZZY_AUDIT_PATH}, "
-        f"Dead letter: {DEAD_LETTER_PATH})"
+        f"Dead letter: {DEAD_LETTER_PATH}, "
+        f"slash dates: {'dd/MM/yyyy' if day_first else 'MM/dd/yyyy'})"
     )
     return query
 
