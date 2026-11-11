@@ -11,7 +11,7 @@ Who writes what. Each node returns only its own keys:
                         incident_context, priority, lookup_route, route_reason
   deterministic_lookup  route, action (when a verified past fix is reused)
   diagnose              diagnosis   {status, hypothesis, confidence, proposed_action, ...}
-  policy_gate           policy      {passed, reasons, checks, ...}, action (when it passes)
+  policy_gate           policy      {passed, outcome, reasons, checks, ...}, action (when it passes)
   remediate             execution   {status, execution_id, overlay, rows_affected, ...}
   validate              validation  {passed, reasons}
   escalate              escalation  {status, reason, details}, status

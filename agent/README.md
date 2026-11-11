@@ -19,7 +19,7 @@ the Validate stub does not pass it. Each stub is replaced by its own task:
 |---|---|---|---|
 | `deterministic_lookup` | `nodes/deterministic_lookup.py` | Task 102 | real: reads the lookup verdict, sets the route |
 | `diagnose` | `nodes/diagnose.py` | Task 103 | real: asks the reasoning model for a cause and one fix |
-| `policy_gate` | `nodes/policy_gate.py` | Task 103 | real: confidence threshold and safe-action set |
+| `policy_gate` | `nodes/policy_gate.py` | Task 103 | real: confidence threshold, safe-action set and a check against the records |
 | `remediate` | `nodes/remediate.py` | Task 104 | real: idempotency check, stages the fix, writes the audit record |
 | `validate` | `nodes/validate.py` | Task 105 | stub: does not pass |
 | `escalate` | `nodes/escalate.py` | Task 106 | stub: records why it was escalated, asks nobody |
@@ -56,7 +56,7 @@ its own keys:
 | consumer | `lookup_id`, `failure_id`, `failure`, `lineage_context`, `incident_context`, `priority`, `lookup_route`, `route_reason` |
 | `deterministic_lookup` | `route`, `action` (when a past fix is reused) |
 | `diagnose` | `diagnosis` = `{status, hypothesis, confidence, proposed_action, model, allowed_actions, evidence, reasons}` |
-| `policy_gate` | `policy` = `{passed, reasons, checks, threshold, safe_actions}`, and `action` when it passes |
+| `policy_gate` | `policy` = `{passed, outcome, reasons, checks, threshold, unverified_threshold, safe_actions}`, and `action` when it passes |
 | `remediate` | `execution` = `{status: SUCCESS or FAILED, execution_id, action, action_params, source, target_table, overlay, rows_expected, rows_affected, rows_with_other_failures, sample_record_ids, quarantine_version, executed_at, idempotent_replay, audit, reasons}` |
 | `validate` | `validation` = `{passed, reasons}` |
 | `escalate` | `escalation` = `{status, reason, details}`, `status` |
@@ -101,6 +101,21 @@ Runs only for failures the lookup could not match to a verified past fix.
 Diagnose never raises and never sets `action`. With no model running, every new
 failure is escalated with the reason `no usable diagnosis (UNAVAILABLE)`.
 
+Qwen3 thinks before it answers unless told not to, and the thinking counts against
+`DIAGNOSE_NUM_PREDICT`, so a long one cuts the JSON off (`INVALID_OUTPUT`: "reply was
+cut off"). The request therefore carries `think: false` (`DIAGNOSE_THINK`). A model
+without a thinking mode that refuses the field is asked once more without it.
+
+Check the model once before relying on it, and again after changing `DIAGNOSE_MODEL`:
+
+```bash
+docker compose exec recovery-agent python -m agent.check_model
+```
+
+It sends one fixed example (`Jule` in three records dated in June) through the real
+Diagnose and gate, prints the diagnosis, the gate's verdict and the time it took, and
+exits 0 when the model answered in the asked form. It needs only Ollama.
+
 Text in the data (a raw value, a past diagnosis) is passed as data only, cut to 300
 characters, and the system prompt tells the model not to follow it. That is a
 request, not a guarantee, which is one reason the gate below trusts nothing the
@@ -121,8 +136,11 @@ To make another action safe, change `actions.py` in a reviewed PR. The setting
 `POLICY_SAFE_ACTIONS` can only narrow the set (`NONE` sends every diagnosis to an
 engineer); it cannot add to it.
 
-A past fix reused by the Deterministic Lookup does not pass this gate: it goes
-straight to Remediate, because it was already validated or approved by an engineer.
+A past fix reused by the Deterministic Lookup does not pass the gate below: it was
+already validated or approved by an engineer. It is still checked against the failure
+with the gate's own `parameters` check (`actions.check_params`) before it becomes
+`action`, so a fix whose canonical value has since left `ref_canonical_mappings`, or
+that does not fit this failure, is sent to Diagnose instead of to Remediate.
 
 ## Policy gate (`nodes/policy_gate.py`, spec AP2, AP3, RS1)
 
@@ -134,16 +152,52 @@ Deterministic, no model. The proposal becomes `action` only when every check pas
 | `confidence` | the model's confidence is at least `POLICY_CONFIDENCE_THRESHOLD`, default 0.85 (spec condition 2) |
 | `trusted_failure` | the failure itself is not waiting for review (a Qwen classification with `needs_review`) |
 | `parameters` | the parameters fit the failure: the canonical value exists for that column (read again from `ref_canonical_mappings`, not taken from the diagnosis), a rename uses the failure's own column names |
+| `evidence` | `ADD_VARIANT` only: the quarantined records do not contradict the value, see below |
 | `not_tried_before` | the same fix has not already failed for this failure (`incident_context.previous_attempts`) |
 
-The last three only ever turn a pass into an escalation. `policy.checks` lists every
-check with its result, and `policy.reasons` the ones that failed, so an engineer
-sees why a proposal was stopped. On a pass, `action_params` is rebuilt from the
-checked values: nothing else the model wrote reaches Remediate.
+The last four only ever turn a pass into an escalation. On a pass, `action_params` is
+rebuilt from the checked values: nothing else the model wrote reaches Remediate.
 
-The gate cannot tell whether a confident, safe proposal is *correct*: a model that
-says `Jule` is July at 0.95 passes. Catching that is Validate's job (Task 105), and
-the threshold should be calibrated on labelled cases in the evaluation (Task 111).
+### Evidence: is the value right, not only valid? (`evidence.py`)
+
+A confident model can be wrong, and `parameters` only proves that the value exists.
+For two columns the record itself carries the answer, so the gate reads the failure's
+sample records from quarantine again (all of `sample_record_ids`, not the three shown
+to the model) and compares:
+
+| Column | Must agree with |
+|---|---|
+| `crash_month` | the month of `crash_date` |
+| `crash_day_of_week` | the weekday of `crash_date` |
+
+| What the records say | Result |
+|---|---|
+| at least one decides the value, all for the proposal | passes at the normal threshold |
+| at least one rules the proposal out (`Jule` proposed as JULY, `crash_date` in June) | rejected, whatever the confidence |
+| nothing decides: another column (weather, lighting, ...), or no readable date | passes only at `POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD` (0.95), where the model's confidence is all there is. `NEVER` sends all of these to an engineer. |
+
+A date like `04/07/2019` is read both ways (7 April or 4 July) because the order
+depends on the source folder. It confirms a month only when both readings agree or
+only one is a real date (`22/06/2024`), but it still rules out every other month.
+
+This narrows the gap, it does not close it. The gate sees a handful of sample
+records, so agreement across every record of the failure stays Validate's check
+(Task 105), and both thresholds are uncalibrated until the evaluation (Task 111).
+
+### What the gate writes
+
+`policy.outcome` says what happened, `policy.checks` lists every check with its
+result and `policy.reasons` the ones that failed:
+
+| `outcome` | Meaning |
+|---|---|
+| `PASSED` | every check passed; the proposal is now `action` |
+| `REJECTED` | a fix was proposed and a check stopped it |
+| `ENGINEER_REQUESTED` | Diagnose itself proposed `ESCALATE` (the evidence did not single out a fix, or a mandatory field is empty); no fix was blocked |
+| `NO_DIAGNOSIS` | there was nothing to judge: model unreachable or its reply unusable |
+
+The escalation still reads `POLICY_GATE_REJECTED` for the last three; wording it per
+outcome belongs to Escalate (Task 106), which can read `policy.outcome`.
 
 ## Remediate (`nodes/remediate.py`, spec RD1, RD2, RD3, TA2)
 
@@ -173,8 +227,9 @@ record that cannot be written.
 
 It **stages** the fix, it does not release it:
 
-- The parameters are checked again against `ref_canonical_mappings` (a reused past
-  fix never went through the policy gate).
+- The parameters are checked again against `ref_canonical_mappings`: the table may
+  have changed since the policy gate or `deterministic_lookup` checked them, and a
+  workflow can resume here much later.
 - The failure's group is collected from `silver2_quarantine`: every record still
   waiting (`PENDING` or `IN_PROGRESS`) with the same folder, column and raw value
   (trimmed, upper-cased), from the micro-batches the failure was found in. These are
@@ -297,12 +352,17 @@ Settings (`config.py`): `LOOKUP_OUTPUT_TOPIC`, `AGENT_CONSUMER_GROUP`,
 | `DIAGNOSE_BASE_URL` | `http://host.docker.internal:11434` | Ollama |
 | `DIAGNOSE_TIMEOUT_SECONDS` | `120` | one model call |
 | `DIAGNOSE_SAMPLE_RECORDS` | `3` | quarantined records shown to the model, 0 for none |
-| `POLICY_CONFIDENCE_THRESHOLD` | `0.85` | minimum confidence to run without an engineer |
-| `POLICY_SAFE_ACTIONS` | empty | empty = the safe set of `actions.py`; `NONE` = review everything |
+| `DIAGNOSE_THINK` | `false` | `false` = answer directly, `true` = think first (raise `DIAGNOSE_NUM_PREDICT`), `default` = leave it to the model |
+| `POLICY_CONFIDENCE_THRESHOLD` | `0.85` | minimum confidence to run without an engineer, 0.5 to 1 |
+| `POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD` | `0.95` | minimum confidence when no record can confirm the value; 0.5 to 1 and never below the threshold above, or `NEVER` |
+| `POLICY_SAFE_ACTIONS` | empty | empty = the safe set of `actions.py`; `NONE` anywhere in the list = review everything |
 
-Compose passes `DIAGNOSE_MODEL`, `DIAGNOSE_BASE_URL` and the two `POLICY_` settings
-from `.env` (see `.env.example`). The model's context and reply size are
-`DIAGNOSE_NUM_CTX` (8192) and `DIAGNOSE_NUM_PREDICT` (1024).
+A threshold outside its range (0, 85, a typo) is refused: the agent stops at start
+with the reason in its log instead of running with a gate that passes everything.
+
+Compose passes `DIAGNOSE_MODEL`, `DIAGNOSE_BASE_URL`, `DIAGNOSE_THINK` and the three
+`POLICY_` settings from `.env` (see `.env.example`). The model's context and reply
+size are `DIAGNOSE_NUM_CTX` (8192) and `DIAGNOSE_NUM_PREDICT` (1024).
 
 `REMEDIATION_AUDIT_PATH` (`/data/delta/remediation_audit`) is the audit table;
 Compose mounts `./delta/remediation_audit` writable inside the read-only `./delta`.

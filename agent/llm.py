@@ -23,6 +23,24 @@ class LLMError(Exception):
         self.status, self.detail = status, detail
 
 
+def _post(payload: dict) -> bytes:
+    request = Request(config.DIAGNOSE_BASE_URL.rstrip("/") + "/api/chat",
+                      data=json.dumps(payload).encode(),
+                      headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(request, timeout=config.DIAGNOSE_TIMEOUT_SECONDS) as response:
+        return response.read(1024 * 1024)
+
+
+def _error_text(exc: HTTPError) -> str:
+    """Ollama's own error message; read once, because the body is a stream."""
+    if not hasattr(exc, "ollama_error"):
+        try:
+            exc.ollama_error = json.loads(exc.read(4096)).get("error") or ""
+        except (ValueError, AttributeError, OSError):
+            exc.ollama_error = ""
+    return exc.ollama_error
+
+
 def chat_json(system: str, user: str, schema: dict) -> dict:
     """One chat turn; returns the model's reply parsed as a JSON object."""
     payload = {
@@ -31,15 +49,21 @@ def chat_json(system: str, user: str, schema: dict) -> dict:
                     "num_predict": config.DIAGNOSE_NUM_PREDICT},
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
     }
-    request = Request(config.DIAGNOSE_BASE_URL.rstrip("/") + "/api/chat",
-                      data=json.dumps(payload).encode(),
-                      headers={"Content-Type": "application/json"}, method="POST")
+    if config.DIAGNOSE_THINK is not None:
+        payload["think"] = config.DIAGNOSE_THINK
     try:
-        with urlopen(request, timeout=config.DIAGNOSE_TIMEOUT_SECONDS) as response:
-            raw = response.read(1024 * 1024)
+        try:
+            raw = _post(payload)
+        except HTTPError as exc:
+            # A model without a thinking mode can refuse the `think` field itself.
+            if exc.code != 400 or "think" not in payload or "thinking" not in _error_text(exc):
+                raise
+            del payload["think"]
+            raw = _post(payload)
     except HTTPError as exc:  # e.g. 404: the model was never pulled
-        raise LLMError(UNAVAILABLE, f"HTTP {exc.code} from {config.DIAGNOSE_BASE_URL} "
-                                    f"for model {config.DIAGNOSE_MODEL}") from exc
+        detail = _error_text(exc)
+        raise LLMError(UNAVAILABLE, f"HTTP {exc.code} from {config.DIAGNOSE_BASE_URL} for model "
+                                    f"{config.DIAGNOSE_MODEL}" + (f": {detail}" if detail else "")) from exc
     except OSError as exc:    # refused, DNS, timeout
         raise LLMError(UNAVAILABLE, f"{config.DIAGNOSE_BASE_URL} not reachable ({exc})") from exc
 
@@ -48,7 +72,7 @@ def chat_json(system: str, user: str, schema: dict) -> dict:
         if not isinstance(body, dict) or body.get("done") is not True:
             raise ValueError("incomplete response")
         if body.get("done_reason") == "length":
-            raise ValueError("reply was cut off (raise DIAGNOSE_NUM_PREDICT)")
+            raise ValueError("reply was cut off (raise DIAGNOSE_NUM_PREDICT, or set DIAGNOSE_THINK=false)")
         reply = json.loads(_THINKING.sub("", body["message"]["content"]).strip())
         if not isinstance(reply, dict):
             raise ValueError("reply is not a JSON object")

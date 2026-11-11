@@ -37,8 +37,9 @@ class RemediationError(Exception):
 
 def add_variant(failure: dict, params) -> dict:
     column = failure.get("column_name")
-    # Checked again at the moment of execution: a reused past fix never went through
-    # the policy gate, and the reference table may have changed since a diagnosis did.
+    # Checked again at the moment of execution: the reference table may have changed
+    # since the policy gate (or, for a reused past fix, deterministic_lookup) checked
+    # them, and a workflow can resume here long after.
     try:
         canonical = reference.read_canonical_values(column)
     except Exception as exc:

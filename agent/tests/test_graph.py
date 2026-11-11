@@ -72,6 +72,36 @@ def test_remediate_verdict_without_a_past_fix_is_diagnosed():
     assert path(state)[:2] == ["deterministic_lookup", "diagnose"]
 
 
+@pytest.mark.parametrize("past, problem", [
+    ({"action": "ADD_VARIANT", "action_params": {"canonical_value": "SMARCH"}}, "'SMARCH' is not a canonical value"),
+    ({"action": "ADD_VARIANT", "action_params": None}, "None is not a canonical value"),
+    ({"action": "RENAME_COLUMN", "action_params": {"renames": {"Month": "crash_month"}}}, "needs a schema failure"),
+    ({"action": "DROP_TABLE", "action_params": {}}, "not a pre-approved action"),
+    ({"action": "ESCALATE", "action_params": {}}, "ESCALATE is not a fix"),
+])
+def test_a_past_fix_that_no_longer_fits_the_failure_is_diagnosed(past, problem):
+    """The gate checks a fresh proposal against the failure; a reused one gets the same check."""
+    state = run(stack_item(route="remediate", match={**PAST_FIX, **past}))
+    assert state["route"] == "diagnose" and path(state)[:2] == ["deterministic_lookup", "diagnose"]
+    note = state["trace"][0]["note"]
+    assert note.startswith(f"past fix {past['action']} no longer fits") and problem in note
+    assert state["action"] is None
+
+
+def test_a_past_fix_is_not_reused_when_the_canonical_values_cannot_be_read(monkeypatch):
+    from agent import reference
+    monkeypatch.setattr(reference, "canonical_values", lambda column, path=None: [])
+    state = run(stack_item(route="remediate", match=PAST_FIX))
+    assert state["route"] == "diagnose" and "no canonical values are known" in state["trace"][0]["note"]
+
+
+def test_only_the_checked_parameters_of_a_past_fix_are_reused():
+    match = {**PAST_FIX, "action_params": {"canonical_value": "JULY", "table": "gold"}}
+    state = run(stack_item(route="remediate", match=match), remediate=remediate_ok, validate=validate_ok)
+    assert state["action"] == {"action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"},
+                               "source": "INCIDENT", "incident_id": "i1"}
+
+
 # --- with fake nodes: the routes the later tasks will use -------------------------
 def test_reused_fix_that_validates_is_learned_without_escalation():
     state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok, validate=validate_ok)

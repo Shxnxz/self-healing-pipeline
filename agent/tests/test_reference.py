@@ -48,6 +48,31 @@ def test_canonical_values_use_the_configured_table(tmp_path, monkeypatch):
     assert reference.canonical_values("crash_month") == ["JULY", "JUNE"]
 
 
+def test_the_table_is_scanned_again_only_when_it_changed(tmp_path, monkeypatch):
+    path = write_ref(tmp_path / "ref")
+    scans = []
+    scan = reference._scan
+    monkeypatch.setattr(reference, "_scan", lambda *args, **kwargs: scans.append(1) or scan(*args, **kwargs))
+    monkeypatch.setattr(reference, "_canonical_cache", {})
+
+    assert reference.canonical_values("crash_month", path) == ["JULY", "JUNE"]
+    assert reference.canonical_values("weather_condition", path) == ["RAIN"]
+    assert reference.canonical_values("crash_month", path) == ["JULY", "JUNE"]
+    assert len(scans) == 1                                    # one scan served all three
+
+    # Learn promotes a mapping: a new commit, so the next question sees it
+    write_deltalake(path, pa.table({"field_name": ["crash_month"], "raw_synonym": ["MAI"],
+                                    "canonical_value": ["MAY"]}), mode="append")
+    assert reference.canonical_values("crash_month", path) == ["JULY", "JUNE", "MAY"]
+    assert len(scans) == 2
+
+
+def test_a_caller_cannot_change_the_cached_values(tmp_path):
+    path = write_ref(tmp_path / "ref")
+    reference.canonical_values("crash_month", path).append("SMARCH")
+    assert reference.canonical_values("crash_month", path) == ["JULY", "JUNE"]
+
+
 def test_a_missing_table_gives_no_values_instead_of_an_error(tmp_path, capsys):
     assert reference.canonical_values("crash_month", str(tmp_path / "nothing")) == []
     assert reference.sample_records({"sample_record_ids": ["r1"], "column_name": "crash_month"},

@@ -72,7 +72,8 @@ def gate_passes_without_action(state):
 # --- Task 103: what the Delta readers and the reasoning model return ---------------
 MONTHS = ["APRIL", "AUGUST", "DECEMBER", "FEBRUARY", "JANUARY", "JULY", "JUNE", "MARCH", "MAY",
           "NOVEMBER", "OCTOBER", "SEPTEMBER"]
-CANONICAL = {"crash_month": MONTHS, "weather_condition": ["CLEAR", "CLOUDY", "FOG", "RAIN", "SNOW", "UNKNOWN"]}
+CANONICAL = {"crash_month": MONTHS, "weather_condition": ["CLEAR", "CLOUDY", "FOG", "RAIN", "SNOW", "UNKNOWN"],
+             "crash_day_of_week": ["FRIDAY", "MONDAY", "SATURDAY", "SUNDAY", "THURSDAY", "TUESDAY", "WEDNESDAY"]}
 
 
 def canonical_values(column, path=None):
