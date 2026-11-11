@@ -1,7 +1,7 @@
 """Hand-made recovery.lookup stack items and fake nodes for the agent tests."""
 
 
-def stack_item(failure_id="f1", route="diagnose", match=None, rank=1, value="Jule"):
+def stack_item(failure_id="f1", route="diagnose", match=None, rank=1, value="Jule", rows=10):
     """One item of a recovery.lookup stack, shaped like lookup/stack.py builds it."""
     return {
         "rank": rank,
@@ -11,7 +11,7 @@ def stack_item(failure_id="f1", route="diagnose", match=None, rank=1, value="Jul
         "failure": {
             "failure_id": failure_id, "source": "QUARANTINE", "failure_type": "UNRESOLVED_VALUE",
             "family": "VALUE", "folder": "Crash1", "column_name": "crash_month",
-            "raw_value": value, "signature_value": value, "rows_affected": 10, "trusted": True,
+            "raw_value": value, "signature_value": value, "rows_affected": rows, "trusted": True,
             "batch_id": "7", "evidence": {"quarantine_batches": ["7"]},
         },
         "lineage_context": {"origin_table": "silver1_crash1", "detected_table": "silver2_crash1",

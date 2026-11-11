@@ -151,20 +151,23 @@ Runs for an `action` that came from the policy gate or from a reused past fix, i
 the fixed order of the spec:
 
 1. **Idempotency check.** `execution_id` is a hash of the failure, the action and
-   its parameters. If the audit table already holds that id, this exact fix was
-   executed before: the recorded result is returned (`idempotent_replay: true`) and
-   nothing runs again. This is what protects a workflow that resumes at Remediate
-   because the agent stopped after executing but before LangGraph saved the node.
-   A failed execution is not retried either: the first outcome stands and goes to
-   an engineer. If the audit table cannot be read, nothing is executed.
+   its parameters. If the audit table already holds a `SUCCESS` for that id, this
+   exact fix was executed before: the recorded result is returned
+   (`idempotent_replay: true`) and nothing runs again. This is what protects a
+   workflow that resumes at Remediate because the agent stopped after executing but
+   before LangGraph saved the node. A `FAILED` attempt staged nothing, so it does
+   not block the fix: if the same fix comes back (a resumed workflow, or a later
+   retry once the cause is gone) it runs again. If the audit table cannot be read,
+   nothing is executed.
 2. **Execute.** The executor of the action (`executors.py`), see below.
-3. **Audit record.** One row in the audit table, for failed executions too.
+3. **Audit record.** One row in the audit table for every attempt, failed ones too.
    `SUCCESS` is claimed only after that row is committed.
 
 Remediate never raises. Everything that is not `SUCCESS` goes to Escalate with
 `execution.reasons`: an action with no executor, parameters that no longer fit, a
-quarantine that cannot be read, no record left to fix, an audit record that cannot
-be written.
+reference table or quarantine that cannot be read (reported as that, not as a wrong
+value), no record left to fix, records of the group that cannot be found, an audit
+record that cannot be written.
 
 ### What executing `ADD_VARIANT` means (`executors.py`)
 
@@ -175,7 +178,13 @@ It **stages** the fix, it does not release it:
 - The failure's group is collected from `silver2_quarantine`: every record still
   waiting (`PENDING` or `IN_PROGRESS`) with the same folder, column and raw value
   (trimmed, upper-cased), from the micro-batches the failure was found in. These are
-  exactly the rows the scanner grouped into the failure.
+  exactly the rows the scanner grouped into the failure. The batches are the union
+  of `batch_id` and `evidence.quarantine_batches`, because a failure the lookup
+  merged from two publishes can carry the full list in only one of them.
+- The group is staged whole or not at all. Rows already `RESOLVED` are accounted
+  for, but if fewer rows are found than the failure reported, the execution fails:
+  a fix applied to part of a group would leave the rest in quarantine with nobody
+  looking for it.
 - The overlay `{"crash_month": {"JULE": "JULY"}}` is built. It is the shape
   `ref_mappings.overlay_mappings()` takes, so Validate can apply it on top of the
   reference table when it re-runs `standardize_silver2` on the staged records.
@@ -191,8 +200,9 @@ to an engineer. A test checks that every safe action has an executor.
 
 ### The audit table (`audit.py`, `delta/remediation_audit`)
 
-A Delta table written without Spark, one row and one commit per execution. Only the
-agent writes it; Spark and `verify_delta.py remediation_audit` can read it.
+A Delta table written without Spark, one row and one commit per execution attempt.
+An `execution_id` can have several `FAILED` rows and one `SUCCESS`. Only the agent
+writes it; Spark and `verify_delta.py remediation_audit` can read it.
 
 | Column | Meaning |
 |---|---|
@@ -214,7 +224,7 @@ staged group and its audit record cannot exist without each other.
 
 ```bash
 docker compose exec recovery-agent python -m agent.audit                  # latest 20 executions
-docker compose exec recovery-agent python -m agent.audit <execution_id>   # one, with its record ids
+docker compose exec recovery-agent python -m agent.audit <execution_id>   # its attempts, with record ids
 docker compose exec recovery-agent python -m agent.audit <failure_id>
 ```
 
@@ -222,7 +232,7 @@ docker compose exec recovery-agent python -m agent.audit <failure_id>
 
 - **Validate (105)** reads `execution.overlay` and the staged records:
   `audit.find(execution["execution_id"])["record_ids"]` with `target_table` (the
-  state keeps only five sample ids). Joining them to the quarantine on
+  state keeps only five sample ids; `find` returns the successful execution). Joining them to the quarantine on
   `record_id` + `target_table` and replaying `raw_record` through
   `standardize_silver2` with the overlay was tried on real tables: the targeted
   column resolves, and rows counted in `rows_with_other_failures` keep their other
@@ -232,9 +242,14 @@ docker compose exec recovery-agent python -m agent.audit <failure_id>
 - **Pipeline cleanups (109)**: Remediate does not change `healing_status`. It accepts
   rows the trigger has marked `IN_PROGRESS` and never stages a `RESOLVED` row.
 
-One agent consumes `recovery.lookup` today. Two agents working on the same failure
-at the same moment could both pass the idempotency check; if the agent is ever
-scaled out, the check needs a lock.
+One agent consumes `recovery.lookup`: the service has a fixed `container_name`, so
+Compose refuses to scale it. Two agent processes working on the same failure at the
+same moment (a `docker compose run` next to the service) could both pass the
+idempotency check and both write a `SUCCESS` row. Nothing else is written, and
+every reader takes the first row, so they agree on one result; if the agent is ever
+scaled out on purpose, the check needs a lock. The table gets one small file per
+attempt, which is fine for the number of failure groups here and would need
+compaction at a much larger scale.
 
 ## How state is kept (`consumer.py`)
 
@@ -295,7 +310,13 @@ Compose mounts `./delta/remediation_audit` writable inside the read-only `./delt
 To start from empty state, remove the volume:
 `docker compose rm -sf recovery-agent && docker volume rm self-healing-pipeline_agent-state`.
 The audit table is kept, so a failure that comes back is still not executed twice.
-Deleting `delta/` removes it together with the pipeline's tables.
+
+The agent's memory is in two places: the workflows in the `agent-state` volume and
+the executions in `delta/remediation_audit`. When you reset the pipeline by deleting
+`delta/` and `checkpoints/`, the audit table goes with it, so remove the
+`agent-state` volume in the same step (command above). Otherwise the reprocessed
+data produces the same failure ids and the agent skips them as workflows it has
+already finished.
 
 ## Tests
 

@@ -1,4 +1,4 @@
-"""Remediation audit table (spec RD1, RD2, TA2): one row per execution.
+"""Remediation audit table (spec RD1, RD2, TA2): one row per execution attempt.
 
 A Delta table written with `deltalake` (no Spark), next to the pipeline's own tables
 so Spark jobs and verify_delta.py can read it. Only the agent writes it.
@@ -6,10 +6,13 @@ so Spark jobs and verify_delta.py can read it. Only the agent writes it.
 It does two jobs with one row:
 
   audit record        action, parameters, affected records and the execution
-                      timestamp, for a failed execution as much as for a successful one
-  idempotency check   `execution_id` is a hash of (failure, action, parameters). A row
-                      with that id means this exact fix was already executed for this
-                      failure, whatever happened to the agent afterwards
+                      timestamp, for a failed attempt as much as for a successful one
+  idempotency check   `execution_id` is a hash of (failure, action, parameters). A
+                      SUCCESS row with that id means this exact fix was already
+                      executed for this failure, whatever happened to the agent
+                      afterwards. A FAILED row staged nothing, so it does not block
+                      another attempt: an id can have several FAILED rows and at most
+                      one SUCCESS that counts.
 
 The row is written in one Delta commit and is the only thing Remediate writes, so an
 execution is either recorded completely or did not happen. There is no state in
@@ -18,7 +21,7 @@ which records were staged but the audit record is missing.
 Print it:
 
   docker compose exec recovery-agent python -m agent.audit                  # latest executions
-  docker compose exec recovery-agent python -m agent.audit <execution_id>   # one, with its record ids
+  docker compose exec recovery-agent python -m agent.audit <execution_id>   # its attempts, with record ids
   docker compose exec recovery-agent python -m agent.audit <failure_id>
 """
 import hashlib
@@ -29,8 +32,10 @@ from typing import List, Optional
 
 from agent import config
 
-# Columns of the table. Maps are stored as JSON text so the schema stays the same
-# whatever an action's parameters look like.
+SUCCESS = "SUCCESS"  # status of an execution that staged its fix (agent/state.py)
+
+# Maps are stored as JSON text so the schema stays the same whatever an action's
+# parameters look like.
 JSON_COLUMNS = ("action_params", "overlay")
 
 
@@ -95,13 +100,21 @@ def _decode(row: dict) -> dict:
     return row
 
 
-def find(execution: str, path: Optional[str] = None) -> Optional[dict]:
-    """The audit record of an execution, or None when it never ran."""
+def attempts(execution: str, path: Optional[str] = None) -> List[dict]:
+    """Every recorded attempt of an execution, oldest first."""
     rows = _rows(path or config.REMEDIATION_AUDIT_PATH, "execution_id", execution)
-    if not rows:
-        return None
-    # One row per id is the rule; if it is ever broken, the first execution counts.
-    return _decode(min(rows, key=lambda row: row["executed_at"]))
+    return [_decode(row) for row in sorted(rows, key=lambda row: row["executed_at"])]
+
+
+def find(execution: str, path: Optional[str] = None) -> Optional[dict]:
+    """The record of the successful execution, or None when the fix was never applied.
+
+    Failed attempts are not returned: they staged nothing, so they are no reason to
+    skip the fix. One SUCCESS per id is the rule; if it is ever broken (two agents at
+    the same moment), the first one counts, for every reader.
+    """
+    done = [row for row in attempts(execution, path) if row["status"] == SUCCESS]
+    return done[0] if done else None
 
 
 def write(record: dict, path: Optional[str] = None) -> None:
@@ -142,8 +155,7 @@ def main() -> None:
     if len(sys.argv) > 2:
         sys.exit("usage: python -m agent.audit [execution_id | failure_id]")
     if len(sys.argv) == 2:
-        one = find(sys.argv[1])
-        found = [one] if one else for_failure(sys.argv[1])
+        found = attempts(sys.argv[1]) or for_failure(sys.argv[1])
         if not found:
             sys.exit(f"No execution recorded for {sys.argv[1]}")
     else:

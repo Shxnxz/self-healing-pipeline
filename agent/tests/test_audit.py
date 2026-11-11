@@ -95,7 +95,18 @@ def test_latest_is_newest_first_and_leaves_the_record_ids_out(tmp_path):
     assert audit.for_failure("other", path) == []
 
 
-def test_if_an_id_is_ever_written_twice_the_first_execution_counts(tmp_path):
+def test_only_a_successful_execution_is_found_and_failed_attempts_stay_in_the_trail(tmp_path):
+    path = str(tmp_path / "audit")
+    audit.write(record("e1", status="FAILED", reasons=["table unreadable"], rows_affected=0, record_ids=[]), path)
+    assert audit.find("e1", path) is None                       # a failed attempt staged nothing
+    audit.write(record("e1", at=NOW + timedelta(minutes=1)), path)
+    audit.write(record("e1", status="FAILED", reasons=["later"], at=NOW + timedelta(minutes=2)), path)
+    assert audit.find("e1", path)["executed_at"] == NOW + timedelta(minutes=1)
+    assert [row["status"] for row in audit.attempts("e1", path)] == ["FAILED", "SUCCESS", "FAILED"]
+    assert audit.attempts("other", path) == []
+
+
+def test_if_a_success_is_ever_written_twice_the_first_execution_counts(tmp_path):
     path = str(tmp_path / "audit")
     audit.write(record("e1", rows_affected=2), path)
     audit.write(record("e1", rows_affected=9, at=NOW + timedelta(minutes=5)), path)

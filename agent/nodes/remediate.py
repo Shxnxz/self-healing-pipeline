@@ -11,15 +11,17 @@ Writes  execution = {"status": "SUCCESS" | "FAILED", "execution_id", "action",
 The fixed sequence of the spec:
 
   1. Idempotency check   `execution_id` = hash of (failure, action, parameters). If
-                         the audit table already holds it, the fix was executed before
-                         (the agent stopped before LangGraph saved this node, and the
-                         workflow resumed here). The recorded result is returned and
-                         nothing is executed again.
+                         the audit table already holds a SUCCESS for it, the fix was
+                         executed before (the agent stopped before LangGraph saved
+                         this node, and the workflow resumed here). The recorded
+                         result is returned and nothing is executed again. A FAILED
+                         attempt staged nothing, so it does not count as executed:
+                         the fix runs again, and the new attempt is audited too.
   2. Execute             the action's executor (agent/executors.py). For ADD_VARIANT:
                          stage the failure's quarantined records with the overlay.
   3. Audit record        one row in the audit table (agent/audit.py): action,
-                         parameters, affected records, timestamp. Written for failed
-                         executions too.
+                         parameters, affected records, timestamp. Written for every
+                         attempt, failed ones too.
 
 SUCCESS is claimed only after the audit record is committed: an execution that
 cannot be recorded did not happen. The audit row is also the only thing written, in

@@ -9,6 +9,7 @@ def temp_tables(monkeypatch, tmp_path):
     """Remediate writes its audit table: keep it, and the quarantine it reads, in the test's own folder."""
     monkeypatch.setattr(config, "REMEDIATION_AUDIT_PATH", str(tmp_path / "remediation_audit"))
     monkeypatch.setattr(config, "QUARANTINE_PATH", str(tmp_path / "silver2_quarantine"))
+    monkeypatch.setattr(config, "REF_MAPPINGS_PATH", str(tmp_path / "ref_canonical_mappings"))
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +22,7 @@ def offline(monkeypatch, request):
 
     monkeypatch.setattr(llm, "chat_json", no_model)
     monkeypatch.setattr(reference, "canonical_values", lambda column, path=None: [])
+    monkeypatch.setattr(reference, "read_canonical_values", lambda column, path=None: [])
     monkeypatch.setattr(reference, "sample_records", lambda failure, limit=None, path=None: [])
 
 

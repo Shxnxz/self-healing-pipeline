@@ -7,7 +7,8 @@ check before it and writes the audit record after it. An executor writes nothing
 ADD_VARIANT stages the fix, it does not release it:
 
   - it collects the failure's group: every quarantined record still waiting with the
-    same folder, column and raw value, from the micro-batches the failure came from
+    same folder, column and raw value, from the micro-batches the failure came from.
+    If records the failure reported cannot be found, nothing is staged
   - it builds the overlay {column: {RAW VALUE: canonical value}}, the mapping that
     Validate applies on top of ref_canonical_mappings when it re-runs the
     standardization on exactly these records (ref_mappings.overlay_mappings takes
@@ -38,7 +39,10 @@ def add_variant(failure: dict, params) -> dict:
     column = failure.get("column_name")
     # Checked again at the moment of execution: a reused past fix never went through
     # the policy gate, and the reference table may have changed since a diagnosis did.
-    canonical = reference.canonical_values(column)
+    try:
+        canonical = reference.read_canonical_values(column)
+    except Exception as exc:
+        raise RemediationError([f"the reference table could not be read: {exc}"]) from exc
     clean, problems = actions.check_params(actions.ADD_VARIANT, params, failure, canonical)
     if problems:
         raise RemediationError(problems)
@@ -52,6 +56,14 @@ def add_variant(failure: dict, params) -> dict:
     if not rows:
         raise RemediationError(["no quarantined record of this failure is waiting for a fix "
                                 "(already resolved, or the failure does not match the quarantine)"])
+    # The group is staged whole or not at all. Rows that were fixed in the meantime
+    # are accounted for; rows that cannot be found are not, and a fix applied to part
+    # of a group would leave the rest in quarantine with nobody looking for it.
+    expected = failure.get("rows_affected")
+    found = len(rows) + group.get("not_waiting", 0)
+    if isinstance(expected, int) and found < expected:
+        raise RemediationError([f"only {found} of the {expected} records the failure reported were found "
+                                f"in the quarantine, so the group is not staged in part"])
     tables = sorted({row["target_table"] for row in rows if row.get("target_table")})
     if len(tables) > 1:
         raise RemediationError([f"the records of one failure belong to several tables: {', '.join(tables)}"])

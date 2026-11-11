@@ -10,11 +10,12 @@ Both answer "nothing" when a table is missing or unreadable. Without canonical
 values the policy gate cannot approve ADD_VARIANT, so an unreadable table sends the
 failure to an engineer instead of stopping the agent.
 
-  failure_records(failure)   every quarantined record that belongs to the failure and
-                             is still waiting: the group Remediate stages. Unlike the
-                             two above it raises when the table cannot be read, because
-                             "no records" and "could not look" must not be confused
-                             when something is about to be executed.
+Remediate uses two readers that raise instead, because "nothing there" and "could
+not look" must not be confused when something is about to be executed:
+
+  read_canonical_values(column)   canonical_values() without the safety net
+  failure_records(failure)        every quarantined record that belongs to the failure
+                                  and is still waiting: the group Remediate stages
 """
 from typing import List, Optional
 
@@ -46,16 +47,22 @@ def _read(path: str, columns: List[str], column: str, values: list) -> List[dict
     ).to_pylist()
 
 
-def canonical_values(column: Optional[str], path: Optional[str] = None) -> List[str]:
-    """Canonical values of a closed-vocabulary column, sorted. [] when it has none."""
+def read_canonical_values(column: Optional[str], path: Optional[str] = None) -> List[str]:
+    """Canonical values of a closed-vocabulary column, sorted. [] when it has none.
+    Raises when the reference table cannot be read."""
     if not column:
         return []
+    rows = _read(path or config.REF_MAPPINGS_PATH, ["canonical_value"], "field_name", [column])
+    return sorted({row["canonical_value"] for row in rows if row.get("canonical_value")})
+
+
+def canonical_values(column: Optional[str], path: Optional[str] = None) -> List[str]:
+    """read_canonical_values() that answers [] instead of raising (Diagnose, policy gate)."""
     try:
-        rows = _read(path or config.REF_MAPPINGS_PATH, ["canonical_value"], "field_name", [column])
+        return read_canonical_values(column, path)
     except Exception as exc:  # table not created yet, volume not mounted, ...
         print(f"[agent] canonical values of {column} not readable: {exc}", flush=True)
         return []
-    return sorted({row["canonical_value"] for row in rows if row.get("canonical_value")})
 
 
 def sample_records(failure: dict, limit: Optional[int] = None, path: Optional[str] = None) -> List[dict]:
@@ -106,11 +113,16 @@ def _key(value) -> str:
 
 
 def failure_batches(failure: dict) -> List[str]:
-    """The Silver 2 micro-batches the failure was found in (lookup/failures.py)."""
-    batches = (failure.get("evidence") or {}).get("quarantine_batches")
-    if not batches and failure.get("batch_id"):
-        batches = str(failure["batch_id"]).split(",")
-    return sorted({str(b).strip() for b in batches or [] if str(b).strip()})
+    """The Silver 2 micro-batches the failure was found in (lookup/failures.py).
+
+    The union of `batch_id` and `evidence.quarantine_batches`: when the lookup merges
+    two publishes of the same group (lookup/stack.py merge_failures) it joins the
+    batch ids but keeps the evidence of the first one, so neither alone is complete.
+    """
+    listed = list((failure.get("evidence") or {}).get("quarantine_batches") or [])
+    if failure.get("batch_id"):
+        listed += str(failure["batch_id"]).split(",")
+    return sorted({str(b).strip() for b in listed if str(b).strip()})
 
 
 def failure_records(failure: dict, path: Optional[str] = None) -> dict:
@@ -118,8 +130,8 @@ def failure_records(failure: dict, path: Optional[str] = None) -> dict:
     (trimmed, upper-cased) and micro-batches as the group the scanner published.
 
     Returns {"version": Delta version read, "rows": [{"record_id", "target_table",
-    "other_failures": the row also fails another column}]}. Raises if the table
-    cannot be read.
+    "other_failures": the row also fails another column}], "not_waiting": rows of the
+    group that are no longer waiting (RESOLVED)}. Raises if the table cannot be read.
     """
     import pyarrow.dataset as ds
     from deltalake import DeltaTable
@@ -137,14 +149,16 @@ def failure_records(failure: dict, path: Optional[str] = None) -> dict:
         use_threads=False,
     ).to_pylist()
 
-    rows = []
+    rows, not_waiting = [], 0
     for row in scanned:
         failing = row.get("columns_to_remediate") or {}
         failing = failing if isinstance(failing, dict) else dict(failing)
-        if (row.get("healing_status") or "PENDING") not in WAITING or _key(_folder_of(row)) != folder:
+        if _key(_folder_of(row)) != folder or not column or column not in failing \
+                or _key(failing[column]) != value:
             continue
-        if not column or column not in failing or _key(failing[column]) != value:
+        if (row.get("healing_status") or "PENDING") not in WAITING:
+            not_waiting += 1
             continue
         rows.append({"record_id": row.get("record_id"), "target_table": row.get("target_table"),
                      "other_failures": len(failing) > 1})
-    return {"version": table.version(), "rows": rows}
+    return {"version": table.version(), "rows": rows, "not_waiting": not_waiting}

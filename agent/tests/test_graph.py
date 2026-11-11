@@ -57,7 +57,7 @@ def test_remediate_that_cannot_execute_never_claims_a_fix():
 
 
 def test_executed_fix_goes_to_validate_which_is_still_a_stub(tmp_path, monkeypatch):
-    monkeypatch.setattr(reference, "canonical_values", canonical_values)
+    monkeypatch.setattr(reference, "read_canonical_values", canonical_values)
     jule_quarantine(tmp_path / "silver2_quarantine")
     state = run(stack_item(route="remediate", match=PAST_FIX))
     assert path(state) == ["deterministic_lookup", "remediate", "validate", "escalate", "learn"]

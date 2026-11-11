@@ -20,7 +20,7 @@ JULY = {"action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"}, "
 
 @pytest.fixture(autouse=True)
 def vocabulary(monkeypatch):
-    monkeypatch.setattr(reference, "canonical_values", canonical_values)
+    monkeypatch.setattr(reference, "read_canonical_values", canonical_values)
 
 
 def state_for(item=None, action=JULY, confidence=0.93):
@@ -67,10 +67,11 @@ def test_only_the_waiting_records_of_this_failure_are_staged():
         quarantine_row("other_folder", {"crash_month": "Jule"}, table="silver2_crash3"),
         quarantine_row("other_batch", {"crash_month": "Jule"}, batch="8"),          # belongs to a later failure
     ])
-    execution = remediate(state_for())["execution"]
-    assert execution["status"] == "SUCCESS"
+    # the failure reported 5 rows: 4 are still waiting, 1 was fixed in the meantime
+    execution = remediate(state_for(stack_item(rows=5)))["execution"]
+    assert execution["status"] == "SUCCESS", execution["reasons"]
     assert audit.find(execution["execution_id"])["record_ids"] == ["claimed", "mine1", "mine2", "mine3"]
-    assert execution["rows_affected"] == 4 and execution["rows_expected"] == 10
+    assert execution["rows_affected"] == 4 and execution["rows_expected"] == 5
     assert execution["rows_with_other_failures"] == 1
 
 
@@ -78,15 +79,56 @@ def test_a_failure_without_batch_information_covers_the_whole_group():
     write_quarantine(config.QUARANTINE_PATH, [quarantine_row("a", {"crash_month": "Jule"}, batch="1"),
                                               quarantine_row("b", {"crash_month": "Jule"}, batch="2")])
 
-    def item(failure_id, **failure):
-        made = stack_item(failure_id=failure_id)
+    def item(failure_id, rows, **failure):
+        made = stack_item(failure_id=failure_id, rows=rows)
         made["failure"].update(failure)
         return made
 
-    assert remediate(state_for(item("f1", batch_id=None, evidence={})))["execution"]["rows_affected"] == 2
+    assert remediate(state_for(item("f1", 2, batch_id=None, evidence={})))["execution"]["rows_affected"] == 2
     # the comma-separated batch_id is used when the evidence is missing
-    assert remediate(state_for(item("f2", batch_id="2", evidence={})))["execution"]["rows_affected"] == 1
-    assert remediate(state_for(item("f3", batch_id="1,2", evidence={})))["execution"]["rows_affected"] == 2
+    assert remediate(state_for(item("f2", 1, batch_id="2", evidence={})))["execution"]["rows_affected"] == 1
+    assert remediate(state_for(item("f3", 2, batch_id="1,2", evidence={})))["execution"]["rows_affected"] == 2
+
+
+def test_a_failure_merged_by_the_lookup_stages_the_rows_of_every_batch():
+    """Two scanner publishes of one group in one lookup window are merged into one failure. The merge
+    joins batch_id but may keep the evidence of the first publish only, so both are read."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lookup"))
+    from failures import group_quarantine_rows
+    from stack import merge_failures
+
+    first = [quarantine_row("r1", {"crash_month": "Jule"}, batch="7"),
+             quarantine_row("r2", {"crash_month": "Jule"}, batch="7")]
+    second = [quarantine_row(f"r{n}", {"crash_month": "Jule"}, batch="8") for n in (3, 4, 5)]
+    write_quarantine(config.QUARANTINE_PATH, first + second)
+
+    def publish(rows):
+        return group_quarantine_rows([{**row, "columns_to_remediate": dict(row["columns_to_remediate"])}
+                                      for row in rows])
+
+    (merged,) = merge_failures(publish(first) + publish(second))
+    assert merged.rows_affected == 5 and merged.batch_id == "7,8"
+    item = stack_item()
+    item["failure"] = merged.to_dict()
+    # whatever the lookup does with the evidence, the first publish's alone must not narrow the group
+    item["failure"]["evidence"]["quarantine_batches"] = ["7"]
+    execution = remediate(state_for(item))["execution"]
+    assert execution["status"] == "SUCCESS", execution["reasons"]
+    assert execution["rows_affected"] == 5
+    assert audit.find(execution["execution_id"])["record_ids"] == ["r1", "r2", "r3", "r4", "r5"]
+
+
+def test_a_group_with_missing_rows_is_not_staged_in_part():
+    jule_quarantine(config.QUARANTINE_PATH, rows=2)
+    execution = failed(state_for(stack_item(rows=5)),
+                       "only 2 of the 5 records the failure reported were found in the quarantine")
+    assert execution["rows_expected"] == 5 and execution["sample_record_ids"] == []
+    # more rows than reported (duplicates) is for Validate's row count check, not a reason to stop here
+    assert remediate(state_for(stack_item(failure_id="f2", rows=1)))["execution"]["status"] == "SUCCESS"
+    # a failure that reports no count (a Qwen incident) cannot be compared
+    unknown = stack_item(failure_id="f3")
+    unknown["failure"]["rows_affected"] = None
+    assert remediate(state_for(unknown))["execution"]["status"] == "SUCCESS"
 
 
 def test_nothing_but_the_audit_table_is_written(tmp_path):
@@ -101,7 +143,7 @@ def test_nothing_but_the_audit_table_is_written(tmp_path):
 # --- audit record (RD2, TA2) -------------------------------------------------------------
 def test_audit_record_has_action_parameters_affected_records_and_timestamp():
     jule_quarantine(config.QUARANTINE_PATH, rows=3)
-    execution = remediate(state_for())["execution"]
+    execution = remediate(state_for(stack_item(rows=3)))["execution"]
     record = audit.find(execution["execution_id"])
     assert record["failure_id"] == "f1" and record["lookup_id"] == "L1"
     assert record["action"] == "ADD_VARIANT" and record["action_params"] == {"canonical_value": "JULY"}
@@ -169,12 +211,32 @@ def test_workflow_that_stopped_after_executing_resumes_without_executing_again()
     assert path(summary["state"])[:3] == ["deterministic_lookup", "remediate", "validate"]
 
 
-def test_a_failed_execution_is_not_retried_on_resume():
-    first = remediate(state_for())["execution"]        # no quarantine table: FAILED
-    jule_quarantine(config.QUARANTINE_PATH)            # it would work now
+def test_a_failed_attempt_does_not_block_the_fix_once_the_cause_is_gone():
+    """A failed attempt staged nothing, so running the fix again is not a duplicate."""
+    first = remediate(state_for())["execution"]        # no quarantine table yet: FAILED
+    assert first["status"] == "FAILED" and "could not be read" in first["reasons"][0]
+    jule_quarantine(config.QUARANTINE_PATH)            # the cause is gone
     second = remediate(state_for())["execution"]
-    assert first["status"] == second["status"] == "FAILED" and second["idempotent_replay"] is True
-    assert second["reasons"] == first["reasons"] and len(audit_rows()) == 1
+    assert second["status"] == "SUCCESS" and second["idempotent_replay"] is False
+    assert second["execution_id"] == first["execution_id"] and second["rows_affected"] == 10
+    # both attempts are in the audit trail, and only the SUCCESS is replayed from now on
+    assert [row["status"] for row in audit.attempts(first["execution_id"])] == ["FAILED", "SUCCESS"]
+    third = remediate(state_for())["execution"]
+    assert third["idempotent_replay"] is True and third["executed_at"] == second["executed_at"]
+    assert len(audit_rows()) == 2
+
+
+def test_an_unreadable_reference_table_is_reported_as_that_and_retried(monkeypatch):
+    jule_quarantine(config.QUARANTINE_PATH)
+
+    def unreadable(column, path=None):
+        raise OSError("mount is gone")
+
+    monkeypatch.setattr(reference, "read_canonical_values", unreadable)
+    first = failed(state_for(), "the reference table could not be read: mount is gone")
+    assert "canonical value" not in first["reasons"][0]      # not blamed on the vocabulary
+    monkeypatch.setattr(reference, "read_canonical_values", canonical_values)
+    assert remediate(state_for())["execution"]["status"] == "SUCCESS"
 
 
 def test_another_fix_for_the_same_failure_is_another_execution():
@@ -208,7 +270,8 @@ def failed(state, reason):
     assert execution["status"] == "FAILED" and execution["rows_affected"] == 0 and execution["overlay"] is None
     assert reason in execution["reasons"][0], execution["reasons"]
     assert out["trace"][0]["note"].startswith("failed: ")
-    record = audit.find(execution["execution_id"])    # failed executions are audited too
+    assert audit.find(execution["execution_id"]) is None        # not a result that is ever replayed
+    record = audit.attempts(execution["execution_id"])[-1]      # but failed attempts are audited too
     assert record["status"] == "FAILED" and record["reasons"] == execution["reasons"] and record["record_ids"] == []
     return execution
 
@@ -226,8 +289,8 @@ def test_a_value_that_is_not_canonical_at_execution_time_fails(monkeypatch):
     jule_quarantine(config.QUARANTINE_PATH)
     failed(state_for(action={**JULY, "action_params": {"canonical_value": "JULLY"}}),
            "'JULLY' is not a canonical value of crash_month")
-    # the reference table can no longer be read: a reused fix is not executed blind
-    monkeypatch.setattr(reference, "canonical_values", lambda column, path=None: [])
+    # the column has no vocabulary at all (it is parsed, not looked up)
+    monkeypatch.setattr(reference, "read_canonical_values", lambda column, path=None: [])
     failed(state_for(stack_item(failure_id="f2")), "no canonical values are known")
 
 
@@ -244,7 +307,8 @@ def test_an_action_without_an_executor_fails_even_as_a_verified_past_fix():
 def test_rows_from_before_the_per_folder_split_are_matched_by_the_producer_table():
     write_quarantine(config.QUARANTINE_PATH, [quarantine_row("a", {"crash_month": "Jule"}, table=None),
                                               quarantine_row("b", {"crash_month": "Jule"}, table=None)])
-    execution = remediate(state_for())["execution"]     # the failure's folder is "Crash1", the rows' table_name
+    # the failure's folder is "Crash1", the rows' table_name
+    execution = remediate(state_for(stack_item(rows=2)))["execution"]
     assert execution["status"] == "SUCCESS" and execution["rows_affected"] == 2
     assert execution["target_table"] is None
 
@@ -253,7 +317,8 @@ def test_records_spread_over_several_tables_fail(monkeypatch):
     rows = [{"record_id": "a", "target_table": "silver2_crash1", "other_failures": False},
             {"record_id": "b", "target_table": "silver2_crash2", "other_failures": False}]
     monkeypatch.setattr(reference, "failure_records", lambda failure: {"version": 0, "rows": rows})
-    failed(state_for(), "the records of one failure belong to several tables: silver2_crash1, silver2_crash2")
+    failed(state_for(stack_item(rows=2)),
+           "the records of one failure belong to several tables: silver2_crash1, silver2_crash2")
 
 
 def test_success_is_not_claimed_when_the_audit_record_cannot_be_written(monkeypatch):
