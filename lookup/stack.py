@@ -51,6 +51,12 @@ def merge_failures(failures: List[StructuredFailure]) -> List[StructuredFailure]
             + [f.evidence.get("incident_id")]))
         evidence = {**m.evidence, "merged_incident_ids": [i for i in merged_ids if i],
                     "merged_count": m.evidence.get("merged_count", 1) + 1}
+        # Remediate stages the quarantine rows of exactly these micro-batches, so the
+        # merged failure must list every batch, not only the first publish's.
+        quarantine_batches = sorted({str(b) for x in (m, f)
+                                     for b in x.evidence.get("quarantine_batches") or []})
+        if quarantine_batches:
+            evidence["quarantine_batches"] = quarantine_batches
         merged[key] = replace(m, rows_affected=rows, batch_id=",".join(batches) or None,
                               sample_record_ids=ids, trusted=m.trusted and f.trusted,
                               evidence=evidence)

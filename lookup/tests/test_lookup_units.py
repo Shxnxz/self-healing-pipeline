@@ -204,6 +204,20 @@ def test_merge_combines_same_signature_from_several_batches():
     assert m.evidence["merged_incident_ids"] == ["x", "y"]
 
 
+def test_merged_quarantine_failure_lists_every_batch_in_evidence():
+    """Two scanner publishes of one group in one window: Remediate stages the rows of
+    evidence.quarantine_batches, so it must hold both batches, not only the first."""
+    def rows(batch, ids):
+        return [{"record_id": i, "table_name": "Crash1", "target_table": "silver2_crash1",
+                 "silver2_batch_id": batch, "columns_to_remediate": {"crash_month": "Jule"}} for i in ids]
+
+    (first,) = group_quarantine_rows(rows("7", ["r1", "r2"]))
+    (second,) = group_quarantine_rows(rows("8", ["r3", "r4", "r5"]))
+    (m,) = merge_failures([first, second])
+    assert m.rows_affected == 5 and m.batch_id == "7,8"
+    assert m.evidence["quarantine_batches"] == ["7", "8"]
+
+
 def test_stack_is_ranked_and_upstream_failure_blocks_downstream_one():
     schema = from_qwen_incident(qwen_schema_msg(table="Crash1"))
     value = quarantine_failure(rows=50)
