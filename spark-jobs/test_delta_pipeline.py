@@ -165,7 +165,7 @@ def run_tests():
     base_rows[2]["street_direction"] = "NORTH"
 
     test_batch_df = spark.createDataFrame(base_rows, schema=silver1_df.schema)
-    processor = make_batch_processor(spark, TEST_SILVER2, target_table="silver2_test")
+    processor = make_batch_processor(spark, TEST_SILVER2, target_table="silver2_test", day_first=False)
 
     print("  -> Executing batch 1...")
     processor(test_batch_df, 1)
@@ -249,7 +249,9 @@ def run_tests():
     print("  -> overlay_mappings successfully augmented mapping in-memory: PASSED")
 
     # Replay quarantine row using overlaid mappings
-    replayed = standardize_silver2(test_batch_df.filter(F.col("record_id") == "REC_QUAR_02"), overlaid)
+    replayed = standardize_silver2(
+        test_batch_df.filter(F.col("record_id") == "REC_QUAR_02"), overlaid, day_first=False
+    )
     replayed_row = replayed.first()
     assert "weather_condition" not in replayed_row.columns_to_remediate, "HAILSTORM APOCALYPSE should be cleared by overlay"
     print("  -> Quarantine replay with overlay cleared the remediate column: PASSED")
