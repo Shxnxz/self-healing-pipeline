@@ -161,6 +161,36 @@ structured failure, its lineage context (blast radius score 0-100 with a breakdo
 its incident context (best past fix, and whether it can be reused). `route` says
 `remediate` or `diagnose`. Unit tests: `python -m pytest lookup/tests`.
 
+## Recovery agent (LangGraph loop)
+
+`agent/` reads `recovery.lookup` and runs one LangGraph workflow per failure:
+deterministic lookup, diagnose, policy gate, remediate, validate, escalate, learn.
+The state of every workflow is saved after each step (SQLite, volume `agent-state`),
+so a crashed workflow resumes and a redelivered one is skipped. See
+[agent/README.md](agent/README.md).
+
+Diagnose asks a reasoning model (Qwen on Ollama, `DIAGNOSE_MODEL`) for a root cause
+and one fix out of a pre-approved action list. The policy gate lets the fix run only
+when the model's confidence reaches `POLICY_CONFIDENCE_THRESHOLD` (0.85) and the
+action is in the safe set (today only `ADD_VARIANT`); everything else goes to an
+engineer with the reasons. Where a record can decide the value (`crash_month` and
+`crash_day_of_week` against `crash_date`) the gate checks it against the quarantined
+records; where nothing can, the stricter `POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD`
+(0.95) applies. `docker compose exec recovery-agent python -m agent.check_model`
+confirms the model answers.
+
+Remediate executes an approved fix exactly once: it checks the audit table first,
+stages the failure's quarantined records with the proposed mapping, and writes one
+audit record (action, parameters, affected records, timestamp) to the Delta table
+`delta/remediation_audit`. Staging changes nothing in Silver 2, the quarantine or the
+reference table. Print the records with
+`docker compose exec recovery-agent python -m agent.audit`.
+
+Validate and the steps after it are still stubs, so every failure currently ends
+`ESCALATED`. A failure that ended on a stub is run again when it is published again
+after the step is built; a fix Remediate already staged is then not executed a
+second time. Unit tests: `python -m pytest agent`.
+
 ## Swapping in the real dataset later
 
 1. Drop the real CSV into `data/` (e.g. `data/cars_dataset_2025.csv`).
