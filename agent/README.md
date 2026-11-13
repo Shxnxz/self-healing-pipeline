@@ -10,10 +10,11 @@ lookup/ service --> kafka: recovery.lookup --> recovery-agent --> one LangGraph 
 ```
 
 The graph, its routing, the saved state, the Kafka consumer, **Diagnose**, the
-**policy gate** and **Remediate** are real. Validate and the steps after it are
-still stubs that change nothing and fail closed, so today every failure still ends
-`ESCALATED`: a fix that passes the gate is staged and audited by Remediate, then
-the Validate stub does not pass it. Each stub is replaced by its own task:
+**policy gate**, **Remediate** and **Validate** are real. A fix that passes the gate
+is staged and audited by Remediate, replayed and checked by Validate, and its
+records are released into Silver 2. Escalate and Learn are still stubs: an
+escalated failure waits for nobody, and nothing is stored in Neo4j or promoted into
+`ref_canonical_mappings`. Each stub is replaced by its own task:
 
 | Node | File | Built in | Behaviour today |
 |---|---|---|---|
@@ -21,7 +22,7 @@ the Validate stub does not pass it. Each stub is replaced by its own task:
 | `diagnose` | `nodes/diagnose.py` | Task 103 | real: asks the reasoning model for a cause and one fix |
 | `policy_gate` | `nodes/policy_gate.py` | Task 103 | real: confidence threshold, safe-action set and a check against the records |
 | `remediate` | `nodes/remediate.py` | Task 104 | real: idempotency check, stages the fix, writes the audit record |
-| `validate` | `nodes/validate.py` | Task 105 | stub: does not pass |
+| `validate` | `nodes/validate.py` | Task 105 | real: replays the staged records through Silver 2, checks them, releases them |
 | `escalate` | `nodes/escalate.py` | Task 106 | stub: records why it was escalated, asks nobody |
 | `learn` | `nodes/learn.py` | Task 107 | stub: writes nothing to Neo4j |
 
@@ -66,7 +67,7 @@ its own keys:
 | `diagnose` | `diagnosis` = `{status, hypothesis, confidence, proposed_action, model, allowed_actions, evidence, reasons}` |
 | `policy_gate` | `policy` = `{passed, outcome, reasons, checks, threshold, unverified_threshold, safe_actions}`, and `action` when it passes |
 | `remediate` | `execution` = `{status: SUCCESS or FAILED, execution_id, action, action_params, source, target_table, overlay, rows_expected, rows_affected, rows_with_other_failures, sample_record_ids, quarantine_version, executed_at, idempotent_replay, audit, reasons}` |
-| `validate` | `validation` = `{passed, reasons}` |
+| `validate` | `validation` = `{status: PASSED or FAILED, passed, reasons, checks, execution_id, target_table, column, canonical_value, rows_staged, rows_valid, rows_remaining, rows_released, rows_already_released, crash_date, quarantine_version, validated_at}` |
 | `escalate` | `escalation` = `{status, reason, details}`, `status` |
 | `learn` | `learned`, `status` |
 | every node | one `trace` entry, so the path can be read back |
@@ -258,11 +259,11 @@ It **stages** the fix, it does not release it:
   `ref_mappings.overlay_mappings()` takes, so Validate can apply it on top of the
   reference table when it re-runs `standardize_silver2` on the staged records.
 
-Nothing in Silver 2, the quarantine or `ref_canonical_mappings` changes. The agent
-mounts `./delta` read only and can write only `delta/remediation_audit`. A wrong
-fix is therefore undone by discarding the staged group, which is what makes the
-action safe. The records reach Silver 2 only after Validate passes (Task 105), and
-the mapping reaches the reference table only through Learn's promotion (Task 107).
+Nothing in Silver 2, the quarantine or `ref_canonical_mappings` changes here: the
+only write is the audit record. A wrong fix is therefore undone by discarding the
+staged group, which is what makes the action safe. The records reach Silver 2 only
+after Validate passes, and the mapping reaches the reference table only through
+Learn's promotion (Task 107).
 
 `RENAME_COLUMN` has no executor: even as a verified past fix it fails here and goes
 to an engineer. A test checks that every safe action has an executor.
@@ -299,17 +300,74 @@ docker compose exec recovery-agent python -m agent.audit <failure_id>
 
 ### What the next tasks take from it
 
-- **Validate (105)** reads `execution.overlay` and the staged records:
-  `audit.find(execution["execution_id"])["record_ids"]` with `target_table` (the
-  state keeps only five sample ids; `find` returns the successful execution). Joining them to the quarantine on
-  `record_id` + `target_table` and replaying `raw_record` through
-  `standardize_silver2` with the overlay was tried on real tables: the targeted
-  column resolves, and rows counted in `rows_with_other_failures` keep their other
-  failure. Releasing the valid rows into Silver 2 and marking the quarantine rows
-  `RESOLVED` is still to be built, after validation.
+- **Validate (105)** reads the staged group from the audit record:
+  `audit.find(execution["execution_id"])` gives all `record_ids`, the `overlay` and
+  the `target_table` (the state keeps only five sample ids). See the next section.
 - **Escalate (106)** gets `execution.reasons` for a failed execution.
 - **Pipeline cleanups (109)**: Remediate does not change `healing_status`. It accepts
   rows the trigger has marked `IN_PROGRESS` and never stages a `RESOLVED` row.
+
+## Validate (`nodes/validate.py`, spec VD1 to VD4)
+
+Runs after a `SUCCESS` from Remediate. It works on the whole group Remediate staged
+(VD1), not on the sample in the state, and has four steps:
+
+1. **The group.** `audit.find(execution_id)`: every staged `record_id`, the overlay
+   `{column: {RAW: canonical}}` and the `target_table` (`silver2_crash3`).
+2. **Replay** (`replay.py`, VD2). The agent starts one small local Spark session the
+   first time it validates and keeps it. The staged rows are read from
+   `silver2_quarantine` (on `record_id` + `target_table`, whatever their status) and
+   their `raw_record`, the untouched Silver 1 row, goes once through the pipeline's
+   own `silver2_job.standardize_silver2`, with `ref_canonical_mappings` plus the
+   overlay (`ref_mappings.overlay_mappings`). Nothing is re-implemented: the image
+   carries `spark-jobs/common.py`, `sources.py`, `ref_mappings.py` and
+   `silver2_job.py` and the same pyspark / delta-spark versions. Each source is read
+   in its own date order (`DAY_FIRST_SOURCES`), so Crash3's `04/07/2021` is 4 July
+   here exactly as in the Silver 2 job. The mapping is not promoted for this.
+3. **Checks** (`validation.py`, VD3). All are computed and listed in
+   `validation.checks`, also after one fails:
+
+   | Check | Passes when |
+   |---|---|
+   | `resolution` | the overlay is exactly the approved fix, and the value is a canonical value of the column in `ref_canonical_mappings` |
+   | `no_conflicting_mapping` | the raw value is not already mapped to a different canonical value (the table may have changed since the gate) |
+   | `rows_conserved` | every staged record is found exactly once, nothing else resolved it in the meantime, none is already in Silver 2, and staged = valid + still quarantined |
+   | `targeted_resolved` | the targeted column no longer fails in **any** staged record, and its standardized value is the canonical value |
+   | `no_new_failures` | no record fails a column it did not fail before |
+   | `agrees_with_crash_date` | `crash_month` / `crash_day_of_week` only: the value is the month / weekday of the standardized `crash_date` of **every** record that has one. One June record among fifty July ones stops `JULE -> JULY`. This is the agreement across rows the gate could only check on samples. |
+
+4. **Release**, only when every check passed. Records with nothing left to fix are
+   appended to the source's Silver 2 table, exactly the columns the Silver 2 job
+   writes, so Gold streams them like any other row. Then their quarantine rows are
+   set to `healing_status = RESOLVED` with `resolved_by` (the execution id) and
+   `resolved_at`, two columns the agent adds to the quarantine the first time.
+   A record that still fails another column (counted in `rows_remaining`) stays
+   `PENDING` for that other failure.
+
+A passed validation goes to Learn, anything else to Escalate with reason
+`VALIDATION_FAILED` and the failed checks as details (VD4). A fix that does not
+hold is a result, not an exception. Spark or Delta failing to read or write raises,
+so the graph retries the step and then escalates it as `STEP_FAILED`.
+
+**Running it again is safe.** The replay changes nothing. The Silver 2 append uses
+`txnAppId = recovery_agent_release:<execution_id>`, so Delta skips it if it already
+landed, and the quarantine update only touches rows still waiting. If the agent
+stops between the append and the update, the next run sees the transaction in
+Silver 2, skips the append and marks the rows. Records this execution already
+released are counted in `rows_already_released`, not written again.
+
+What it does not do (later tasks):
+
+- It does not promote `JULE -> JULY` into `ref_canonical_mappings`; that is Learn's
+  decision (Task 107). Until then a record that also failed another column can only
+  be released once both fixes are known together: when its other failure is fixed,
+  that failure's overlay does not carry this one, so the record stays quarantined.
+- It does not write to Neo4j (Learn) or ask an engineer (Escalate, Task 106).
+
+The writes go to the source's `silver2_<source>` and to `silver2_quarantine`, from
+the agent's own Spark session, next to the Silver 2 job's streaming appends. Delta
+handles the two writers (appends do not conflict, and a conflicting quarantine
+update or schema change is retried).
 
 One agent consumes `recovery.lookup`: the service has a fixed `container_name`, so
 Compose refuses to scale it. Two agent processes working on the same failure at the
@@ -361,13 +419,14 @@ docker compose logs -f recovery-agent
 
 ```
 [agent] lookup 66b035e5-...: 2 failure(s)
-[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > remediate > validate > escalate > learn) [stubs: validate, escalate, learn]
+[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> RESOLVED (deterministic_lookup > diagnose > policy_gate > remediate > validate > learn) [stubs: learn]
 [agent] 289b9d3430ea286e new       P3 crash1:weather_condition value='MISTY DARK' -> ESCALATED (deterministic_lookup > diagnose > policy_gate > escalate > learn) [stubs: escalate, learn]
 ```
 
-The first failure passed the gate and was staged by `remediate` (it reached
-`validate`, still a stub); the second was stopped by the gate. A path that ends
-`remediate > escalate` is a failed execution. Diagnose needs Ollama with the model
+The first failure passed the gate, was staged by `remediate`, held in `validate`
+and its records were released into Silver 2; the second was stopped by the gate.
+A path that ends `remediate > escalate` is a failed execution, `validate > escalate`
+a fix that did not hold. The first validation waits about 10 s for Spark to start. Diagnose needs Ollama with the model
 pulled (`ollama pull qwen3:8b`); without it both lines end at `policy_gate > escalate`.
 
 The first word is the `failure_id`. Print everything saved for that workflow:
@@ -398,8 +457,13 @@ Compose passes `DIAGNOSE_MODEL`, `DIAGNOSE_BASE_URL`, `DIAGNOSE_THINK` and the t
 `POLICY_` settings from `.env` (see `.env.example`). The model's context and reply
 size are `DIAGNOSE_NUM_CTX` (8192) and `DIAGNOSE_NUM_PREDICT` (1024).
 
-`REMEDIATION_AUDIT_PATH` (`/data/delta/remediation_audit`) is the audit table;
-Compose mounts `./delta/remediation_audit` writable inside the read-only `./delta`.
+`REMEDIATION_AUDIT_PATH` (`/data/delta/remediation_audit`) is the audit table.
+Compose mounts `./delta` writable: the agent writes the audit table, the healed rows
+of `silver2_<source>` and the status of their quarantine rows, and only reads the
+rest. Validate's settings: `DELTA_ROOT` (where `silver2_<source>` is),
+`DAY_FIRST_SOURCES` (must match the Silver 2 job, Compose passes the same default),
+`VALIDATE_SPARK_DRIVER_MEMORY` (`512m`) and `VALIDATE_SPARK_MASTER` (`local[2]`).
+The Spark session adds roughly 1 to 1.5 GB to the agent's memory once it has started.
 
 To start from empty state, remove the volume:
 `docker compose rm -sf recovery-agent && docker volume rm self-healing-pipeline_agent-state`.
@@ -414,10 +478,16 @@ already finished.
 
 ## Tests
 
-No Kafka, Neo4j, Spark or model needed: the model is a fake, and the Delta reader
-and the audit table run on small tables written to a temp folder. From the repo root:
+No Kafka, Neo4j or model needed: the model is a fake, and the Delta reader and the
+audit table run on small tables written to a temp folder. From the repo root:
 
 ```bash
 pip install -r agent/requirements.txt pytest
 python -m pytest agent
 ```
+
+Validate's replay is a fake in every test except `test_validate_spark.py`, which
+builds real tables with the pipeline's own Bronze, Silver 1 and Silver 2 jobs from
+rows of `data/` (`tests/spark_tables.py`), stages them with the real Remediate and
+validates and releases them with real Spark. It needs Java and downloads the Delta
+jars once (about 2 minutes); without Java it is skipped.

@@ -13,7 +13,7 @@ Who writes what. Each node returns only its own keys:
   diagnose              diagnosis   {status, hypothesis, confidence, proposed_action, ...}
   policy_gate           policy      {passed, outcome, reasons, checks, ...}, action (when it passes)
   remediate             execution   {status, execution_id, overlay, rows_affected, ...}
-  validate              validation  {passed, reasons}
+  validate              validation  {status, passed, reasons, checks, rows_released, ...}
   escalate              escalation  {status, reason, details}, status
   learn                 learned     {written, ...}, status
   a stub                stubbed     its own name, until the step is built

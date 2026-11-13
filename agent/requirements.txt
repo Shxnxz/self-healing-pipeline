@@ -2,6 +2,11 @@ neo4j>=5.26,<6
 langgraph>=1.2,<2
 langgraph-checkpoint-sqlite>=3.1,<4
 confluent-kafka>=2.5,<3
-# Diagnose and the policy gate read two Delta tables (agent/reference.py), without Spark.
-deltalake>=0.22,<2
+# Diagnose, the policy gate and Remediate read and write Delta without Spark
+# (agent/reference.py, agent/audit.py). Validate needs DeltaTable.transaction_version.
+deltalake>=1.0,<2
 pyarrow>=15
+# Validate replays the staged records through Silver 2's own code (agent/replay.py).
+# Same versions as spark-jobs/requirements.txt: the replay must match the pipeline.
+pyspark==3.5.3
+delta-spark==3.3.1

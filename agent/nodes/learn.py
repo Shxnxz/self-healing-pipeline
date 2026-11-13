@@ -1,6 +1,8 @@
 """Learn (spec EL2, EL3, KG2, TA3). STUB: the incident write is built in Task 107.
 
-Reads   everything
+Reads   everything. After a passed validation the healed records are already in
+        Silver 2 and RESOLVED in quarantine (Validate releases them); what is left
+        here is the incident in Neo4j and the promotion into ref_canonical_mappings.
 Writes  learned = {"written": bool, ...}, status
 
 It must write the outcome to Neo4j with agent.memory.incidents.write_incident()

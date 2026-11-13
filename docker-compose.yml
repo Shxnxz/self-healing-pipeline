@@ -257,9 +257,10 @@ services:
   # Consumes recovery.lookup and runs one LangGraph workflow per failure:
   # deterministic lookup -> diagnose -> policy gate -> remediate -> validate ->
   # escalate / learn. Diagnose asks the reasoning model (Qwen on Ollama), the policy
-  # gate decides whether its proposal may run, and Remediate stages the fix and
-  # writes the audit record. Validate and the steps after it are still stubs:
-  # nothing reaches Silver 2 and every failure ends ESCALATED. See agent/README.md.
+  # gate decides whether its proposal may run, Remediate stages the fix and writes the
+  # audit record, and Validate replays the staged records through Silver 2's own code
+  # (a small local Spark session) and releases the ones that pass into Silver 2.
+  # Escalate and Learn are still stubs. See agent/README.md.
   recovery-agent:
     build:
       context: .
@@ -268,16 +269,21 @@ services:
     restart: on-failure
     volumes:
       - agent-state:/state
-      - ./delta:/data/delta:ro # the pipeline's tables, read only
-      # The one table the agent writes: a record of every remediation it executed.
-      - ./delta/remediation_audit:/data/delta/remediation_audit
+      # The pipeline's tables. The agent writes three kinds: delta/remediation_audit
+      # (Remediate), the healed rows appended to silver2_<source> and their quarantine
+      # rows marked RESOLVED (Validate). Everything else it only reads.
+      - ./delta:/data/delta
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       LOOKUP_OUTPUT_TOPIC: recovery.lookup
       AGENT_CHECKPOINT_PATH: /state/recovery_checkpoints.sqlite
+      DELTA_ROOT: /data/delta
       REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
       QUARANTINE_PATH: /data/delta/silver2_quarantine
       REMEDIATION_AUDIT_PATH: /data/delta/remediation_audit
+      # Must match the Silver 2 job: Validate re-reads each source's dates in its own order.
+      DAY_FIRST_SOURCES: ${DAY_FIRST_SOURCES:-crash3}
+      VALIDATE_SPARK_DRIVER_MEMORY: ${VALIDATE_SPARK_DRIVER_MEMORY:-512m}
       DIAGNOSE_MODEL: ${DIAGNOSE_MODEL:-qwen3:8b}
       DIAGNOSE_BASE_URL: ${DIAGNOSE_BASE_URL:-http://host.docker.internal:11434}
       DIAGNOSE_THINK: ${DIAGNOSE_THINK:-false}
