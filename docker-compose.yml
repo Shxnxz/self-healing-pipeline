@@ -253,6 +253,43 @@ services:
       neo4j-init:
         condition: service_completed_successfully
 
+  # --- Tools: replay and fault injection (not started by `up`) ------------
+  # tools/README.md. One-off commands on the Spark jobs' image, with the repo
+  # mounted read-only and the tables writable:
+  #   docker compose run --rm tools python -m tools.replay list
+  #   docker compose run --rm tools python -m tools.fault_injector inject jule
+  tools:
+    build: ./spark-jobs
+    profiles: [ "tools" ]
+    working_dir: /repo
+    command: [ "python", "-m", "tools.replay", "--help" ]
+    volumes:
+      - .:/repo:ro
+      - ./delta:/data/delta
+      - ivy-cache:/root/.ivy2
+    environment:
+      PYTHONPATH: /repo/spark-jobs:/repo
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Same tables and settings as the Spark jobs above: the tools run their code.
+      SOURCES: ${SOURCES:-crash1,crash2,crash3,crash4}
+      DAY_FIRST_SOURCES: ${DAY_FIRST_SOURCES:-crash3}
+      DELTA_ROOT: /data/delta
+      QUARANTINE_PATH: /data/delta/silver2_quarantine
+      DEAD_LETTER_PATH: /data/delta/silver2_dead_letter
+      REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
+      FUZZY_AUDIT_PATH: /data/delta/silver2_fuzzy_audit
+      REMEDIATION_AUDIT_PATH: /data/delta/remediation_audit
+      FAULT_INJECTIONS_PATH: /data/delta/fault_injections
+      SILVER1_OPTIONAL_COLUMNS: ${SILVER1_OPTIONAL_COLUMNS:-[]}
+      TOOLS_SPARK_DRIVER_MEMORY: ${TOOLS_SPARK_DRIVER_MEMORY:-1g}
+      # A replay is not a pipeline job: keep it out of the lineage graph, where an
+      # extra quarantine -> silver2 edge would change the lookup's blast radius.
+      OPENLINEAGE_ENABLED: "false"
+      QWEN_ENABLED: "false"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   # --- Recovery agent (LangGraph loop) -----------------------------------
   # Consumes recovery.lookup and runs one LangGraph workflow per failure:
   # deterministic lookup -> diagnose -> policy gate -> remediate -> validate ->

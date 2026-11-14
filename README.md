@@ -169,6 +169,24 @@ structured failure, its lineage context (blast radius score 0-100 with a breakdo
 its incident context (best past fix, and whether it can be reused). `route` says
 `remediate` or `diagnose`. Unit tests: `python -m pytest lookup/tests`.
 
+## Replay and fault injection
+
+`tools/` has two one-off commands that run the pipeline's own Spark code
+([tools/README.md](tools/README.md)):
+
+- `python -m tools.replay` reprocesses one dead-lettered micro-batch (Silver 1 after a
+  column rename, Silver 2 after a crash) or a quarantine group that the current
+  reference table now fixes, without re-running the dataset (spec RM1).
+- `python -m tools.fault_injector` copies clean records, breaks one thing in each
+  (typos, ambiguous values, unseen variants and formats, schema changes, broken
+  messages), publishes them to Kafka, keeps the right answer for each in
+  `delta/fault_injections`, and `status` follows every record through the pipeline.
+
+```bash
+docker compose run --rm tools python -m tools.fault_injector inject jule
+docker compose run --rm tools python -m tools.replay list
+```
+
 ## Recovery agent (LangGraph loop)
 
 `agent/` reads `recovery.lookup` and runs one LangGraph workflow per failure:
@@ -215,8 +233,6 @@ second time. Unit tests: `python -m pytest agent`.
   there; ask if you want to work through that pattern.
 - **Multi-source / schema-drift simulation** — vary formatting per
   simulated source, deliberately rename/drop a field mid-stream.
-- **Fault injection harness** — a corruption step between the CSV and the
-  producer.
 - **Detect/triage layer** — Great Expectations checkpoints on `silver_cars`,
   plus the severity-classification logic from the architecture doc.
 

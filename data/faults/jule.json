@@ -1,0 +1,7 @@
+{
+  "name": "jule",
+  "description": "The spec's worked example: crash_month 'Jule' in Crash1 records dated in June, in 3 micro-batches (enough occurrences and batches for promotion).",
+  "faults": [
+    {"kind": "ambiguous", "source": "crash1", "column": "crash_month", "value": "Jule", "base": "JUNE", "count": 4, "batches": 3}
+  ]
+}
