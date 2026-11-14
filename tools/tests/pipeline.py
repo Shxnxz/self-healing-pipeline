@@ -40,6 +40,7 @@ def configure(root: str) -> None:
     os.environ.update({"DELTA_ROOT": f"{root}/delta", "CHECKPOINT_ROOT": f"{root}/checkpoints",
                        "SOURCES": ",".join(SOURCES), "DAY_FIRST_SOURCES": "crash3",
                        "OPENLINEAGE_ENABLED": "false", "QWEN_ENABLED": "false",
+                       "PIPELINE_STACK": "evaluation",
                        "QUARANTINE_PATH": f"{root}/delta/silver2_quarantine",
                        "DEAD_LETTER_PATH": f"{root}/delta/silver2_dead_letter",
                        "SILVER1_DEAD_LETTER_PATH": f"{root}/delta/silver1_dead_letter",

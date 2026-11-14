@@ -180,11 +180,15 @@ its incident context (best past fix, and whether it can be reused). `route` says
 - `python -m tools.fault_injector` copies clean records, breaks one thing in each
   (typos, ambiguous values, unseen variants and formats, schema changes, broken
   messages), publishes them to Kafka, keeps the right answer for each in
-  `delta/fault_injections`, and `status` follows every record through the pipeline.
+  `fault_injections`, and `status` follows every record through the pipeline. It
+  only runs in the separate evaluation stack (`docker-compose.eval.yml`: its own
+  Delta folder `./eval`, Kafka and Neo4j), so the agent never learns fixes from
+  test records in the real pipeline.
 
 ```bash
-docker compose run --rm tools python -m tools.fault_injector inject jule
 docker compose run --rm tools python -m tools.replay list
+docker compose -f docker-compose.yml -f docker-compose.eval.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
 ```
 
 ## Recovery agent (LangGraph loop)

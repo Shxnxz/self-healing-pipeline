@@ -17,8 +17,10 @@ mounted read-only at `/repo`, `./delta` writable). It has a Compose profile, so
 
 ```bash
 docker compose run --rm tools python -m tools.replay list
-docker compose run --rm tools python -m tools.fault_injector inject jule
 ```
+
+The fault injector runs in the **evaluation stack** instead (next section): it
+refuses to inject into the main pipeline.
 
 Each command starts its own small Spark driver (`TOOLS_SPARK_DRIVER_MEMORY`, 1g)
 next to the running jobs, so it takes 15 to 30 s before it prints anything. It
@@ -28,6 +30,45 @@ and a write that loses a race is retried.
 Outside Docker, run them from the repo root with the same environment the Spark jobs
 get (`DELTA_ROOT`, `SOURCES`, `DAY_FIRST_SOURCES`, `KAFKA_BOOTSTRAP_SERVERS`, ...) and
 `pyspark==3.5.3`, `delta-spark==3.3.1`, `confluent-kafka` installed.
+
+## Evaluation stack (`docker-compose.eval.yml`)
+
+The recovery agent cannot tell an injected record from a real one. In the main
+pipeline, healing a fake "Jule" would make Learn store `JULE -> JUNE` as a real
+incident and promote it (or an invented spelling such as `RAINING`) into
+`ref_canonical_mappings`, which every source uses, and later runs would look better
+only because the system learned from earlier tests. So faults go into a second, separate
+copy of the pipeline, layered on `docker-compose.yml`:
+
+| | Main stack | Evaluation stack |
+|---|---|---|
+| Compose project | `self-healing-pipeline` | `self-healing-eval` (own containers `eval-*`, network, named volumes) |
+| Delta tables, checkpoints | `./delta`, `./checkpoints` | `./eval/delta`, `./eval/checkpoints` |
+| Kafka (topics, offsets) | broker `kafka`, host port 29092 | broker `eval-kafka`, host port 39092 |
+| Neo4j (incidents, lineage) | 7474 / 7687 | 17474 / 17687 (in the browser, connect to `bolt://localhost:17687`) |
+| Lookup and agent state | `lookup-state`, `agent-state` | the eval project's own volumes |
+| Producer | all of Crash1 to Crash4 | a clean sample: the first `EVAL_ROWS_PER_TABLE` (2000) rows of Crash1 and Crash3 (`EVAL_TABLES`, `EVAL_SOURCES`) |
+| `tools.fault_injector inject` | refused (`PIPELINE_STACK=main`) | allowed (`PIPELINE_STACK=evaluation`) |
+
+```bash
+# start it (the main stack can keep running: nothing is shared)
+docker compose -f docker-compose.yml -f docker-compose.eval.yml up -d --build
+# wait until the producer has exited and Silver 2 has the sample, then
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector status <run_id>
+docker compose -f docker-compose.yml -f docker-compose.eval.yml exec recovery-agent python -m agent.review list
+# stop it and forget everything it learned
+docker compose -f docker-compose.yml -f docker-compose.eval.yml down -v
+# then delete the ./eval folder
+```
+
+It needs Docker Compose 2.24.4 or newer (Docker Desktop 4.27+), for the `!override`
+tags that replace the main file's host ports. Running both stacks at once needs
+memory for two sets of Spark drivers; stop the main one if the machine is short.
+
+Learning inside the evaluation stack is intended: a second run of the same scenario
+measures what the first one taught (records predicted `CLEAN`). For independent runs,
+`down -v` and delete `./eval` between them. The replay tool works in both stacks.
 
 ## Replay tool (`tools/replay.py`, spec RM1)
 
@@ -153,13 +194,13 @@ Shipped: `jule` (the spec's worked example, 12 records in 3 batches), `schema-re
 Crash3, a smoke test of the whole recovery path). One fault without a file:
 
 ```bash
-docker compose run --rm tools python -m tools.fault_injector inject --kind ambiguous --column crash_month --value Jule --base JUNE --count 5 --batches 3
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject --kind ambiguous --column crash_month --value Jule --base JUNE --count 5 --batches 3
 ```
 
 `--dry-run` plans and predicts without sending or writing anything; `--seed` changes
 which records are picked; `--run-id` names the run (default `<scenario>-<UTC time>`).
 
-### The ground truth (`delta/fault_injections`)
+### The ground truth (`fault_injections`, in `./eval/delta`)
 
 Written **before** anything is sent, one row per injected record; `published_at` is set
 when Kafka acknowledged its batch.
@@ -181,9 +222,9 @@ when Kafka acknowledged its batch.
 ### Following a run (`status`)
 
 ```bash
-docker compose run --rm tools python -m tools.fault_injector runs
-docker compose run --rm tools python -m tools.fault_injector status jule-20261114t051500 --records
-docker compose run --rm tools python -m tools.fault_injector status jule-20261114t051500 --json
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector runs
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector status jule-20261114t051500 --records
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector status jule-20261114t051500 --json
 ```
 
 `status` looks every record up in `silver1_dead_letter`, `silver1_<source>`,
@@ -219,10 +260,10 @@ scanner's grouping (folder, column, value). `status --json` is the input to buil
 
 ### Things to know
 
-- Injected records are copies of real crashes. They are marked by `crash_record_id
-  LIKE 'FAULT-%'`; anything that counts crashes in Gold should leave them out. To
-  start clean, wipe `delta/` and `checkpoints/` as usual (the agent's `agent-state`
-  volume too, see agent/README.md).
+- Injected records are copies of real crashes, marked by `crash_record_id LIKE
+  'FAULT-%'`. They only ever reach the evaluation stack's Gold; anything that counts
+  crashes there should leave them out. To start clean, `down -v` the evaluation stack
+  and delete `./eval`.
 - Base records are drawn from `silver1_<source>` joined with `silver2_<source>`, so the
   pipeline must have run for that source first.
 - A run id can be injected once (`run ... was already injected`).

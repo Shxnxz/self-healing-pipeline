@@ -24,6 +24,13 @@ what the evaluation (Task 111) measures from.
 Injected records are marked: crash_record_id = "FAULT-<run_id>-<seq>", record_id a
 uuid5 of (run_id, seq). They are copies of real crashes, so anything that counts
 crashes (Gold metrics) should leave out crash_record_id LIKE 'FAULT-%'.
+
+Faults are only injected into the evaluation stack (docker-compose.eval.yml: its own
+Delta folder, Kafka and Neo4j). The recovery agent cannot tell an injected record
+from a real one, so in the main stack Learn would store their fixes as incidents and
+promote invented spellings into ref_canonical_mappings. `inject` refuses unless
+PIPELINE_STACK=evaluation, which only the evaluation stack sets. A dry run sends and
+writes nothing, so it is allowed anywhere.
 """
 import argparse
 import json
@@ -44,6 +51,8 @@ DEFAULT_INTERVAL = float(os.environ.get("FAULT_BATCH_INTERVAL_SECONDS", "15"))
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _NAMESPACE = uuid.UUID("6f1d3c3e-6a52-4e0b-9a51-5e1f7c0b1080")
 _METADATA = {"record_id", "batch_id", "table_name", "ingestion_ts", "payload"}
+EVALUATION_STACK = "evaluation"
+EVAL_COMMAND = "docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools"
 
 # Observed outcomes (status), in the order a record can move through them.
 NOT_ARRIVED = "NOT_ARRIVED"            # not in Silver 1 or a dead letter yet
@@ -321,8 +330,20 @@ def publish(spark, records: List[dict], interval: float, producer=None) -> None:
             time.sleep(interval)
 
 
+def require_evaluation_stack() -> None:
+    """Refuse to send faults anywhere but the evaluation stack (see the module docstring)."""
+    stack = os.environ.get("PIPELINE_STACK", "").strip().lower()
+    if stack != EVALUATION_STACK:
+        raise faults.FaultSpecError(
+            f"faults are only injected into the evaluation stack (PIPELINE_STACK={stack or 'unset'}). "
+            "In the main stack the agent would learn their fixes as real ones. Run it as: "
+            f"{EVAL_COMMAND} python -m tools.fault_injector inject ... (tools/README.md)")
+
+
 def inject(spark, scenario: dict, run_id: Optional[str] = None, seed: int = 7, dry_run: bool = False,
            interval: float = DEFAULT_INTERVAL, producer=None) -> List[dict]:
+    if not dry_run:
+        require_evaluation_stack()
     run_id = run_id or new_run_id(scenario.get("name", "run"))
     if not _RUN_ID.match(run_id):
         raise faults.FaultSpecError(f"run id {run_id!r}: lower-case letters, digits and '-' only")
@@ -522,6 +543,8 @@ def main(argv=None) -> int:
             if bool(args.scenario) == bool(args.kind):
                 raise faults.FaultSpecError("give a scenario name or --kind (not both)")
             scenario = load_scenario(args.scenario) if args.scenario else adhoc_scenario(args)
+            if not args.dry_run:
+                require_evaluation_stack()  # before starting Spark
             spark = session.spark("FaultInjector")
             records = inject(spark, scenario, args.run_id, args.seed, args.dry_run, args.interval)
             rows = _manifest_rows(records)

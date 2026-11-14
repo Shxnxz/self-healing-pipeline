@@ -38,6 +38,9 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2000"))
 BATCH_INTERVAL_SECONDS = float(os.environ.get("BATCH_INTERVAL_SECONDS", "3"))
 LOOP_FOREVER = os.environ.get("LOOP_FOREVER", "true").lower() == "true"
 STREAMING_MODE = os.environ.get("STREAMING_MODE", "interleaved").lower()
+# Stop each table after this many rows (0 = no limit). The evaluation stack
+# (docker-compose.eval.yml) only needs a small clean sample to inject faults into.
+MAX_ROWS_PER_TABLE = int(os.environ.get("MAX_ROWS_PER_TABLE", "0"))
 
 
 def natural_sort_key(s: str):
@@ -84,6 +87,7 @@ def row_generator(table_name: str, file_paths: list[str], loop_forever: bool):
     Streams sequentially through all partition files, then loops if loop_forever is True.
     """
     iteration = 0
+    sent = 0
     while True:
         iteration += 1
         for file_path in file_paths:
@@ -91,6 +95,10 @@ def row_generator(table_name: str, file_paths: list[str], loop_forever: bool):
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
+                    if MAX_ROWS_PER_TABLE and sent >= MAX_ROWS_PER_TABLE:
+                        print(f"[{table_name}] Reached MAX_ROWS_PER_TABLE={MAX_ROWS_PER_TABLE}.")
+                        return
+                    sent += 1
                     yield row
 
         if not loop_forever:

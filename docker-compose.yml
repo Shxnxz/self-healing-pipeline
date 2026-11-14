@@ -257,7 +257,8 @@ services:
   # tools/README.md. One-off commands on the Spark jobs' image, with the repo
   # mounted read-only and the tables writable:
   #   docker compose run --rm tools python -m tools.replay list
-  #   docker compose run --rm tools python -m tools.fault_injector inject jule
+  # Fault injection runs only in the evaluation stack (docker-compose.eval.yml):
+  #   docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
   tools:
     build: ./spark-jobs
     profiles: [ "tools" ]
@@ -269,6 +270,8 @@ services:
       - ivy-cache:/root/.ivy2
     environment:
       PYTHONPATH: /repo/spark-jobs:/repo
+      # tools.fault_injector refuses to inject unless this is "evaluation" (set by docker-compose.eval.yml).
+      PIPELINE_STACK: main
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       # Same tables and settings as the Spark jobs above: the tools run their code.
       SOURCES: ${SOURCES:-crash1,crash2,crash3,crash4}

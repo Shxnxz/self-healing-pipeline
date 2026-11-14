@@ -16,6 +16,9 @@ delta/*
 checkpoints/*
 !checkpoints/.gitkeep
 
+# Evaluation stack's tables, checkpoints and Qwen records (docker-compose.eval.yml)
+/eval/
+
 # Spark / Hive / Derby metastore & local artifacts
 metastore_db/
 derby.log
