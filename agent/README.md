@@ -471,7 +471,20 @@ and resumes the workflow, and its log shows the result:
 ```
 
 A decision for a workflow that is not waiting, or for an older round, is refused and
-logged; the workflow keeps waiting. A decision delivered again after the agent died
+logged; the workflow keeps waiting. If `engineer_review` itself refuses a decision the
+agent had accepted (the reference table changed or could not be read in between), the
+log says `refused`, and `review list` / `show` mark the case with the refused decision
+and why, so nobody believes it is being applied.
+
+After a fix fails Validate, the proposed fix is that same fix: `approve` would replay
+the staged execution and fail the same way, so `show` hides it and `approve` refuses
+unless `--force` is given. Use `fix VALUE` for another value.
+
+**Assumption: whoever can write to `recovery.decisions` is trusted.** The topic is not
+authenticated and `--by` is free text, so any process that reaches Kafka can apply a
+fix in someone's name, and the audit and the workflow record that name as
+`approved_by`. That is acceptable for this project's single-host setup; a real
+deployment would need Kafka ACLs on the topic or signed decisions. A decision delivered again after the agent died
 while acting on it continues the workflow; delivered again after it finished, it is a
 duplicate. The agent creates both topics at start, so the first decision is not
 delayed by Kafka's metadata refresh.
@@ -494,7 +507,10 @@ LangGraph saves the state after every node in SQLite, under
 - **duplicate**: the workflow ended and every step it went through was real: skip
   it. Kafka delivers at least once.
 - **rerun**: the workflow ended on a stub (`stubbed` is not empty), so it was not
-  really finished: the saved state is dropped and the failure runs again. A fix
+  really finished: the saved state is dropped and the failure runs again. **Except**
+  a workflow an engineer decided (`escalation.decision` set, or status
+  `RESOLVED_BY_ENGINEER` / `DISMISSED`): that is a duplicate, never rerun, so the
+  engineer is not asked again and a released fix is not redone. A fix
   Remediate staged the first time is not executed twice, its idempotency check
   finds the audit record and returns it.
 
@@ -507,9 +523,9 @@ so a long stack does not get it dropped from the consumer group.
 A failure that went through a stub (today only Learn) ended without its outcome
 being stored. It is not lost for good: because of **rerun** it is handled properly
 the next time it is published. Failures handled before Task 106 ended `ESCALATED`
-with nobody asked; republished, they now open a case. Until Learn is built this also holds for a case
-an engineer closed: its workflow ends on the Learn stub, so if the failure is
-published again (scanner reset) it is run again and asks the engineer again. After a
+with nobody asked; republished, they now open a case. A case an engineer closed is the exception: it
+ends on the Learn stub too, but it is never rerun (see **rerun** above), so its
+outcome waits for Learn to be stored without asking the engineer again. After a
 step is built, publish the open failures again by resetting the scanner:
 
 ```bash

@@ -381,7 +381,10 @@ def test_review_lists_cases_from_the_sqlite_checkpoints(tmp_path):
     g = build_graph(checkpointer, nodes=REJECTED)
     escalated(g, stack_item("f1"))
     process_lookup(g, lookup_message(stack_item("f2", route="remediate", match=PAST_FIX)))
-    assert review.thread_ids(checkpointer) and [s["failure_id"] for s in review.open_cases(g)] == ["f1", "f2"]
+    finished = build_graph(checkpointer, nodes={"remediate": remediate_ok, "validate": validate_ok})
+    finished.invoke(initial_state("L1", stack_item("f3", route="remediate", match=PAST_FIX)), thread("f3"))
+    assert sorted(review.paused_thread_ids(checkpointer)) == ["f1", "f2"]   # the finished f3 is not loaded
+    assert [s["failure_id"] for s in review.open_cases(g)] == ["f1", "f2"]
     checkpointer.conn.close()
 
 
@@ -436,3 +439,69 @@ def test_a_borrowed_fix_that_no_longer_fits_is_diagnosed_not_sent_for_approval()
                          match={**BORROWED, "action_params": {"canonical_value": "SMARCH"}}))
     state = graph().invoke(initial_state("L1", item), thread())
     assert state["route"] == "diagnose" and path(state)[:2] == ["deterministic_lookup", "diagnose"]
+
+
+# --- review of #31: a decided workflow is never thrown away -------------------------------
+@pytest.mark.parametrize("kind, params", [("DISMISS", None), ("APPLY_FIX", {"canonical_value": "JULY"})])
+def test_redelivered_lookup_never_reruns_a_workflow_an_engineer_decided(tmp_path, kind, params):
+    """Learn is still a stub, so the decided workflow ends with stubbed = ['learn']."""
+    from agent.graph import open_checkpointer
+    jule_quarantine(config.QUARANTINE_PATH, rows=10)
+    checkpointer = open_checkpointer(str(tmp_path / "checkpoints.sqlite"))
+    g = build_graph(checkpointer, retry_seconds=0)
+    message = lookup_message(stack_item("f1"))
+    (first,) = process_lookup(g, message)
+    state = first["state"]
+    done = apply_decision(g, decide(state, kind, note="not a month", action="ADD_VARIANT" if params else None,
+                                    params=params))
+    assert done["delivery"] == "decided" and done["state"]["stubbed"] == ["learn"]
+
+    (again,) = process_lookup(g, message)
+    checkpointer.conn.close()
+    assert again["delivery"] == "duplicate"
+    assert again["state"]["escalation"]["decision"]["decision"] == kind      # the decision is kept
+    assert again["state"]["status"] == done["state"]["status"]
+
+
+# --- review of #31: approving the fix that just failed Validate -----------------------------
+def test_approve_is_held_back_after_the_proposed_fix_failed_validation(capsys):
+    g = graph(remediate=remediate_ok, validate=validate_fails)
+    escalated(g, stack_item("f1", route="remediate", match=PAST_FIX))
+    review.main(["show", "f1"], graph=g)
+    shown = capsys.readouterr().out
+    assert "approve f1 --by NAME" not in shown and "approve is hidden" in shown
+    sent = []
+    with pytest.raises(SystemExit, match="just failed Validate"):
+        review.main(["approve", "f1", "--by", "thay"], graph=g, send=sent.append)
+    review.main(["approve", "f1", "--by", "thay", "--force"], graph=g, send=sent.append)
+    assert sent and sent[0]["action_params"] == {"canonical_value": "JULY"}
+
+
+# --- review of #31: a refusal by engineer_review itself is visible ---------------------------
+def test_a_decision_refused_on_resume_is_shown_not_silently_dropped(monkeypatch, capsys):
+    g = graph(**REJECTED, remediate=remediate_ok, validate=validate_ok, learn=learn_ok)
+    state = escalated(g)
+    calls = []
+
+    def flaky(column, path=None):   # readable when the consumer checks, not a moment later
+        calls.append(column)
+        if len(calls) > 1:
+            raise OSError("ref_canonical_mappings is being rewritten")
+        return canonical_values(column)
+
+    monkeypatch.setattr(reference, "read_canonical_values", flaky)
+    summary = apply_decision(g, decide(state, "APPLY_FIX", action="ADD_VARIANT", params={"canonical_value": "JULY"}))
+    assert summary["delivery"] == "refused" and "cannot read the canonical values" in summary["problems"][0]
+    assert g.get_state(thread()).next == ("engineer_review",)
+    monkeypatch.setattr(reference, "read_canonical_values", canonical_values)
+
+    review.main([], graph=g)
+    assert "[last decision REFUSED, see show]" in capsys.readouterr().out
+    review.main(["show", "f1"], graph=g)
+    shown = capsys.readouterr().out
+    assert "LAST DECISION REFUSED: APPLY_FIX by thay" in shown and "cannot read the canonical values" in shown
+
+    sent = []
+    review.main(["approve", "f1", "--by", "thay"], graph=g, send=sent.append)   # deciding again works
+    out = apply_decision(g, sent[0])
+    assert out["delivery"] == "decided" and out["state"]["status"] == "RESOLVED_BY_ENGINEER"
