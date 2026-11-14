@@ -14,14 +14,19 @@ Who writes what. Each node returns only its own keys:
   policy_gate           policy      {passed, outcome, reasons, checks, ...}, action (when it passes)
   remediate             execution   {status, execution_id, overlay, rows_affected, ...}
   validate              validation  {status, passed, reasons, checks, rows_released, ...}
-  escalate              escalation  {status, reason, details}, status
+  escalate              escalation  {status WAITING, escalation_id, round, reason, details,
+                                     case, escalated_at, decision None, history}, status
+  engineer_review       escalation  {..., status DECIDED, decision}, status, and for
+                                    APPLY_FIX / RETRY: action and the keys the automated
+                                    steps write again (cleared)
   learn                 learned     {written, ...}, status
   a stub                stubbed     its own name, until the step is built
   the graph             error       {node, error, attempts} when a step kept raising
 
-`action` is the only thing Remediate executes, and only two nodes may set it:
-deterministic_lookup (a fix that already worked) and policy_gate (a proposal that
-passed both checks). A diagnosis on its own never reaches Remediate.
+`action` is the only thing Remediate executes, and only three nodes may set it:
+deterministic_lookup (a fix that already worked), policy_gate (a proposal that
+passed both checks) and engineer_review (a fix an engineer decided). A diagnosis on
+its own never reaches Remediate.
 """
 import operator
 from datetime import datetime, timezone
@@ -30,6 +35,8 @@ from typing import Annotated, Optional, TypedDict
 # Routes published by the Deterministic Lookup (lookup/stack.py).
 ROUTE_REMEDIATE = "remediate"
 ROUTE_DIAGNOSE = "diagnose"
+# deterministic_lookup only: a past fix that an engineer must approve before it runs.
+ROUTE_ESCALATE = "escalate"
 
 # execution["status"]
 EXECUTION_SUCCESS = "SUCCESS"
@@ -37,8 +44,10 @@ EXECUTION_FAILED = "FAILED"
 
 # Final status of a workflow.
 STATUS_RESOLVED = "RESOLVED"    # fixed and validated without an engineer
-STATUS_ESCALATED = "ESCALATED"  # handed to an engineer
-STATUS_FAILED = "FAILED"        # escalate or learn itself kept raising: nobody has the case
+STATUS_ESCALATED = "ESCALATED"  # handed to an engineer, waiting for the decision
+STATUS_RESOLVED_BY_ENGINEER = "RESOLVED_BY_ENGINEER"  # an engineer's fix that validated, or fixed by hand
+STATUS_DISMISSED = "DISMISSED"  # the engineer decided it is not to be fixed; records stay quarantined
+STATUS_FAILED = "FAILED"        # escalate, engineer_review or learn kept raising: nobody has the case
 
 # Marker a stub node leaves so nobody mistakes its output for a real result.
 NOT_IMPLEMENTED = "NOT_IMPLEMENTED"

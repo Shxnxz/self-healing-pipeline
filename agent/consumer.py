@@ -1,10 +1,13 @@
 """Recovery agent: Kafka `recovery.lookup` in, one LangGraph workflow per failure.
 
   recovery.lookup (lookup/consumer.py) --> for each stack item, top first --> graph (agent/graph.py)
+  recovery.decisions (agent/review.py)  --> resume the workflow waiting for that decision
 
-Each workflow is checkpointed under thread_id = failure_id, which gives four
+Each workflow is checkpointed under thread_id = failure_id, which gives five
 behaviours for a stack item:
 
+  waiting    saved state paused in engineer_review: the failure is with an engineer,
+             leave it alone (the decision resumes it, not a new publish)
   new        no saved state: start the workflow
   resumed    saved state that stopped part-way (the agent was killed): continue
              from the last finished node
@@ -21,11 +24,24 @@ dies, the message is redelivered: finished items are skipped, the rest resume.
 import json
 from typing import Callable, List, Optional
 
+from langgraph.types import Command
+
 from agent import config
+from agent import escalation as esc
 from agent.graph import build_graph, open_checkpointer
 from agent.state import initial_state
 
 NEW, RESUMED, DUPLICATE, RERUN, MALFORMED = "new", "resumed", "duplicate", "rerun", "malformed"
+WAITING = "waiting"
+# What happened to a decision from recovery.decisions.
+DECIDED, REFUSED, UNKNOWN = "decided", "refused", "unknown"
+
+REVIEW_NODE = "engineer_review"
+
+
+def is_waiting(saved) -> bool:
+    """The workflow is paused for an engineer's decision."""
+    return bool(saved.values) and tuple(saved.next) == (REVIEW_NODE,) and bool(saved.interrupts)
 
 
 def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
@@ -38,6 +54,8 @@ def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
     thread = {"configurable": {"thread_id": failure_id}}
     saved = graph.get_state(thread)
     delivery = NEW
+    if is_waiting(saved):
+        return {"delivery": WAITING, "failure_id": failure_id, "state": saved.values}
     if saved.values and saved.next:
         return {"delivery": RESUMED, "failure_id": failure_id, "state": graph.invoke(None, thread)}
     if saved.values and not saved.values.get("stubbed"):
@@ -47,6 +65,39 @@ def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
         delivery = RERUN
     state = graph.invoke(initial_state(lookup_id, item), thread)
     return {"delivery": delivery, "failure_id": failure_id, "state": state}
+
+
+def apply_decision(graph, message: dict) -> dict:
+    """Resume the workflow an engineer's decision answers (agent/review.py sends it).
+
+    The decision is checked against the saved state first: a decision for a workflow
+    that is not waiting, or for an older round of its escalation, is refused and the
+    workflow is left as it is. A decision delivered again after the agent died while
+    acting on it continues the workflow from where it stopped.
+    """
+    failure_id = message.get("failure_id") if isinstance(message, dict) else None
+    if not isinstance(failure_id, str) or not failure_id:
+        return {"delivery": MALFORMED, "failure_id": None, "state": {}, "problems": ["no failure_id"]}
+    thread = {"configurable": {"thread_id": failure_id}}
+    saved = graph.get_state(thread)
+    if not saved.values:
+        return {"delivery": UNKNOWN, "failure_id": failure_id, "state": {},
+                "problems": [f"no workflow is saved for failure {failure_id}"]}
+    if not is_waiting(saved):
+        decided = (saved.values.get("escalation") or {}).get("decision") or {}
+        same = decided.get("escalation_id") == message.get("escalation_id") and \
+            decided.get("decided_at") == message.get("decided_at")
+        if same and saved.next:   # redelivered after the agent died while acting on it
+            return {"delivery": RESUMED, "failure_id": failure_id, "state": graph.invoke(None, thread)}
+        if same:
+            return {"delivery": DUPLICATE, "failure_id": failure_id, "state": saved.values}
+        return {"delivery": REFUSED, "failure_id": failure_id, "state": saved.values,
+                "problems": [f"failure {failure_id} is not waiting for an engineer"]}
+    _, problems = esc.check_decision(saved.values, message)
+    if problems:
+        return {"delivery": REFUSED, "failure_id": failure_id, "state": saved.values, "problems": problems}
+    state = graph.invoke(Command(resume=message), thread)
+    return {"delivery": DECIDED, "failure_id": failure_id, "state": state}
 
 
 def process_lookup(graph, message: dict, between: Optional[Callable[[], None]] = None) -> List[dict]:
@@ -66,15 +117,23 @@ def process_lookup(graph, message: dict, between: Optional[Callable[[], None]] =
 def describe(summary: dict) -> str:
     state = summary["state"]
     if summary["delivery"] == MALFORMED:
-        return "[agent] Skipping stack item without failure.failure_id"
+        return "[agent] Skipping stack item or decision without a failure_id"
+    if not state:
+        return f"[agent] decision for {summary['failure_id']} {summary['delivery']}: {'; '.join(summary.get('problems') or [])}"
     failure = state.get("failure") or {}
     what = failure.get("column_name") or failure.get("failure_type")
     path = " > ".join(entry["node"] for entry in state.get("trace", []))
     stubs = f" [stubs: {', '.join(state['stubbed'])}]" if state.get("stubbed") else ""
+    escalation = state.get("escalation") or {}
+    outcome = state.get("status")
+    if escalation.get("status") == esc.WAITING and (summary["delivery"] == WAITING or "__interrupt__" in state):
+        outcome = (f"{outcome} {escalation.get('reason')}, waiting for an engineer: "
+                   f"python -m agent.review show {summary['failure_id']}")
+    problems = f" [{'; '.join(summary['problems'])}]" if summary.get("problems") else ""
     return (f"[agent] {summary['failure_id']} {summary['delivery']:<9} "
             f"{(state.get('priority') or {}).get('tier') or '-'} "
             f"{failure.get('folder') or '-'}:{what} value={failure.get('signature_value')!r} "
-            f"-> {state.get('status')} ({path}){stubs}")
+            f"-> {outcome} ({path}){stubs}{problems}")
 
 
 def parse(msg) -> Optional[dict]:
@@ -119,13 +178,37 @@ def run(consumer, graph, max_messages: Optional[int] = None) -> None:
         if message is not None:
             assigned = consumer.assignment()
             consumer.pause(assigned)
-            summaries = process_lookup(graph, message, between=keep_alive)
-            consumer.resume(assigned)
-            print(f"[agent] lookup {message.get('lookup_id')}: {len(summaries)} failure(s)")
-            for summary in summaries:
+            if msg.topic() == config.DECISIONS_TOPIC:
+                summary = apply_decision(graph, message)
+                consumer.resume(assigned)
+                print(f"[agent] decision {message.get('decision')} by {message.get('engineer')} "
+                      f"on {message.get('escalation_id')}: {summary['delivery']}")
                 print(describe(summary), flush=True)
+            else:
+                summaries = process_lookup(graph, message, between=keep_alive)
+                consumer.resume(assigned)
+                print(f"[agent] lookup {message.get('lookup_id')}: {len(summaries)} failure(s)")
+                for summary in summaries:
+                    print(describe(summary), flush=True)
         consumer.commit(message=msg, asynchronous=False)
         handled += 1
+
+
+def ensure_topics(topics: List[str]) -> None:
+    """Create the topics if they do not exist yet. A consumer subscribed to a missing
+    topic only sees it at its next metadata refresh (minutes), so the first decision an
+    engineer sends would wait that long."""
+    from confluent_kafka.admin import AdminClient, NewTopic
+
+    admin = AdminClient({"bootstrap.servers": config.KAFKA_BOOTSTRAP})
+    existing = set(admin.list_topics(timeout=10).topics)
+    missing = [NewTopic(t, num_partitions=1, replication_factor=1) for t in topics if t not in existing]
+    for topic, future in (admin.create_topics(missing) if missing else {}).items():
+        try:
+            future.result()
+            print(f"[agent] Created topic {topic}", flush=True)
+        except Exception as exc:  # created meanwhile by someone else, or auto-created: fine
+            print(f"[agent] Topic {topic}: {exc}", flush=True)
 
 
 def main() -> None:
@@ -139,8 +222,9 @@ def main() -> None:
         "enable.auto.commit": False,
         "max.poll.interval.ms": config.MAX_POLL_INTERVAL_MS,
     })
-    consumer.subscribe([config.LOOKUP_TOPIC])
-    print(f"[agent] Consuming {config.LOOKUP_TOPIC} from {config.KAFKA_BOOTSTRAP} "
+    ensure_topics([config.LOOKUP_TOPIC, config.DECISIONS_TOPIC])
+    consumer.subscribe([config.LOOKUP_TOPIC, config.DECISIONS_TOPIC])
+    print(f"[agent] Consuming {config.LOOKUP_TOPIC} and {config.DECISIONS_TOPIC} from {config.KAFKA_BOOTSTRAP} "
           f"(checkpoints {config.CHECKPOINT_PATH})", flush=True)
     try:
         run(consumer, graph)

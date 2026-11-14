@@ -293,7 +293,7 @@ def test_a_confident_safe_diagnosis_reaches_remediate_with_the_checked_action():
 
 def test_a_rejected_diagnosis_reaches_the_engineer_with_the_reasons():
     state = run(stack_item(), {**JULY_REPLY, "confidence": 0.6}, remediate=remediate_ok, validate=validate_ok)
-    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate"]   # waits for the engineer
     assert state["action"] is None and "execution" not in state and state["status"] == "ESCALATED"
     assert state["escalation"]["reason"] == "POLICY_GATE_REJECTED"
     assert state["escalation"]["details"] == ["confidence 0.60 is below the threshold 0.85"]
@@ -314,7 +314,7 @@ def test_a_model_that_asks_for_an_engineer_reaches_one_without_a_blocked_fix():
     reply = {"hypothesis": "The records point to June and July alike.", "action": "ESCALATE",
              "canonical_value": None, "confidence": 0.4}
     state = run(stack_item(), reply)
-    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate"]   # waits for the engineer
     assert state["policy"]["outcome"] == "ENGINEER_REQUESTED"
     assert state["escalation"]["reason"] == "ENGINEER_REQUESTED"
     assert state["escalation"]["details"] == [

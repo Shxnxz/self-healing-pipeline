@@ -2,12 +2,15 @@
 
   from                  to
   START                 deterministic_lookup
-  deterministic_lookup  remediate when a verified past fix is reused, else diagnose
+  deterministic_lookup  remediate when a verified past fix is reused, escalate when that
+                        fix needs an engineer's approval first, else diagnose
   diagnose              policy_gate
   policy_gate           remediate when it passes, else escalate
   remediate             validate on SUCCESS, else escalate
   validate              learn when it passes, else escalate
-  escalate              learn (the engineer's outcome is stored too)
+  escalate              engineer_review (the workflow pauses there for the decision)
+  engineer_review       remediate (APPLY_FIX), deterministic_lookup (RETRY),
+                        learn (RESOLVED_MANUALLY, DISMISS: the engineer's outcome is stored too)
   learn                 END
 
 The routing lives here and reads only the keys documented in agent/state.py, so a
@@ -24,12 +27,14 @@ from langgraph.errors import GraphBubbleUp
 from langgraph.graph import END, START, StateGraph
 
 from agent import config
+from agent import escalation as esc
 from agent.nodes import NODES
-from agent.state import EXECUTION_SUCCESS, ROUTE_REMEDIATE, STATUS_FAILED, RecoveryState, step
+from agent.state import (EXECUTION_SUCCESS, ROUTE_ESCALATE, ROUTE_REMEDIATE, STATUS_FAILED, RecoveryState,
+                         step)
 
 # Steps with nothing after them to catch a failure: if one keeps raising, the
 # workflow ends FAILED instead of ESCALATED.
-LAST_STEPS = ("escalate", "learn")
+LAST_STEPS = ("escalate", "engineer_review", "learn")
 
 
 def guarded(name: str, fn: Callable, max_attempts: int, retry_seconds: float) -> Callable:
@@ -66,8 +71,11 @@ def guarded(name: str, fn: Callable, max_attempts: int, retry_seconds: float) ->
 def route_after_lookup(state: RecoveryState) -> str:
     if state.get("error"):
         return "escalate"
-    if state.get("route") == ROUTE_REMEDIATE and (state.get("action") or {}).get("action"):
+    has_action = bool((state.get("action") or {}).get("action"))
+    if state.get("route") == ROUTE_REMEDIATE and has_action:
         return "remediate"
+    if state.get("route") == ROUTE_ESCALATE and has_action:
+        return "escalate"
     return "diagnose"
 
 
@@ -94,6 +102,27 @@ def route_after_validate(state: RecoveryState) -> str:
     return "learn" if (state.get("validation") or {}).get("passed") is True else "escalate"
 
 
+def _failed_itself(state: RecoveryState, node: str) -> bool:
+    return (state.get("error") or {}).get("node") == node
+
+
+def route_after_escalate(state: RecoveryState) -> str:
+    # Escalate that keeps raising has opened no case: end FAILED rather than wait for nobody.
+    return "learn" if _failed_itself(state, "escalate") else "engineer_review"
+
+
+def route_after_engineer_review(state: RecoveryState) -> str:
+    if _failed_itself(state, "engineer_review"):
+        return "learn"
+    escalation = state.get("escalation") or {}
+    decision = (escalation.get("decision") or {}).get("decision") if escalation.get("status") == esc.DECIDED else None
+    if decision == esc.APPLY_FIX and (state.get("action") or {}).get("action"):
+        return "remediate"
+    if decision == esc.RETRY:
+        return "deterministic_lookup"
+    return "learn"
+
+
 def build_graph(checkpointer=None, nodes: Optional[Dict[str, Callable]] = None,
                 max_attempts: Optional[int] = None, retry_seconds: Optional[float] = None):
     """Compile the graph. `nodes` replaces steps by name (tests use it to drive each path)."""
@@ -114,7 +143,9 @@ def build_graph(checkpointer=None, nodes: Optional[Dict[str, Callable]] = None,
     builder.add_conditional_edges("policy_gate", route_after_policy_gate, ["remediate", "escalate"])
     builder.add_conditional_edges("remediate", route_after_remediate, ["validate", "escalate"])
     builder.add_conditional_edges("validate", route_after_validate, ["learn", "escalate"])
-    builder.add_edge("escalate", "learn")
+    builder.add_conditional_edges("escalate", route_after_escalate, ["engineer_review", "learn"])
+    builder.add_conditional_edges("engineer_review", route_after_engineer_review,
+                                  ["remediate", "deterministic_lookup", "learn"])
     builder.add_edge("learn", END)
     return builder.compile(checkpointer=checkpointer)
 

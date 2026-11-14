@@ -5,6 +5,8 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 # Same variable the Deterministic Lookup service publishes with (lookup/config.py).
 LOOKUP_TOPIC = os.environ.get("LOOKUP_OUTPUT_TOPIC", "recovery.lookup")
 GROUP_ID = os.environ.get("AGENT_CONSUMER_GROUP", "recovery-agent")
+# Engineers' decisions on escalated failures (agent/review.py publishes, the agent resumes).
+DECISIONS_TOPIC = os.environ.get("AGENT_DECISIONS_TOPIC", "recovery.decisions")
 
 # LangGraph checkpoints: the saved state of every recovery workflow.
 CHECKPOINT_PATH = os.environ.get("AGENT_CHECKPOINT_PATH", "/state/recovery_checkpoints.sqlite")

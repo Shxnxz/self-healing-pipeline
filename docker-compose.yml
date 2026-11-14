@@ -276,6 +276,8 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       LOOKUP_OUTPUT_TOPIC: recovery.lookup
+      # Engineers' decisions on escalated failures: python -m agent.review publishes them.
+      AGENT_DECISIONS_TOPIC: recovery.decisions
       AGENT_CHECKPOINT_PATH: /state/recovery_checkpoints.sqlite
       DELTA_ROOT: /data/delta
       REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
