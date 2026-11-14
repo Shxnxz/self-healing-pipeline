@@ -8,15 +8,16 @@ lookup/ service --> kafka: recovery.lookup --> recovery-agent --> one LangGraph 
                                                     |   ^
                                                     |   +-- kafka: recovery.decisions <-- python -m agent.review (engineer)
                                                     +-- SQLite checkpoints (volume agent-state)
+                                                    +-- Neo4j incidents + ref_canonical_mappings (Learn)
 ```
 
-The graph, its routing, the saved state, the Kafka consumer, **Diagnose**, the
-**policy gate**, **Remediate**, **Validate** and **Escalate** are real. A fix that
-passes the gate is staged and audited by Remediate, replayed and checked by
-Validate, and its records are released into Silver 2. Everything else is handed to
-an engineer: the workflow pauses with the whole case saved, and continues with the
-engineer's decision. Learn is still a stub: nothing is stored in Neo4j or promoted
-into `ref_canonical_mappings`. Each stub is replaced by its own task:
+Every step is real. A fix that passes the gate is staged and audited by Remediate,
+replayed and checked by Validate, and its records are released into Silver 2.
+Everything else is handed to an engineer: the workflow pauses with the whole case
+saved, and continues with the engineer's decision. **Learn** stores every outcome as
+an incident in Neo4j, so the next occurrence is found by the Deterministic Lookup,
+and promotes proven fixes into `ref_canonical_mappings`, so Silver 2 maps the value
+itself from then on. Each step was built by its own task:
 
 | Node | File | Built in | Behaviour today |
 |---|---|---|---|
@@ -27,7 +28,7 @@ into `ref_canonical_mappings`. Each stub is replaced by its own task:
 | `validate` | `nodes/validate.py` | Task 105 | real: replays the staged records through Silver 2, checks them, releases them |
 | `escalate` | `nodes/escalate.py` | Task 106 | real: opens a case for an engineer with the full context |
 | `engineer_review` | `nodes/engineer_review.py` | Task 106 | real: waits for the engineer's decision and acts on it |
-| `learn` | `nodes/learn.py` | Task 107 | stub: writes nothing to Neo4j |
+| `learn` | `nodes/learn.py` | Task 107 | real: stores the incident in Neo4j, promotes proven variants |
 
 ## The graph (`graph.py`)
 
@@ -78,9 +79,9 @@ its own keys:
 | `validate` | `validation` = `{status: PASSED or FAILED, passed, reasons, checks, execution_id, target_table, column, canonical_value, rows_staged, rows_valid, rows_remaining, rows_released, rows_already_released, crash_date, quarantine_version, validated_at}` |
 | `escalate` | `escalation` = `{status: WAITING, escalation_id, round, reason, details, case, escalated_at, decision: None, history}`, `status` = `ESCALATED` |
 | `engineer_review` | `escalation` with `status: DECIDED` and `decision`, `status`, and for `APPLY_FIX` the engineer's `action` (`source: ENGINEER`) |
-| `learn` | `learned`, `status` |
+| `learn` | `learned` = `{status: STORED or SKIPPED, written, incident_id, outcome, resolved_by, verified, borrowed, embedded, embed_error, attempts, promotion, learned_at}`, `status` |
 | every node | one `trace` entry, so the path can be read back |
-| a stub | its name in `stubbed`. Delete that line when you build the step |
+| a stub | its name in `stubbed` (no step is a stub any more; tests still use the mechanism) |
 | the graph | `error` = `{node, error, attempts}` when a step kept raising |
 
 `action` (`{action, action_params, source, incident_id}`) is the only thing Remediate
@@ -172,7 +173,9 @@ approval before it runs (escalation reason `APPROVAL_REQUIRED`; `approve` runs i
 through Remediate and Validate). Thay chose this on 2026-11-14: P1 has the widest
 impact and Validate cannot tell a wrong value outside month and weekday. The tiers
 are `APPROVE_BORROWED_FIX_TIERS` (default `P1`, `NONE` or `ALL`). Once approved and
-learned, the same value in that table is an exact match and is not asked again. It is still checked against the failure
+learned, the same value is an exact match and is not asked again. A borrowed fix that
+ran without approval (P2/P3) is learned as `borrowed`, so an exact match on it is still
+asked on P1 (see Learn). It is still checked against the failure
 with the gate's own `parameters` check (`actions.check_params`) before it becomes
 `action`, so a fix whose canonical value has since left `ref_canonical_mappings`, or
 that does not fit this failure, is sent to Diagnose instead of to Remediate.
@@ -382,9 +385,10 @@ released are counted in `rows_already_released`, not written again.
 What it does not do (later tasks):
 
 - It does not promote `JULE -> JULY` into `ref_canonical_mappings`; that is Learn's
-  decision (Task 107). Until then a record that also failed another column can only
-  be released once both fixes are known together: when its other failure is fixed,
-  that failure's overlay does not carry this one, so the record stays quarantined.
+  decision. Until the variant is promoted a record that also failed another column
+  can only be released once both fixes are known together: when its other failure is
+  fixed, that failure's overlay does not carry this one, so the record stays
+  quarantined. Once it is promoted, the replay tool releases such records.
 - It does not write to Neo4j (Learn). A fix that does not hold goes to an engineer
   (Escalate).
 
@@ -445,8 +449,9 @@ docker compose exec recovery-agent python -m agent.review dismiss  <failure_id> 
 
 | Command | Decision | What the workflow does |
 |---|---|---|
-| `approve` | `APPLY_FIX` with the proposed fix | Remediate stages it, Validate replays, checks and releases it, Learn gets status `RESOLVED_BY_ENGINEER` |
+| `approve` | `APPLY_FIX` with the proposed fix | Remediate stages it, Validate replays, checks and releases it, Learn stores it with status `RESOLVED_BY_ENGINEER` and promotes the variant at once |
 | `fix VALUE` | `APPLY_FIX` `ADD_VARIANT` with the engineer's canonical value | same |
+| `approve` / `fix` with `--no-promote` | same, `promote: false` | the records are healed, the variant is **not** added to `ref_canonical_mappings` (and the agent never promotes it by recurrence either) |
 | `retry` | `RETRY` | runs the automated path again from `deterministic_lookup` (Ollama or a table was down) |
 | `resolved` | `RESOLVED_MANUALLY` | nothing is executed; Learn gets `RESOLVED_BY_ENGINEER` and the note |
 | `dismiss` | `DISMISS` | nothing is executed, the records stay quarantined; Learn gets `DISMISSED` and the note |
@@ -467,7 +472,7 @@ and resumes the workflow, and its log shows the result:
 
 ```
 [agent] decision APPLY_FIX by thay on 289b9d3430ea286e:1: decided
-[agent] 289b9d3430ea286e decided  P3 crash1:crash_month value='Jule' -> RESOLVED_BY_ENGINEER (... > escalate > engineer_review > remediate > validate > learn) [stubs: learn]
+[agent] 289b9d3430ea286e decided  P3 crash1:crash_month value='Jule' -> RESOLVED_BY_ENGINEER (... > escalate > engineer_review > remediate > validate > learn)
 ```
 
 A decision for a workflow that is not waiting, or for an older round, is refused and
@@ -476,10 +481,95 @@ while acting on it continues the workflow; delivered again after it finished, it
 duplicate. The agent creates both topics at start, so the first decision is not
 delayed by Kafka's metadata refresh.
 
-For Learn (Task 107): `escalation.decision` = `{decision, engineer, note,
-escalation_id, decided_at}` and, for `APPLY_FIX`, `action` / `action_params`. An
-`APPLY_FIX` that reached Learn passed Validate, so it is approved by an engineer and
-may be promoted at once (spec EL2).
+`escalation.decision` = `{decision, engineer, note, escalation_id, decided_at}` and,
+for `APPLY_FIX`, `action`, `action_params` and `promote`. An `APPLY_FIX` that reached
+Learn passed Validate, so it is approved by an engineer and Learn promotes it at once
+(spec EL2) unless `promote` is false. Each round in `escalation.history` keeps the
+`proposed_fix` it was about, so Learn can store a fix that failed Validate.
+
+## Learn (`nodes/learn.py`, `promotion.py`, spec EL2, EL3, KG2, TA3)
+
+The last step of every workflow that has an outcome, automated or human. Validate has
+already released the healed records; Learn keeps what was learned. Three parts:
+
+**1. The outcome, as an incident in Neo4j** (`agent/memory/incidents.py:
+write_incident`, schema in `lineage/schema.cypher`). One per workflow, with
+`incident_id = failure_id`, so writing it again updates it:
+
+| Workflow ended | outcome | action | resolved_by | verified | reused by the lookup |
+|---|---|---|---|---|---|
+| `RESOLVED`: a fix passed Validate without an engineer | `SUCCESS` | the fix | `LLM` (Diagnose) or `LOOKUP` (reused) | yes | yes |
+| `RESOLVED_BY_ENGINEER`: `approve` / `fix` that passed Validate | `SUCCESS` | the fix | `ENGINEER` | yes | yes |
+| `RESOLVED_BY_ENGINEER`: `resolved` (fixed by hand) | `SUCCESS` | `MANUAL` | `ENGINEER` | yes | no: shown as a past incident, the note says what was done |
+| `DISMISSED` | `DISMISSED` | `DISMISS` | `ENGINEER` | no | no: listed as a previous attempt |
+| `FAILED` (nobody decided) | nothing is stored | | | | |
+
+A fix that was staged and **failed Validate** in an earlier round is stored too, as
+`<failure_id>:attempt:<round>` with outcome `FAILED_VALIDATION` (unless the same fix
+held later). The lookup never reuses a fix that failed for the same signature.
+
+Each incident carries its provenance: `failure_id`, `execution_id`, `batch_ids`
+(`silver2_crash1:7`), `fix_source`, `matched_by` and `reused_incident_id` for a reused
+fix, `approved_by`, `engineer_note`, `escalation_reasons`, `priority_tier` and the
+promotion decision. It is embedded with the lookup's model and text
+(`incidents.signature_text`, `LOOKUP_EMBED_MODEL`, off by default); an unreachable model
+only leaves the vector out (`learned.embed_error`), the exact and structured lookups
+still find it.
+
+**Borrowed fixes stay borrowed** (Thay's rule of 2026-11-14 for P1). A fix the lookup
+reused from a similar incident, not an exact one, that no engineer approved (P2/P3 run
+it directly) is stored with `borrowed = true`. When a later failure matches that
+incident exactly, the lookup still reports it as borrowed (`match.borrowed`) and
+`deterministic_lookup` asks for approval on P1 as for any borrowed fix, so reusing a
+borrowed fix never turns it into an exact one. `find_exact` prefers a fix that is not
+borrowed. Once an engineer approves it, the incident is not borrowed.
+
+**2. Promotion into `ref_canonical_mappings`** (`promotion.py`, EL2). The variant
+(column, RAW value, canonical value) is the overlay Validate checked. It is added:
+
+- **at once** when an engineer's fix passed Validate (`approve`, `fix`, including an
+  approved borrowed fix). `--no-promote` heals the records only.
+- **when it recurs**: the same fix of the same value, made by the agent, has healed at
+  least `PROMOTE_MIN_OCCURRENCES` rows (default 5) in at least `PROMOTE_MIN_BATCHES`
+  distinct micro-batches (default 3), each validated (Thay, 2026-11-14). Batches are
+  counted per source table (`silver2_crash1:7` and `silver2_crash3:7` are two).
+  Borrowed fixes nobody approved do not count. `NEVER` in either setting leaves
+  promotion to engineers.
+
+And **never** when the value is ambiguous: another verified incident fixed the same
+signature to a different value (`Ju` was JUNE in one batch and JULY in another), the
+same fix failed Validate before, the table already maps the raw value to something
+else, or an engineer declined promoting this fix. Only `ADD_VARIANT` is promoted.
+
+The write is a Delta MERGE on `(field_name, raw_synonym)` that only inserts (the same
+key as the Silver 2 job's own fuzzy promotion), done with `deltalake`, without Spark:
+`added_by = recovery_agent:engineer:<name>` or `recovery_agent:recurrence`,
+`source_batch_id = recovery_agent:<incident_id>`, `confidence = 1.0`. Silver 2 reloads
+the table every micro-batch, so the next occurrence of the value is standardized there
+and never reaches quarantine. The decision is in `learned.promotion` = `{status:
+PROMOTED | ALREADY_IN_TABLE | BELOW_THRESHOLD | BLOCKED | DECLINED | NOT_APPLICABLE,
+route: ENGINEER_APPROVED | RECURRENCE, reasons, occurrences, batches, needed, inserted}`
+and on the incident (`promotion`, `promotion_reason`, `promoted`).
+
+Learn does not release quarantined records. Records that were still waiting for the
+promoted value, e.g. a record that also failed another column and stayed `PENDING`
+after Validate, are released by re-running them against the updated table with the
+replay tool (Task 108, `tools/replay.py quarantine`).
+
+**3. When Neo4j or the table is down**, Learn raises; the graph retries it and then
+ends the workflow `FAILED` with `error.node = learn`. Everything Learn writes is
+idempotent, and when the failure is delivered again the consumer runs Learn alone
+again (**relearn**, below).
+
+Look at what was stored in the Neo4j browser (http://localhost:7474):
+
+```cypher
+MATCH (i:Incident)-[:AFFECTS]->(t:Table)
+RETURN i.signature_key, i.outcome, i.action, i.action_params, i.resolved_by, i.borrowed,
+       i.promotion, i.batch_ids, t.name ORDER BY i.resolved_at DESC LIMIT 25
+```
+
+and what was promoted: `added_by` starting with `recovery_agent:` in `ref_canonical_mappings`.
 
 ## How state is kept (`consumer.py`)
 
@@ -502,15 +592,20 @@ The Kafka offset is committed after the whole stack was handled. While a stack i
 being worked the agent pauses the partition and polls Kafka after every workflow,
 so a long stack does not get it dropped from the consumer group.
 
-### Failures seen while steps are still stubs
+- **relearn**: the workflow ended and only Learn is missing: Learn kept raising
+  (Neo4j or the reference table was down; the status is `FAILED` with
+  `error.node = learn`), or it ended on the Learn stub before Task 107. Learn alone
+  runs again, from the checkpoint saved just before it, so no fix, model call or
+  engineer's case is repeated. The status becomes the real one again.
 
-A failure that went through a stub (today only Learn) ended without its outcome
-being stored. It is not lost for good: because of **rerun** it is handled properly
-the next time it is published. Failures handled before Task 106 ended `ESCALATED`
-with nobody asked; republished, they now open a case. Until Learn is built this also holds for a case
-an engineer closed: its workflow ends on the Learn stub, so if the failure is
-published again (scanner reset) it is run again and asks the engineer again. After a
-step is built, publish the open failures again by resetting the scanner:
+### Failures seen while steps were still stubs
+
+A failure that went through a stub ended without its outcome being stored. It is not
+lost for good: the next time it is published it is handled properly. A workflow that
+only missed Learn (every workflow finished between Task 106 and Task 107, including
+cases an engineer already closed) is **relearned**: only Learn runs, nobody is asked
+again. One that went through an earlier stub is **rerun** from the start. To publish
+the failures again, reset the scanner:
 
 ```bash
 docker compose rm -sf lookup-scanner
@@ -527,13 +622,13 @@ docker compose logs -f recovery-agent
 
 ```
 [agent] lookup 66b035e5-...: 2 failure(s)
-[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> RESOLVED (deterministic_lookup > diagnose > policy_gate > remediate > validate > learn) [stubs: learn]
+[agent] fd95d1c4c9991007 new       P3 crash1:crash_month value='Jule' -> RESOLVED (deterministic_lookup > diagnose > policy_gate > remediate > validate > learn)
 [agent] 289b9d3430ea286e new       P3 crash1:weather_condition value='MISTY DARK' -> ESCALATED POLICY_GATE_REJECTED, waiting for an engineer: python -m agent.review show 289b9d3430ea286e (deterministic_lookup > diagnose > policy_gate > escalate)
 ```
 
-The first failure passed the gate, was staged by `remediate`, held in `validate`
-and its records were released into Silver 2; the second was stopped by the gate
-and waits for an engineer (`python -m agent.review`).
+The first failure passed the gate, was staged by `remediate`, held in `validate`,
+its records were released into Silver 2 and `learn` stored it as an incident; the
+second was stopped by the gate and waits for an engineer (`python -m agent.review`).
 A path that ends `remediate > escalate` is a failed execution, `validate > escalate`
 a fix that did not hold. The first validation waits about 10 s for Spark to start. Diagnose needs Ollama with the model
 pulled (`ollama pull qwen3:8b`); without it both lines end at `policy_gate > escalate`.
@@ -546,7 +641,9 @@ docker compose exec recovery-agent python -m agent.show fd95d1c4c9991007
 
 Settings (`config.py`): `LOOKUP_OUTPUT_TOPIC`, `AGENT_DECISIONS_TOPIC`, `AGENT_CONSUMER_GROUP`,
 `AGENT_CHECKPOINT_PATH`, `AGENT_MAX_POLL_INTERVAL_MS`, `AGENT_NODE_MAX_ATTEMPTS`,
-`AGENT_NODE_RETRY_SECONDS`, `APPROVE_BORROWED_FIX_TIERS` (`P1`), and for Diagnose and the gate:
+`AGENT_NODE_RETRY_SECONDS`, `APPROVE_BORROWED_FIX_TIERS` (`P1`), Learn's (see the Learn
+section: `PROMOTE_MIN_OCCURRENCES`, `PROMOTE_MIN_BATCHES`, `NEO4J_*`, `LOOKUP_EMBED_MODEL`),
+and for Diagnose and the gate:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -568,8 +665,8 @@ size are `DIAGNOSE_NUM_CTX` (8192) and `DIAGNOSE_NUM_PREDICT` (1024).
 
 `REMEDIATION_AUDIT_PATH` (`/data/delta/remediation_audit`) is the audit table.
 Compose mounts `./delta` writable: the agent writes the audit table, the healed rows
-of `silver2_<source>` and the status of their quarantine rows, and only reads the
-rest. Validate's settings: `DELTA_ROOT` (where `silver2_<source>` is),
+of `silver2_<source>`, the status of their quarantine rows and the promoted variants
+of `ref_canonical_mappings`, and only reads the rest. Validate's settings: `DELTA_ROOT` (where `silver2_<source>` is),
 `DAY_FIRST_SOURCES` (must match the Silver 2 job, Compose passes the same default),
 `VALIDATE_SPARK_DRIVER_MEMORY` (`512m`) and `VALIDATE_SPARK_MASTER` (`local[2]`).
 The Spark session adds roughly 1 to 1.5 GB to the agent's memory once it has started.
@@ -578,12 +675,14 @@ To start from empty state, remove the volume:
 `docker compose rm -sf recovery-agent && docker volume rm self-healing-pipeline_agent-state`.
 The audit table is kept, so a failure that comes back is still not executed twice.
 
-The agent's memory is in two places: the workflows in the `agent-state` volume and
-the executions in `delta/remediation_audit`. When you reset the pipeline by deleting
-`delta/` and `checkpoints/`, the audit table goes with it, so remove the
-`agent-state` volume in the same step (command above). Otherwise the reprocessed
-data produces the same failure ids and the agent skips them as workflows it has
-already finished.
+The agent's memory is in three places: the workflows in the `agent-state` volume, the
+executions in `delta/remediation_audit` and the incidents in Neo4j (`neo4j-data`).
+When you reset the pipeline by deleting `delta/` and `checkpoints/`, the audit table
+and the promoted variants go with it, so remove the `agent-state` volume in the same
+step (command above). Otherwise the reprocessed data produces the same failure ids
+and the agent skips them as workflows it has already finished. The incidents survive
+in Neo4j: past fixes are still reused, and the promotion counts carry on. To forget
+them too: `docker compose exec neo4j cypher-shell -u neo4j -p selfhealing "MATCH (i:Incident) DETACH DELETE i"`.
 
 ## Tests
 
@@ -600,3 +699,14 @@ builds real tables with the pipeline's own Bronze, Silver 1 and Silver 2 jobs fr
 rows of `data/` (`tests/spark_tables.py`), stages them with the real Remediate and
 validates and releases them with real Spark. It needs Java and downloads the Delta
 jars once (about 2 minutes); without Java it is skipped.
+It also promotes an engineer's fix into the Spark-written `ref_canonical_mappings`
+with Learn and reads it back with the Silver 2 job's own loader.
+
+Neo4j is an in-memory fake (`helpers.FakeMemory`, the `memory` fixture) except in
+`test_incidents_neo4j.py`, which runs the real Cypher of Learn and the lookup against
+a Neo4j you start, and is skipped otherwise:
+
+```bash
+docker run -d --name neo4j-test -p 7687:7687 -e NEO4J_AUTH=neo4j/selfhealing neo4j:5.26-community
+NEO4J_TEST_URI=bolt://localhost:7687 python -m pytest agent/tests/test_incidents_neo4j.py
+```

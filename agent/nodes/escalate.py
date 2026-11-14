@@ -35,8 +35,10 @@ def escalate(state: RecoveryState) -> dict:
     previous = state.get("escalation") or {}
     history = list(previous.get("history") or [])
     if previous.get("escalation_id"):
-        history.append({k: previous.get(k) for k in ("escalation_id", "round", "reason", "details",
-                                                     "escalated_at", "decision")})
+        history.append({**{k: previous.get(k) for k in ("escalation_id", "round", "reason", "details",
+                                                        "escalated_at", "decision")},
+                        # the fix that round was about: Learn stores a fix that failed Validate
+                        "proposed_fix": (previous.get("case") or {}).get("proposed_fix")})
     round_ = int(previous.get("round") or 0) + 1
     reason, details = esc.escalation_reason(state)
     case = esc.build_case(state, reason, details, round_)

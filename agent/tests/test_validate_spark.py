@@ -181,3 +181,34 @@ def test_release_is_tagged_with_the_execution(tables):
     validate(state)
     app_id = release_app_id(state["execution"]["execution_id"])
     assert DeltaTable(str(delta / "silver2_crash1")).transaction_version(app_id) == 0
+
+
+# --- Task 107: Learn promotes into the Spark-written reference table -------------------
+@pytest.mark.real_io
+def test_an_engineers_fix_is_promoted_into_the_table_silver2_reads(tables, memory):
+    """deltalake MERGEs into the table Spark created; the Silver 2 job's own loader sees it."""
+    import importlib
+
+    from ref_mappings import load_mappings_dict
+
+    learn = importlib.import_module("agent.nodes.learn").learn
+    delta, session = tables
+    state = staged()
+    state["action"].update(source="ENGINEER", approved_by="thay")
+    state["escalation"] = {"status": "DECIDED", "escalation_id": "f-crash1:1", "round": 1, "reason": "POLICY_GATE_REJECTED",
+                           "decision": {"decision": "APPLY_FIX", "engineer": "thay", "promote": True}, "history": []}
+    state["status"] = "RESOLVED_BY_ENGINEER"
+    state.update(validate(state))
+    assert state["validation"]["passed"] is True, state["validation"]["reasons"]
+
+    learned = learn(state)["learned"]
+    again = learn(state)["learned"]
+
+    assert learned["promotion"]["status"] == "PROMOTED" and learned["promotion"]["inserted"] is True
+    assert again["promotion"]["status"] == "ALREADY_IN_TABLE"
+    ref = str(delta / "ref_canonical_mappings")
+    assert load_mappings_dict(session, ref)["crash_month"]["JULE"] == "JULY"
+    rows = session.read.format("delta").load(ref).where("raw_synonym = 'JULE'").collect()
+    assert len(rows) == 1
+    assert rows[0]["added_by"] == "recovery_agent:engineer:thay" and rows[0]["source_batch_id"] == "recovery_agent:f-crash1"
+    assert rows[0]["field_name"] == "crash_month" and rows[0]["confidence"] == 1.0 and rows[0]["added_at"] is not None

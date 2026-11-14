@@ -2,8 +2,8 @@
 
   docker compose exec recovery-agent python -m agent.review                      # open cases
   docker compose exec recovery-agent python -m agent.review show <failure_id>    # one case
-  docker compose exec recovery-agent python -m agent.review approve  <failure_id> --by NAME [--note ...]
-  docker compose exec recovery-agent python -m agent.review fix      <failure_id> <CANONICAL_VALUE> --by NAME [--note ...]
+  docker compose exec recovery-agent python -m agent.review approve  <failure_id> --by NAME [--note ...] [--no-promote]
+  docker compose exec recovery-agent python -m agent.review fix      <failure_id> <CANONICAL_VALUE> --by NAME [--note ...] [--no-promote]
   docker compose exec recovery-agent python -m agent.review retry    <failure_id> --by NAME [--note ...]
   docker compose exec recovery-agent python -m agent.review resolved <failure_id> --by NAME --note "what you did"
   docker compose exec recovery-agent python -m agent.review dismiss  <failure_id> --by NAME --note "why"
@@ -141,7 +141,7 @@ def render_case(state: dict) -> str:
 # Deciding
 # ----------------------------------------------------------------------------
 def build_decision(state: dict, command: str, engineer: str, note: Optional[str],
-                   value: Optional[str] = None) -> dict:
+                   value: Optional[str] = None, promote: bool = True) -> dict:
     escalation = state.get("escalation") or {}
     case = escalation.get("case") or {}
     kind = {"approve": esc.APPLY_FIX, "fix": esc.APPLY_FIX, "retry": esc.RETRY,
@@ -155,7 +155,7 @@ def build_decision(state: dict, command: str, engineer: str, note: Optional[str]
     elif command == "fix":
         action, params = "ADD_VARIANT", {"canonical_value": (value or "").strip().upper()}
     return esc.make_decision(state["failure_id"], escalation.get("escalation_id"), kind, engineer, note,
-                             action, params)
+                             action, params, promote=promote)
 
 
 def publish(message: dict) -> None:
@@ -186,6 +186,9 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
             cmd.add_argument("value", help="a canonical value of the column")
         cmd.add_argument("--by", default=os.environ.get("ENGINEER_NAME"), help="your name (or ENGINEER_NAME)")
         cmd.add_argument("--note", help="required for resolved and dismiss")
+        if name in ("approve", "fix"):
+            cmd.add_argument("--no-promote", dest="promote", action="store_false",
+                             help="heal these records only; do not add the variant to ref_canonical_mappings")
     args = parser.parse_args(argv)
     graph = graph or open_graph()
 
@@ -204,13 +207,15 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
     if not (args.by or "").strip():
         sys.exit("Say who decides: --by NAME (or set ENGINEER_NAME)")
     state = waiting_state(graph, args.failure_id)
-    message = build_decision(state, args.command, args.by.strip(), args.note, getattr(args, "value", None))
+    message = build_decision(state, args.command, args.by.strip(), args.note, getattr(args, "value", None),
+                             promote=getattr(args, "promote", True))
     _, problems = esc.check_decision(state, message)
     if problems:
         sys.exit("Not sent:\n" + "\n".join(f"  - {p}" for p in problems))
     send(message)
     print(f"Sent {message['decision']} on {message['escalation_id']} by {message['engineer']}"
           + (f": {esc.fix_text(message)}" if message["decision"] == esc.APPLY_FIX else "")
+          + (" (not promoted)" if message.get("promote") is False else "")
           + ". The agent applies it; follow it with `docker compose logs -f recovery-agent`.")
 
 

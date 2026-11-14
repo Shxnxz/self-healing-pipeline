@@ -260,7 +260,9 @@ services:
   # gate decides whether its proposal may run, Remediate stages the fix and writes the
   # audit record, and Validate replays the staged records through Silver 2's own code
   # (a small local Spark session) and releases the ones that pass into Silver 2.
-  # Escalate and Learn are still stubs. See agent/README.md.
+  # Escalate hands everything else to an engineer (python -m agent.review), and
+  # Learn stores every outcome as an incident in Neo4j and promotes proven fixes into
+  # ref_canonical_mappings. See agent/README.md.
   recovery-agent:
     build:
       context: .
@@ -269,9 +271,10 @@ services:
     restart: on-failure
     volumes:
       - agent-state:/state
-      # The pipeline's tables. The agent writes three kinds: delta/remediation_audit
+      # The pipeline's tables. The agent writes four kinds: delta/remediation_audit
       # (Remediate), the healed rows appended to silver2_<source> and their quarantine
-      # rows marked RESOLVED (Validate). Everything else it only reads.
+      # rows marked RESOLVED (Validate), and promoted variants added to
+      # ref_canonical_mappings (Learn). Everything else it only reads.
       - ./delta:/data/delta
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
@@ -294,9 +297,21 @@ services:
       POLICY_SAFE_ACTIONS: ${POLICY_SAFE_ACTIONS:-}
       # A fix borrowed from a similar (not exact) past incident waits for an engineer on these tiers.
       APPROVE_BORROWED_FIX_TIERS: ${APPROVE_BORROWED_FIX_TIERS:-P1}
+      # Learn: incidents go to Neo4j, embedded with the same model as the lookup's.
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-selfhealing}
+      LOOKUP_EMBED_MODEL: ${LOOKUP_EMBED_MODEL:-}
+      LOOKUP_EMBED_BASE_URL: ${LOOKUP_EMBED_BASE_URL:-http://host.docker.internal:11434}
+      # An automatic fix joins ref_canonical_mappings once it healed this many rows in this
+      # many micro-batches (an engineer's fix at once). NEVER = engineers' fixes only.
+      PROMOTE_MIN_OCCURRENCES: ${PROMOTE_MIN_OCCURRENCES:-5}
+      PROMOTE_MIN_BATCHES: ${PROMOTE_MIN_BATCHES:-3}
     depends_on:
       kafka:
         condition: service_healthy
+      neo4j-init:
+        condition: service_completed_successfully
 
 volumes:
   ivy-cache:

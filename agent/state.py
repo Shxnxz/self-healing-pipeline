@@ -19,7 +19,9 @@ Who writes what. Each node returns only its own keys:
   engineer_review       escalation  {..., status DECIDED, decision}, status, and for
                                     APPLY_FIX / RETRY: action and the keys the automated
                                     steps write again (cleared)
-  learn                 learned     {written, ...}, status
+  learn                 learned     {status STORED|SKIPPED, written, incident_id, outcome,
+                                     resolved_by, verified, borrowed, embedded, attempts,
+                                     promotion, learned_at}, status
   a stub                stubbed     its own name, until the step is built
   the graph             error       {node, error, attempts} when a step kept raising
 

@@ -76,7 +76,8 @@ POLICY_SAFE_ACTIONS = None if not _safe else ([] if "NONE" in _safe else _safe)
 # A past fix the lookup reused from a SIMILAR incident (matched_by STRUCTURED or
 # EMBEDDING, not EXACT) waits for an engineer's approval before it runs when the
 # failure is in one of these priority tiers (Thay, 2026-11-14: P1). After the
-# approval Learn stores the incident for this table, so the next one is EXACT.
+# approval Learn stores the incident, so the next one is EXACT. A borrowed fix that
+# ran without approval (another tier) is stored as `borrowed` and still asks on P1.
 # NONE = never ask; ALL = ask on every tier.
 _tiers = [t.strip().upper() for t in os.environ.get("APPROVE_BORROWED_FIX_TIERS", "P1").split(",") if t.strip()]
 APPROVE_BORROWED_FIX_TIERS = frozenset() if "NONE" in _tiers else (
@@ -96,3 +97,35 @@ SPARK_JOBS_DIR = os.environ.get(
 DELTA_ROOT = os.environ.get("DELTA_ROOT", "/data/delta").rstrip("/")
 VALIDATE_SPARK_MASTER = os.environ.get("VALIDATE_SPARK_MASTER", "local[2]")
 VALIDATE_SPARK_DRIVER_MEMORY = os.environ.get("VALIDATE_SPARK_DRIVER_MEMORY", "512m")
+
+# --- Learn (spec EL2, EL3, KG2, TA3) -----------------------------------------------
+# Incidents go to Neo4j through agent/memory/incidents.py, which reads NEO4J_URI,
+# NEO4J_USER and NEO4J_PASSWORD. Learn embeds an incident with the same model and
+# text as the Deterministic Lookup embeds a new failure, so the variables are shared
+# with the lookup service. Empty = no vector (exact and structured matching only).
+EMBED_MODEL = os.environ.get("LOOKUP_EMBED_MODEL", "")
+EMBED_BASE_URL = os.environ.get("LOOKUP_EMBED_BASE_URL", "http://host.docker.internal:11434")
+EMBED_TIMEOUT_SECONDS = float(os.environ.get("LOOKUP_EMBED_TIMEOUT_SECONDS", 30))
+
+
+def _count(name: str, default: int) -> int:
+    """A promotion threshold: a whole number of at least 1, or NEVER."""
+    raw = os.environ.get(name, "").strip()
+    if raw.upper() == "NEVER":
+        return 0
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not a whole number or NEVER") from None
+    if value < 1:
+        raise ValueError(f"{name}={value} must be at least 1 (or NEVER)")
+    return value
+
+
+# Promotion into ref_canonical_mappings (agent/promotion.py). A fix an engineer
+# approved is promoted at once; a fix the agent made on its own only once the same
+# fix of the same value has healed PROMOTE_MIN_OCCURRENCES rows in
+# PROMOTE_MIN_BATCHES distinct Silver 2 micro-batches, each validated. NEVER in
+# either = only engineers' fixes are promoted. 0 below means NEVER.
+PROMOTE_MIN_OCCURRENCES = _count("PROMOTE_MIN_OCCURRENCES", 5)
+PROMOTE_MIN_BATCHES = _count("PROMOTE_MIN_BATCHES", 3)

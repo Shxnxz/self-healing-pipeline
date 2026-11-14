@@ -16,6 +16,10 @@ behaviours for a stack item:
   rerun      saved state that ended on a stub step: nothing was really done, so
              forget it and run again. A failure handled before a step was built is
              therefore picked up when it is published again afterwards.
+  relearn    saved state whose only missing piece is Learn: Learn kept raising (Neo4j
+             or the reference table down) or was still the stub. Learn alone runs again
+             from the checkpoint before it, so nothing else (no fix, no model call, no
+             engineer's case) is repeated.
 
 The offset is committed only after every item of the message was handled. A step
 that raises does not stop the agent (agent/graph.py: guarded). If the agent itself
@@ -32,16 +36,36 @@ from agent.graph import build_graph, open_checkpointer
 from agent.state import initial_state
 
 NEW, RESUMED, DUPLICATE, RERUN, MALFORMED = "new", "resumed", "duplicate", "rerun", "malformed"
+RELEARN = "relearn"
 WAITING = "waiting"
 # What happened to a decision from recovery.decisions.
 DECIDED, REFUSED, UNKNOWN = "decided", "refused", "unknown"
 
 REVIEW_NODE = "engineer_review"
+LEARN_NODE = "learn"
 
 
 def is_waiting(saved) -> bool:
     """The workflow is paused for an engineer's decision."""
     return bool(saved.values) and tuple(saved.next) == (REVIEW_NODE,) and bool(saved.interrupts)
+
+
+def needs_learn(saved) -> bool:
+    """The workflow ended, and Learn is the only step that did not really run: it kept
+    raising, or it was the stub (workflows finished before Task 107)."""
+    values = saved.values or {}
+    if not values or saved.next:
+        return False
+    stubbed = set(values.get("stubbed") or [])
+    return stubbed == {LEARN_NODE} or (not stubbed and (values.get("error") or {}).get("node") == LEARN_NODE)
+
+
+def before_learn(graph, thread: dict):
+    """The newest checkpoint of the thread that is about to run Learn, or None."""
+    for snapshot in graph.get_state_history(thread):
+        if tuple(snapshot.next) == (LEARN_NODE,):
+            return snapshot
+    return None
 
 
 def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
@@ -58,6 +82,11 @@ def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
         return {"delivery": WAITING, "failure_id": failure_id, "state": saved.values}
     if saved.values and saved.next:
         return {"delivery": RESUMED, "failure_id": failure_id, "state": graph.invoke(None, thread)}
+    if needs_learn(saved):
+        snapshot = before_learn(graph, thread)
+        if snapshot is not None and not set(snapshot.values.get("stubbed") or []):
+            # Replays from that checkpoint: only Learn runs, on the state it had then.
+            return {"delivery": RELEARN, "failure_id": failure_id, "state": graph.invoke(None, snapshot.config)}
     if saved.values and not saved.values.get("stubbed"):
         return {"delivery": DUPLICATE, "failure_id": failure_id, "state": saved.values}
     if saved.values:

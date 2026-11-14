@@ -142,6 +142,8 @@ def similarity(failure: StructuredFailure, table: Optional[str], incident: dict)
 
 
 def transferable(failure: StructuredFailure, incident: dict, components: Dict, exact: bool) -> Tuple[bool, str]:
+    if incident.get("action") in (incidents.MANUAL, incidents.DISMISS):
+        return False, "fixed by hand by an engineer; nothing to repeat, needs diagnosis"
     if exact:
         return True, "exact signature match"
     if failure.family == "VALUE":
@@ -177,9 +179,8 @@ ORDER BY i.resolved_at DESC LIMIT 10
 
 
 def signature_text(failure: StructuredFailure, table: Optional[str]) -> str:
-    """Text to embed. The Learn node must embed incidents with the same format and model."""
-    return (f"table={table or ''} column={(failure.column_name or '').strip()} "
-            f"value={(failure.signature_value or '').strip().upper()} failure={failure.failure_type}")
+    """Text to embed. The Learn node embeds incidents with the same function and model."""
+    return incidents.signature_text(table, failure.column_name, failure.signature_value, failure.failure_type)
 
 
 def _params(raw):
@@ -257,6 +258,9 @@ def evaluate(failure: StructuredFailure, table: Optional[str], exact: Optional[d
             "action": inc.get("action"),
             "action_params": params,
             "resolved_by": inc.get("resolved_by"),
+            # The past fix was itself borrowed from a similar incident and nobody approved
+            # it: the agent treats it as borrowed, not exact (APPROVE_BORROWED_FIX_TIERS).
+            "borrowed": bool(inc.get("borrowed")),
         })
 
     best = ranked[0] if ranked else None

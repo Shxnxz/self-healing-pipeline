@@ -74,6 +74,14 @@ def learn_ok(state):
             "status": state.get("status") or "RESOLVED", "trace": trace("learn")}
 
 
+def stub(name, **keys):
+    """A step as it was before it was built: does nothing (beyond `keys`) and says so in
+    `stubbed`. stub("validate", validation={"passed": True}) lets the workflow go on."""
+    def node(state):
+        return {**keys, "stubbed": [name], "trace": trace(name)}
+    return node
+
+
 def escalate_ok(state):
     return {"escalation": {"status": "PENDING_REVIEW", "reason": "asked"}, "status": "ESCALATED",
             "trace": trace("escalate")}
@@ -199,3 +207,72 @@ def fixed_row(record_id, column="crash_month", value="JULY", crash_date=None, be
 def fixed_replay(target_table, record_ids, column, overlay):
     """agent.replay.replay_group in tests: every staged record comes back fixed."""
     return FakeReplay(target_table, record_ids, column, overlay)
+
+
+# --- Task 107: incident memory (Neo4j) and the reference table, in memory --------------
+class FakeMemory:
+    """Stands in for Neo4j (agent/memory/incidents.py) and for the promotion's reads and
+    writes of ref_canonical_mappings (agent/promotion.py). Same signatures, no I/O."""
+
+    def __init__(self, mappings=None):
+        self.incidents = {}      # incident_id -> stored properties
+        self.mappings = dict(mappings or {})   # (column, RAW) -> canonical value
+        self.promoted = []       # rows promote() inserted
+        self.writes = 0
+        self.down = False        # True: every call raises, like Neo4j being unreachable
+
+    def _check(self):
+        if self.down:
+            raise ConnectionError("Neo4j is down")
+
+    # agent.memory.incidents
+    def shared_driver(self):
+        self._check()
+        return self
+
+    def write_incident(self, driver, *, incident_id, table_name, column_name, raw_value, failure_type, diagnosis,
+                       action, action_params, outcome, resolved_by, confidence, verified, rows_affected,
+                       embedding, signature_text, extra=None):
+        from agent.memory.incidents import signature_key
+
+        self._check()
+        self.writes += 1
+        stored = dict(self.incidents.get(incident_id) or {})
+        stored.update(incident_id=incident_id, signature_key=signature_key(table_name, column_name, raw_value),
+                      signature_text=signature_text, table_name=table_name, column_name=column_name,
+                      raw_value=raw_value, failure_type=failure_type, diagnosis=diagnosis, action=action,
+                      action_params=dict(action_params), outcome=outcome, resolved_by=resolved_by,
+                      confidence=confidence, verified=verified, rows_affected=rows_affected,
+                      embedding=embedding)
+        for key, value in (extra or {}).items():
+            if value is None:
+                stored.pop(key, None)
+            else:
+                stored[key] = value
+        self.incidents[incident_id] = stored
+        return incident_id
+
+    def signature_history(self, driver, key):
+        self._check()
+        return [dict(i) for i in self.incidents.values() if i["signature_key"] == key]
+
+    def mark_promotion(self, driver, incident_id, promotion, reason):
+        self._check()
+        stored = self.incidents[incident_id]
+        stored.update(promotion=promotion, promotion_reason=reason,
+                      promoted=promotion == "PROMOTED" or stored.get("promoted", False))
+
+    # agent.promotion
+    def current_mapping(self, column, raw, path=None):
+        self._check()
+        return self.mappings.get((column, raw.strip().upper()))
+
+    def promote(self, column, raw, canonical, added_by, source, path=None):
+        self._check()
+        key = (column, raw.strip().upper())
+        if key in self.mappings:
+            return False
+        self.mappings[key] = canonical
+        self.promoted.append({"column": column, "raw": key[1], "canonical": canonical,
+                              "added_by": added_by, "source": source})
+        return True

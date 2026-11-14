@@ -15,8 +15,9 @@ The engineer's decisions:
 
   APPLY_FIX          run this fix (the proposed one, or the engineer's own canonical
                      value) through Remediate and Validate like any other fix. If
-                     Validate passes the records are released and Learn may promote the
-                     variant at once (spec EL2: approved by an engineer). If not, the
+                     Validate passes the records are released and Learn promotes the
+                     variant at once (spec EL2: approved by an engineer) unless the
+                     decision says promote: false (`--no-promote`). If not, the
                      failure comes back to the engineer with the new reason.
   RETRY              run the automated path again from Deterministic Lookup, e.g. after
                      Ollama or a table was down (NO_DIAGNOSIS, STEP_FAILED)
@@ -201,12 +202,14 @@ def build_case(state: dict, reason: str, details: List[str], round_: int) -> dic
 # ----------------------------------------------------------------------------
 def make_decision(failure_id: str, escalation_id_: str, decision: str, engineer: str,
                   note: Optional[str] = None, action: Optional[str] = None,
-                  action_params: Optional[dict] = None) -> dict:
-    """A decision message, as the review CLI publishes it to Kafka recovery.decisions."""
+                  action_params: Optional[dict] = None, promote: bool = True) -> dict:
+    """A decision message, as the review CLI publishes it to Kafka recovery.decisions.
+    `promote` (APPLY_FIX only): False keeps Learn from adding the variant to
+    ref_canonical_mappings; the fix then heals these records only."""
     message = {"schema_version": "1.0", "failure_id": failure_id, "escalation_id": escalation_id_,
                "decision": decision, "engineer": engineer, "note": note, "decided_at": now()}
     if decision == APPLY_FIX:
-        message.update(action=action, action_params=action_params or {})
+        message.update(action=action, action_params=action_params or {}, promote=bool(promote))
     return message
 
 
@@ -241,7 +244,10 @@ def check_decision(state: dict, decision) -> Tuple[Optional[dict], List[str]]:
     if kind == APPLY_FIX:
         params, fix_problems = _check_fix(state, decision.get("action"), decision.get("action_params"))
         problems += fix_problems
-        clean.update(action=decision.get("action"), action_params=params)
+        if decision.get("promote") not in (None, True, False):
+            problems.append("promote must be true or false")
+        clean.update(action=decision.get("action"), action_params=params,
+                     promote=decision.get("promote") is not False)
     return (None, problems) if problems else (clean, [])
 
 
