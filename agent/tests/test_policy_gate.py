@@ -325,7 +325,7 @@ def test_a_model_that_asks_for_an_engineer_reaches_one_without_a_blocked_fix():
 def settings(monkeypatch, **env):
     """agent.config as it would load with these environment variables."""
     for name in ("POLICY_SAFE_ACTIONS", "POLICY_CONFIDENCE_THRESHOLD", "POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD",
-                 "DIAGNOSE_THINK"):
+                 "DIAGNOSE_THINK", "APPROVE_BORROWED_FIX_TIERS"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -389,3 +389,11 @@ def test_a_threshold_outside_the_range_stops_the_agent_at_start(monkeypatch, env
 def test_diagnose_think_setting(monkeypatch, value, expected):
     env = {} if value is None else {"DIAGNOSE_THINK": value}
     assert settings(monkeypatch, **env)["DIAGNOSE_THINK"] is expected
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, {"P1"}), ("p1, p2", {"P1", "P2"}), ("NONE", set()), ("all", {"P1", "P2", "P3"}),
+])
+def test_approval_tiers_for_borrowed_fixes(monkeypatch, value, expected):
+    env = {} if value is None else {"APPROVE_BORROWED_FIX_TIERS": value}
+    assert settings(monkeypatch, **env)["APPROVE_BORROWED_FIX_TIERS"] == expected

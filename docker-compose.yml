@@ -292,6 +292,8 @@ services:
       POLICY_CONFIDENCE_THRESHOLD: ${POLICY_CONFIDENCE_THRESHOLD:-0.85}
       POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD: ${POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD:-}
       POLICY_SAFE_ACTIONS: ${POLICY_SAFE_ACTIONS:-}
+      # A fix borrowed from a similar (not exact) past incident waits for an engineer on these tiers.
+      APPROVE_BORROWED_FIX_TIERS: ${APPROVE_BORROWED_FIX_TIERS:-P1}
     depends_on:
       kafka:
         condition: service_healthy

@@ -383,3 +383,56 @@ def test_review_lists_cases_from_the_sqlite_checkpoints(tmp_path):
     process_lookup(g, lookup_message(stack_item("f2", route="remediate", match=PAST_FIX)))
     assert review.thread_ids(checkpointer) and [s["failure_id"] for s in review.open_cases(g)] == ["f1", "f2"]
     checkpointer.conn.close()
+
+
+# --- a borrowed past fix on a P1 failure waits for approval (Thay, 2026-11-14) ---------
+BORROWED = {**PAST_FIX, "matched_by": "STRUCTURED", "score": 0.9}
+
+
+def p1(item):
+    item["priority"]["tier"] = "P1"
+    return item
+
+
+@pytest.mark.parametrize("matched_by", ["STRUCTURED", "EMBEDDING"])
+def test_borrowed_fix_on_a_p1_failure_waits_for_approval_then_runs(matched_by):
+    jule_quarantine(config.QUARANTINE_PATH, rows=10)
+    g = graph(learn=learn_ok)
+    state = escalated(g, p1(stack_item("f1", route="remediate", match={**BORROWED, "matched_by": matched_by})))
+    assert path(state) == ["deterministic_lookup", "escalate"] and "execution" not in state
+    escalation = state["escalation"]
+    assert escalation["reason"] == "APPROVAL_REQUIRED"
+    assert f"borrowed from a {matched_by.lower()} match (incident i1" in escalation["details"][0]
+    assert escalation["case"]["proposed_fix"] == {"action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"},
+                                                  "source": "INCIDENT", "incident_id": "i1"}
+
+    sent = []
+    review.main(["approve", "f1", "--by", "thay"], graph=g, send=sent.append)
+    out = g.invoke(Command(resume=sent[0]), thread())
+    assert path(out)[-4:] == ["engineer_review", "remediate", "validate", "learn"]
+    assert out["status"] == "RESOLVED_BY_ENGINEER" and out["validation"]["rows_released"] == 10
+    assert out["action"]["source"] == "ENGINEER" and out["action"]["incident_id"] == "i1"
+
+
+@pytest.mark.parametrize("tier, matched_by", [("P1", "EXACT"), ("P2", "STRUCTURED"), ("P3", "EMBEDDING")])
+def test_exact_matches_and_lower_tiers_still_reuse_the_fix_directly(tier, matched_by):
+    item = stack_item("f1", route="remediate", match={**BORROWED, "matched_by": matched_by})
+    item["priority"]["tier"] = tier
+    state = graph(remediate=remediate_ok, validate=validate_ok, learn=learn_ok).invoke(
+        initial_state("L1", item), thread())
+    assert path(state) == ["deterministic_lookup", "remediate", "validate", "learn"]
+    assert state["status"] == "RESOLVED"
+
+
+def test_the_approval_tiers_can_be_changed(monkeypatch):
+    monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset())
+    state = graph(remediate=remediate_ok, validate=validate_ok, learn=learn_ok).invoke(
+        initial_state("L1", p1(stack_item("f1", route="remediate", match=BORROWED))), thread())
+    assert state["status"] == "RESOLVED" and "escalation" not in state
+
+
+def test_a_borrowed_fix_that_no_longer_fits_is_diagnosed_not_sent_for_approval():
+    item = p1(stack_item("f1", route="remediate",
+                         match={**BORROWED, "action_params": {"canonical_value": "SMARCH"}}))
+    state = graph().invoke(initial_state("L1", item), thread())
+    assert state["route"] == "diagnose" and path(state)[:2] == ["deterministic_lookup", "diagnose"]

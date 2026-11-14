@@ -35,6 +35,7 @@ into `ref_canonical_mappings`. Each stub is replaced by its own task:
 flowchart TD
     S([recovery.lookup stack item]) --> L[deterministic_lookup]
     L -- verified past fix --> R[remediate]
+    L -- borrowed fix on P1 --> E
     L -- no reusable fix --> D[diagnose]
     D --> G[policy_gate]
     G -- confident and SAFE --> R
@@ -164,7 +165,14 @@ To make another action safe, change `actions.py` in a reviewed PR. The setting
 engineer); it cannot add to it.
 
 A past fix reused by the Deterministic Lookup does not pass the gate below: it was
-already validated or approved by an engineer. It is still checked against the failure
+already validated or approved by an engineer. **Except on a P1 failure:** a fix
+borrowed from a similar incident (`matched_by` `STRUCTURED` or `EMBEDDING`, not
+`EXACT`, e.g. `Jule` fixed in Crash1 and now seen in Crash3) waits for an engineer's
+approval before it runs (escalation reason `APPROVAL_REQUIRED`; `approve` runs it
+through Remediate and Validate). Thay chose this on 2026-11-14: P1 has the widest
+impact and Validate cannot tell a wrong value outside month and weekday. The tiers
+are `APPROVE_BORROWED_FIX_TIERS` (default `P1`, `NONE` or `ALL`). Once approved and
+learned, the same value in that table is an exact match and is not asked again. It is still checked against the failure
 with the gate's own `parameters` check (`actions.check_params`) before it becomes
 `action`, so a fix whose canonical value has since left `ref_canonical_mappings`, or
 that does not fit this failure, is sent to Diagnose instead of to Remediate.
@@ -538,7 +546,7 @@ docker compose exec recovery-agent python -m agent.show fd95d1c4c9991007
 
 Settings (`config.py`): `LOOKUP_OUTPUT_TOPIC`, `AGENT_DECISIONS_TOPIC`, `AGENT_CONSUMER_GROUP`,
 `AGENT_CHECKPOINT_PATH`, `AGENT_MAX_POLL_INTERVAL_MS`, `AGENT_NODE_MAX_ATTEMPTS`,
-`AGENT_NODE_RETRY_SECONDS`, and for Diagnose and the gate:
+`AGENT_NODE_RETRY_SECONDS`, `APPROVE_BORROWED_FIX_TIERS` (`P1`), and for Diagnose and the gate:
 
 | Setting | Default | Meaning |
 |---|---|---|
