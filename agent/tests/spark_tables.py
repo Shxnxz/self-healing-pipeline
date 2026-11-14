@@ -5,6 +5,7 @@ silver2_job run on them exactly as in Docker, so the quarantine, Silver 2 and
 ref_canonical_mappings are what the agent meets in production.
 
   crash1 (month first)  r1-ok-1..3  crash_month "Jule", crash_date in July  -> quarantined
+                                    (r1-ok-3 also has weather "Clqudy", fuzzy-corrected to CLOUDY)
                         r1-other    the same, and damage "$1489" too        -> quarantined, 2 failures
                         r1-clean    untouched                               -> Silver 2
   crash3 (day first)    r3-ok-1..2  crash_month "Jule", crash_date 04/07/2021 and 21/07/2021,
@@ -25,7 +26,8 @@ DATA = os.path.join(REPO, "data")
 CRASH1 = {
     "r1-ok-1": {"crash_month": "Jule", "crash_date": "07/04/2019", "crash_day_of_week": "Th"},
     "r1-ok-2": {"crash_month": "Jule", "crash_date": "07/21/2019", "crash_day_of_week": "Su"},
-    "r1-ok-3": {"crash_month": "jule", "crash_date": "07/30/2019", "crash_day_of_week": "Tu"},
+    "r1-ok-3": {"crash_month": "jule", "crash_date": "07/30/2019", "crash_day_of_week": "Tu",
+                "weather_condition": "Clqudy"},
     "r1-other": {"crash_month": "Jule", "crash_date": "07/05/2019", "damage": "$1489", "crash_day_of_week": "Fr"},
     "r1-clean": {},
 }

@@ -70,8 +70,8 @@ def test_the_fix_holds_and_the_fixed_records_are_released(tables):
     assert {c["name"]: c["passed"] for c in result["checks"]} == {
         "resolution": True, "no_conflicting_mapping": True, "rows_conserved": True,
         "targeted_resolved": True, "no_new_failures": True, "agrees_with_crash_date": True}
-    assert (result["rows_staged"], result["rows_valid"], result["rows_remaining"], result["rows_released"]) \
-        == (4, 3, 1, 3)
+    assert (result["rows_staged"], result["rows_valid"], result["rows_remaining"], result["rows_released"],
+            result["rows_marked_resolved"]) == (4, 3, 1, 3, 3)
     assert result["crash_date"]["verdict"] == "AGREES" and result["crash_date"]["confirming"] == 4
 
     silver2 = read(session, delta / "silver2_crash1")
@@ -97,15 +97,20 @@ def test_running_the_step_again_releases_nothing_twice(tables):
 
     again = validate(state)["validation"]
     assert again["passed"] is True, again["reasons"]
-    assert again["rows_released"] == 0 and again["rows_already_released"] == 3
+    assert again["rows_released"] == 0 and again["rows_marked_resolved"] == 0
+    assert again["rows_already_released"] == 3
     assert len(read(session, delta / "silver2_crash1")) == 4
 
     # The agent stopped after the Silver 2 append but before the quarantine update:
     session.sql(f"UPDATE delta.`{delta / 'silver2_quarantine'}` SET healing_status = 'PENDING', "
                 "resolved_by = NULL, resolved_at = NULL")
-    resumed = validate(state)["validation"]
+    out = validate(state)
+    resumed = out["validation"]
     assert resumed["passed"] is True, resumed["reasons"]
     assert len(read(session, delta / "silver2_crash1")) == 4          # Delta skipped the second append
+    # the counts say what this run wrote: nothing appended, three rows marked
+    assert resumed["rows_released"] == 0 and resumed["rows_marked_resolved"] == 3
+    assert "3 were already in silver2_crash1 from an earlier run" in out["trace"][0]["note"]
     quarantine = read(session, delta / "silver2_quarantine")
     assert [quarantine[r]["healing_status"] for r in ("r1-ok-1", "r1-ok-2", "r1-ok-3")] == ["RESOLVED"] * 3
 
@@ -181,3 +186,20 @@ def test_release_is_tagged_with_the_execution(tables):
     validate(state)
     app_id = release_app_id(state["execution"]["execution_id"])
     assert DeltaTable(str(delta / "silver2_crash1")).transaction_version(app_id) == 0
+
+
+def test_fuzzy_corrections_of_released_records_are_not_logged_twice(tables):
+    """The Silver 2 job logged r1-ok-3's Clqudy -> CLOUDY when it quarantined the record;
+    releasing it must not add a second entry (promote_fuzzy_variants counts rows)."""
+    delta, session = tables
+    audit_path = str(delta / "silver2_fuzzy_audit")
+
+    def entries():
+        return [(r["record_id"], r["field"], r["raw"], r["matched"])
+                for r in session.read.format("delta").load(audit_path).collect()]
+
+    assert entries() == [("r1-ok-3", "weather_condition", "CLQUDY", "CLOUDY")]
+    assert validate(staged())["validation"]["passed"] is True
+
+    assert entries() == [("r1-ok-3", "weather_condition", "CLQUDY", "CLOUDY")]
+    assert read(session, delta / "silver2_crash1")["r1-ok-3"]["weather_condition"] == "CLOUDY"
