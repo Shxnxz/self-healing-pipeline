@@ -475,6 +475,116 @@ def _dead_letter_batch(
     )
 
 
+def standardize_and_count(batch_df: DataFrame, mapping_dict, *, day_first: bool):
+    """TRANSFORM stage: standardize, persist and materialize the batch.
+
+    Returns (transformed, stats) with stats = (total, quarantined, fuzzy). Anything
+    that raises here is a data/schema problem of the batch (the caller dead-letters
+    it); `transformed` is unpersisted again when it does.
+    """
+    transformed = standardize_silver2(batch_df, mapping_dict, day_first=day_first).persist()
+    try:
+        row = transformed.agg(
+            F.count(F.lit(1)).alias("total"),
+            F.sum(F.when(F.size("columns_to_remediate") > 0, 1).otherwise(0)).alias("quarantined"),
+            F.sum(F.when(F.size("_fuzzy_audit_entries") > 0, 1).otherwise(0)).alias("fuzzy"),
+        ).first()
+    except Exception:
+        transformed.unpersist()
+        raise
+    stats = (int(row["total"] or 0), int(row["quarantined"] or 0), int(row["fuzzy"] or 0))
+    return transformed, stats
+
+
+def write_standardized(
+    transformed: DataFrame,
+    stats,
+    *,
+    silver2_path: str,
+    txn_app_id: Optional[str],
+    txn_version: int,
+    target_table: Optional[str],
+    batch_label: Optional[str] = None,
+) -> None:
+    """
+    WRITE stage: valid rows -> Silver 2, failed rows -> quarantine, fuzzy fixes -> audit.
+
+    Each write is idempotent per (txn_app_id:<table tag>, txn_version). The quarantine
+    and fuzzy-audit rows carry `batch_label` as their batch id (default: txn_version),
+    so a replay (tools/replay.py) can write under its own transaction id and still
+    label the rows with the micro-batch they came from. Errors propagate.
+    """
+    total, n_quarantined, n_fuzzy = stats
+    if total == 0:
+        return
+    label = str(txn_version if batch_label is None else batch_label)
+    failed = F.size(F.col("columns_to_remediate")) > 0
+
+    # Clean rows: drop lineage/audit/replay columns before writing to Silver 2
+    # Adds zero extra columns to Silver 2
+    if total - n_quarantined > 0:
+        valid_df = transformed.filter(~failed).drop(
+            "columns_to_remediate", "_fuzzy_audit_entries", "raw_record"
+        )
+        _txn_write(valid_df, silver2_path, "valid", txn_version, txn_app_id=txn_app_id)
+
+    # Quarantined rows keep columns_to_remediate and the original raw_record
+    if n_quarantined > 0:
+        quarantine_out = (
+            transformed.filter(failed)
+            .drop("_fuzzy_audit_entries")
+            .withColumn("quarantined_at", F.current_timestamp())
+            .withColumn("silver2_batch_id", F.lit(label))
+            .withColumn("healing_status", F.lit("PENDING"))
+            .withColumn("target_table", F.lit(target_table).cast(StringType()))
+        )
+        _txn_write(quarantine_out, QUARANTINE_PATH, "quarantine", txn_version,
+                   merge_schema=True, txn_app_id=txn_app_id)
+        print(
+            f"[{target_table or 'silver2'}] Batch {label}: quarantined {n_quarantined} of {total} records "
+            f"at {QUARANTINE_PATH}"
+        )
+
+    # Log fuzzy corrections: (field, record_id, raw, matched, distance)
+    if n_fuzzy > 0:
+        write_fuzzy_audit(transformed, txn_app_id=txn_app_id, txn_version=txn_version,
+                          batch_label=label, target_table=target_table)
+
+
+def write_fuzzy_audit(
+    transformed: DataFrame,
+    *,
+    txn_app_id: Optional[str],
+    txn_version: int,
+    batch_label: str,
+    target_table: Optional[str],
+) -> None:
+    """Append the fuzzy corrections of `transformed` (its _fuzzy_audit_entries) to the
+    fuzzy audit table, idempotently per (txn_app_id:fuzzy_audit, txn_version)."""
+    audit_df = (
+        transformed.filter(F.size(F.col("_fuzzy_audit_entries")) > 0)
+        .select(
+            F.explode("_fuzzy_audit_entries").alias("entry"),
+            F.lit(str(batch_label)).alias("batch_id"),
+            F.current_timestamp().alias("corrected_at"),
+        )
+        .select(
+            F.col("entry.field").alias("field"),
+            F.col("entry.record_id").alias("record_id"),
+            F.col("entry.raw").alias("raw"),
+            F.col("entry.matched").alias("matched"),
+            F.col("entry.distance").cast(IntegerType()).alias("distance"),
+            F.col("corrected_at"),
+            F.col("batch_id"),
+        )
+    )
+    _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", txn_version,
+               merge_schema=True, txn_app_id=txn_app_id)
+    print(
+        f"[{target_table or 'silver2'}] Batch {batch_label}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
+    )
+
+
 def make_batch_processor(
     spark: SparkSession,
     silver2_path: str,
@@ -499,17 +609,9 @@ def make_batch_processor(
 
         # 2. TRANSFORM stage: build, persist and materialize in one go.
         #    Anything that blows up here is a data/schema problem -> dead letter.
-        transformed = None
         try:
-            transformed = standardize_silver2(batch_df, mapping_dict, day_first=day_first).persist()
-            stats = transformed.agg(
-                F.count(F.lit(1)).alias("total"),
-                F.sum(F.when(F.size("columns_to_remediate") > 0, 1).otherwise(0)).alias("quarantined"),
-                F.sum(F.when(F.size("_fuzzy_audit_entries") > 0, 1).otherwise(0)).alias("fuzzy"),
-            ).first()
+            transformed, stats = standardize_and_count(batch_df, mapping_dict, day_first=day_first)
         except Exception as exc:
-            if transformed is not None:
-                transformed.unpersist()
             _dead_letter_batch(batch_df, batch_id, exc, txn_app_id, target_table)
             # Classify only after the raw batch is durably preserved (IC2/IC4).
             from qwen_classifier.integration import capture_exception
@@ -519,63 +621,9 @@ def make_batch_processor(
 
         # 3. WRITE stage: idempotent writes; errors propagate so Spark replays the batch
         try:
-            total = int(stats["total"] or 0)
-            n_quarantined = int(stats["quarantined"] or 0)
-            n_fuzzy = int(stats["fuzzy"] or 0)
-            if total == 0:
-                return
-
-            failed = F.size(F.col("columns_to_remediate")) > 0
-
-            # Clean rows: drop lineage/audit/replay columns before writing to Silver 2
-            # Adds zero extra columns to Silver 2
-            if total - n_quarantined > 0:
-                valid_df = transformed.filter(~failed).drop(
-                    "columns_to_remediate", "_fuzzy_audit_entries", "raw_record"
-                )
-                _txn_write(valid_df, silver2_path, "valid", batch_id, txn_app_id=txn_app_id)
-
-            # Quarantined rows keep columns_to_remediate and the original raw_record
-            if n_quarantined > 0:
-                quarantine_out = (
-                    transformed.filter(failed)
-                    .drop("_fuzzy_audit_entries")
-                    .withColumn("quarantined_at", F.current_timestamp())
-                    .withColumn("silver2_batch_id", F.lit(str(batch_id)))
-                    .withColumn("healing_status", F.lit("PENDING"))
-                    .withColumn("target_table", F.lit(target_table).cast(StringType()))
-                )
-                _txn_write(quarantine_out, QUARANTINE_PATH, "quarantine", batch_id,
-                           merge_schema=True, txn_app_id=txn_app_id)
-                print(
-                    f"[{target_table or 'silver2'}] Batch {batch_id}: quarantined {n_quarantined} of {total} records "
-                    f"at {QUARANTINE_PATH}"
-                )
-
-            # Log fuzzy corrections: (field, record_id, raw, matched, distance)
-            if n_fuzzy > 0:
-                audit_df = (
-                    transformed.filter(F.size(F.col("_fuzzy_audit_entries")) > 0)
-                    .select(
-                        F.explode("_fuzzy_audit_entries").alias("entry"),
-                        F.lit(str(batch_id)).alias("batch_id"),
-                        F.current_timestamp().alias("corrected_at"),
-                    )
-                    .select(
-                        F.col("entry.field").alias("field"),
-                        F.col("entry.record_id").alias("record_id"),
-                        F.col("entry.raw").alias("raw"),
-                        F.col("entry.matched").alias("matched"),
-                        F.col("entry.distance").cast(IntegerType()).alias("distance"),
-                        F.col("corrected_at"),
-                        F.col("batch_id"),
-                    )
-                )
-                _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", batch_id,
-                           merge_schema=True, txn_app_id=txn_app_id)
-                print(
-                    f"[{target_table or 'silver2'}] Batch {batch_id}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
-                )
+            write_standardized(transformed, stats, silver2_path=silver2_path,
+                               txn_app_id=txn_app_id, txn_version=batch_id,
+                               target_table=target_table)
         finally:
             transformed.unpersist()
 

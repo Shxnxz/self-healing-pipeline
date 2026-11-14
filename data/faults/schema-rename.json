@@ -1,0 +1,7 @@
+{
+  "name": "schema-rename",
+  "description": "An upstream API change: crash_date arrives as CrashDate. Silver 1's schema guard parks the records; an engineer renames and replays them (python -m tools.replay dead-letter silver1 --rename CrashDate=crash_date).",
+  "faults": [
+    {"kind": "schema_rename", "source": "crash1", "column": "crash_date", "to": "CrashDate", "count": 3}
+  ]
+}
