@@ -6,6 +6,7 @@ The tests share one pipeline and run in order: each step works on what the step
 before it left behind.
 """
 import json
+import os
 
 import pytest
 
@@ -107,21 +108,38 @@ def test_replay_quarantine_releases_rows_the_reference_table_now_fixes(spark):
          for r in variants], REF_MAPPINGS_SCHEMA).dropDuplicates(["raw_synonym"]) \
         .write.format("delta").mode("append").save(REF_MAPPINGS_PATH)
 
+    # The agent staged the first variant record and is still working on it (a SUCCESS
+    # execution in remediation_audit lists it): the replay must leave it alone.
+    held, free = variants
+    spark.createDataFrame([("exec-1", "fail-1", "SUCCESS", "silver2_crash1", [held["record_id"]],
+                            "ADD_VARIANT", None, "DIAGNOSIS", 0.9, now)],
+                          "execution_id string, failure_id string, status string, target_table string, "
+                          "record_ids array<string>, action string, action_params string, "
+                          "action_source string, confidence double, executed_at timestamp") \
+        .write.format("delta").save(os.environ["REMEDIATION_AUDIT_PATH"])
+
     dry = replay.replay_quarantine(spark, "crash1", column="weather_condition")
-    # The unknown values (MISTY DARK, and the dirty data's own) still fail; the promoted variants now pass.
-    assert dry["applied"] is False and dry["now_pass"] == 2 and dry["still_failing"] >= 2
+    # The unknown values (MISTY DARK, and the dirty data's own) still fail; the promoted variant now passes.
+    assert dry["applied"] is False and dry["now_pass"] == 1 and dry["still_failing"] >= 2
+    assert dry["held_by_agent"] == 1 and dry["held_by_executions"] == ["exec-1"]
     applied = replay.replay_quarantine(spark, "crash1", column="weather_condition", apply=True)
-    assert applied["applied"] and applied["appended"] == 2 and applied["marked_resolved"] == 2
+    assert applied["applied"] and applied["appended"] == 1 and applied["marked_resolved"] == 1
     assert applied["replay_id"] == dry["replay_id"]
+    assert _status(spark, "run1")[held["seq"]]["outcome"] == fault_injector.QUARANTINED
+
+    # The engineer dismissed that case: --force takes the record too.
+    forced = replay.replay_quarantine(spark, "crash1", column="weather_condition", apply=True, force=True)
+    assert forced["applied"] and forced["appended"] == 1 and forced["held_by_agent"] == 0
 
     status = _status(spark, "run1")
     for r in variants:
         row = status[r["seq"]]
         assert row["outcome"] == fault_injector.HEALED_BY_REPLAY and row["correct"] is True
-        assert row["resolved_by"] == applied["replay_id"] and row["fix_source"] == "REPLAY"
+        assert row["resolved_by"] == (forced if r is held else applied)["replay_id"]
+        assert row["fix_source"] == "REPLAY"
         assert row["seconds_to_heal"] >= 0
 
-    again = replay.replay_quarantine(spark, "crash1", column="weather_condition", apply=True)
+    again = replay.replay_quarantine(spark, "crash1", column="weather_condition", apply=True, force=True)
     assert again["now_pass"] == 0 and again["applied"] is False
 
 
@@ -182,8 +200,9 @@ def test_replay_silver2_dead_letter(spark):
     rows = (spark.read.format("delta").load(table_path("silver1", "crash3"))
             .filter(~F.col("crash_record_id").startswith("FAULT-")).limit(4)
             .withColumn("record_id", F.expr("uuid()")))
-    rows = rows.withColumn("weather_condition", F.when(F.monotonically_increasing_id() == 0,
-                                                       F.lit("HAILSTORM")).otherwise(F.col("weather_condition")))
+    first = F.monotonically_increasing_id() == 0
+    rows = (rows.withColumn("weather_condition", F.when(first, F.lit("HAILSTORM")).otherwise(F.col("weather_condition")))
+            .withColumn("lighting_condition", F.when(first, F.lit("DAYLIHGT")).otherwise(F.col("lighting_condition"))))
     parked = rows.cache()
     ids = [r["record_id"] for r in parked.select("record_id").collect()]
     silver2_job._dead_letter_batch(parked, 77, RuntimeError("schema drift"), "test_parked", "silver2_crash3")
@@ -198,9 +217,30 @@ def test_replay_silver2_dead_letter(spark):
     assert len(q) == 1 and q[0]["silver2_batch_id"] == "77" and q[0]["healing_status"] == "PENDING"
     again = replay.replay_silver2_dead_letter(spark, "crash3", 77, apply=True)
     assert again["to_replay"] == 0
+    STATE["hailstorm"] = q[0]["record_id"]
     # Nothing written twice, even when asked again.
     assert spark.read.format("delta").load(table_path("silver2", "crash3")).filter(
         F.col("record_id").isin(*ids)).count() == 3
+
+
+def test_replay_quarantine_logs_fuzzy_fixes_of_released_rows(spark):
+    """HAILSTORM becomes known; its row also had DAYLIHGT, which the fuzzy match fixes
+    on the way: the release logs that correction like the stream does."""
+    from datetime import datetime, timezone
+
+    from pyspark.sql import functions as F
+
+    from ref_mappings import REF_MAPPINGS_SCHEMA
+    from silver2_job import FUZZY_AUDIT_PATH, REF_MAPPINGS_PATH
+    from tools import replay
+
+    spark.createDataFrame([("weather_condition", "HAILSTORM", "RAIN", "test", datetime.now(timezone.utc), 1.0, None)],
+                          REF_MAPPINGS_SCHEMA).write.format("delta").mode("append").save(REF_MAPPINGS_PATH)
+    done = replay.replay_quarantine(spark, "crash3", column="weather_condition", value="hailstorm", apply=True)
+    assert done["appended"] == 1
+    logged = spark.read.format("delta").load(FUZZY_AUDIT_PATH).filter(
+        (F.col("record_id") == STATE["hailstorm"]) & (F.col("batch_id") == done["replay_id"])).collect()
+    assert [(r["field"], r["matched"]) for r in logged] == [("lighting_condition", "DAYLIGHT")]
 
 
 def test_list_and_runs(spark):

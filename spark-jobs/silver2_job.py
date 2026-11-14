@@ -547,28 +547,42 @@ def write_standardized(
 
     # Log fuzzy corrections: (field, record_id, raw, matched, distance)
     if n_fuzzy > 0:
-        audit_df = (
-            transformed.filter(F.size(F.col("_fuzzy_audit_entries")) > 0)
-            .select(
-                F.explode("_fuzzy_audit_entries").alias("entry"),
-                F.lit(label).alias("batch_id"),
-                F.current_timestamp().alias("corrected_at"),
-            )
-            .select(
-                F.col("entry.field").alias("field"),
-                F.col("entry.record_id").alias("record_id"),
-                F.col("entry.raw").alias("raw"),
-                F.col("entry.matched").alias("matched"),
-                F.col("entry.distance").cast(IntegerType()).alias("distance"),
-                F.col("corrected_at"),
-                F.col("batch_id"),
-            )
+        write_fuzzy_audit(transformed, txn_app_id=txn_app_id, txn_version=txn_version,
+                          batch_label=label, target_table=target_table)
+
+
+def write_fuzzy_audit(
+    transformed: DataFrame,
+    *,
+    txn_app_id: Optional[str],
+    txn_version: int,
+    batch_label: str,
+    target_table: Optional[str],
+) -> None:
+    """Append the fuzzy corrections of `transformed` (its _fuzzy_audit_entries) to the
+    fuzzy audit table, idempotently per (txn_app_id:fuzzy_audit, txn_version)."""
+    audit_df = (
+        transformed.filter(F.size(F.col("_fuzzy_audit_entries")) > 0)
+        .select(
+            F.explode("_fuzzy_audit_entries").alias("entry"),
+            F.lit(str(batch_label)).alias("batch_id"),
+            F.current_timestamp().alias("corrected_at"),
         )
-        _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", txn_version,
-                   merge_schema=True, txn_app_id=txn_app_id)
-        print(
-            f"[{target_table or 'silver2'}] Batch {label}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
+        .select(
+            F.col("entry.field").alias("field"),
+            F.col("entry.record_id").alias("record_id"),
+            F.col("entry.raw").alias("raw"),
+            F.col("entry.matched").alias("matched"),
+            F.col("entry.distance").cast(IntegerType()).alias("distance"),
+            F.col("corrected_at"),
+            F.col("batch_id"),
         )
+    )
+    _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", txn_version,
+               merge_schema=True, txn_app_id=txn_app_id)
+    print(
+        f"[{target_table or 'silver2'}] Batch {batch_label}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
+    )
 
 
 def make_batch_processor(

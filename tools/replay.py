@@ -299,9 +299,25 @@ def replay_silver2_dead_letter(spark, source: str, batch: int, apply: bool) -> d
 
 
 # --------------------------------------------------------------------------- quarantine
+def agent_held(spark, target_table: str) -> Dict[str, str]:
+    """record_id -> execution_id of every record of `target_table` that Remediate staged
+    with a SUCCESS (remediation_audit). Waiting rows among them belong to a workflow."""
+    from pyspark.sql import functions as F
+
+    from sources import shared_path
+
+    path = os.environ.get("REMEDIATION_AUDIT_PATH", shared_path("remediation_audit"))
+    if not session.is_delta(path):
+        return {}
+    rows = (spark.read.format("delta").load(path)
+            .filter((F.col("status") == "SUCCESS") & (F.col("target_table") == target_table))
+            .select("execution_id", F.explode("record_ids").alias("record_id")).collect())
+    return {r["record_id"]: r["execution_id"] for r in rows}
+
+
 def replay_quarantine(spark, source: str, column: Optional[str] = None, value: Optional[str] = None,
                       batch: Optional[str] = None, record_ids: Optional[List[str]] = None,
-                      include_in_progress: bool = False, apply: bool = False) -> dict:
+                      include_in_progress: bool = False, apply: bool = False, force: bool = False) -> dict:
     """Re-run waiting quarantine rows with the current reference table and release the
     ones that now pass.
 
@@ -311,15 +327,19 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
     and nothing is promoted: the replay trusts ref_canonical_mappings as the Silver 2
     job does. Rows that still fail stay PENDING, untouched.
 
-    Do not run it on a group the agent is working on (IN_PROGRESS, or a case waiting
-    for an engineer): Validate would then find the records already released and stop.
+    Records the agent is working on are left out: a row that Remediate staged (a
+    SUCCESS execution in remediation_audit lists it) and that is still waiting belongs
+    to an open workflow (being validated, waiting for an engineer's approval, or a fix
+    that did not hold). Releasing it here would make that workflow's Validate stop at
+    rows_conserved and open another round for rows already fixed. `force` takes them
+    anyway (e.g. after the engineer dismissed the case).
     """
     from delta.tables import DeltaTable
     from pyspark.sql import functions as F
 
     from common import idempotent_append
     from ref_mappings import load_mappings_dict
-    from silver2_job import standardize_silver2
+    from silver2_job import standardize_silver2, write_fuzzy_audit
     from sources import is_day_first, table_name, table_path
 
     paths = _paths()
@@ -341,6 +361,11 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
     if record_ids:
         selected = selected.filter(F.col("record_id").isin(*record_ids))
 
+    held = agent_held(spark, target_table)
+    held_selected = sorted({r["record_id"] for r in selected.select("record_id").collect()} & set(held))
+    if held_selected and not force:
+        selected = selected.filter(~F.col("record_id").isin(*held_selected))
+
     mappings = load_mappings_dict(spark, paths["ref"])
     replayed = standardize_silver2(selected.select("raw_record.*"), mappings,
                                    day_first=is_day_first(source)).cache()
@@ -359,7 +384,12 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
         result = {"source": source, "target_table": target_table, "column": column, "value": value,
                   "batch": batch, "selected": len(report), "now_pass": len(passing),
                   "still_failing": len(report) - len(passing), "still_failing_by_column": still,
-                  "already_in_silver2": len(in_silver2), "applied": False}
+                  "already_in_silver2": len(in_silver2), "applied": False,
+                  "held_by_agent": 0 if force else len(held_selected),
+                  "held_by_executions": sorted({held[r] for r in held_selected})[:10]}
+        if held_selected and not force:
+            result["held_note"] = ("left out: staged by the agent and still waiting "
+                                   "(python -m agent.audit <execution_id>); --force takes them")
         if not passing:
             result["note"] = "nothing to release: no selected row passes with the current reference table"
             return result
@@ -374,6 +404,11 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
             rows = replayed.filter(F.col("record_id").isin(*to_append)).drop(*_NOT_IN_SILVER2)
             # Idempotent: Delta skips the append if this replay id already wrote it.
             idempotent_append(rows, silver2_path, f"{replay_id}:release", 0)
+            # Another column fixed by the fuzzy match on the way: logged like the stream does.
+            fuzzy = replayed.filter(F.col("record_id").isin(*to_append))
+            if fuzzy.filter(F.size("_fuzzy_audit_entries") > 0).limit(1).count():
+                write_fuzzy_audit(fuzzy, txn_app_id=replay_id, txn_version=0, batch_label=replay_id,
+                                  target_table=target_table)
         _add_columns(spark, paths["quarantine"], {"resolved_by": "STRING", "resolved_at": "TIMESTAMP"})
         table = DeltaTable.forPath(spark, paths["quarantine"])
         condition = ((F.col("target_table") == target_table) & F.col("record_id").isin(*passing)
@@ -425,6 +460,8 @@ def main(argv=None) -> int:
     p_q.add_argument("--record-id", action="append", dest="record_ids", help="only these records (repeatable)")
     p_q.add_argument("--include-in-progress", action="store_true",
                      help="also rows the recovery trigger marked IN_PROGRESS")
+    p_q.add_argument("--force", action="store_true",
+                     help="also records the agent staged and is still working on (see agent.audit)")
     p_q.add_argument("--apply", action="store_true", help="write (default: dry run)")
     p_q.add_argument("--json", action="store_true")
     for p in (p_list, p_dl):
@@ -454,7 +491,7 @@ def main(argv=None) -> int:
                 result = replay_silver2_dead_letter(spark, source, args.batch, args.apply)
         else:
             result = replay_quarantine(spark, source, args.column, args.value, args.batch, args.record_ids,
-                                       args.include_in_progress, args.apply)
+                                       args.include_in_progress, args.apply, args.force)
     except ReplayRefused as exc:
         print(f"[replay] refused: {exc}", file=sys.stderr)
         return 2

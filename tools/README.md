@@ -76,10 +76,17 @@ docker compose run --rm tools python -m tools.replay dead-letter silver1 --sourc
   Rows that still fail stay `PENDING`, untouched. No overlay is used and nothing is
   promoted: the replay trusts `ref_canonical_mappings` exactly as the Silver 2 job does.
 
-**Do not replay a quarantine group the agent is working on** (rows `IN_PROGRESS`, or a
-case waiting for an engineer in `python -m agent.review`): its Validate step would
-then find the records already released and stop with `rows_conserved`. By default the
-command only takes `PENDING` rows; `--include-in-progress` takes those too.
+**Records the agent is working on are left out.** A waiting row that Remediate staged
+(a `SUCCESS` execution in `remediation_audit` lists it) belongs to an open workflow:
+being validated, waiting for an engineer's approval, or a fix that did not hold.
+Releasing it here would make that workflow's Validate stop at `rows_conserved` and
+open another round for rows already fixed, so the command skips them and reports
+`held_by_agent` with the execution ids (`python -m agent.audit <execution_id>`).
+`--force` takes them anyway, for example after the engineer dismissed the case. By
+default only `PENDING` rows are taken; `--include-in-progress` adds `IN_PROGRESS`.
+
+Rows released here that another column was fuzzy-fixed in on the way get their
+`silver2_fuzzy_audit` rows, as in the stream.
 
 ### Safe to run again
 
