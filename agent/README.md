@@ -537,9 +537,15 @@ borrowed. Once an engineer approves it, the incident is not borrowed.
   promotion to engineers.
 
 And **never** when the value is ambiguous: another verified incident fixed the same
-signature to a different value (`Ju` was JUNE in one batch and JULY in another), the
-same fix failed Validate before, the table already maps the raw value to something
-else, or an engineer declined promoting this fix. Only `ADD_VARIANT` is promoted.
+signature to a different value (`Ju` was JUNE in one batch and JULY in another), or
+the table already maps the raw value to something else. While there is doubt (the same
+fix failed Validate before, or an engineer declined promoting it) only the automatic
+promotion waits; an engineer approving this very fix overrides it
+(`learned.promotion.overridden`). Only `ADD_VARIANT` is promoted.
+
+The lookup applies the same rule to reuse: when the verified fixes of one exact value
+disagree (`find_exact` returns them in `distinct_fixes`), neither is reused, and the
+failure goes to Diagnose with both as past incidents.
 
 The write is a Delta MERGE on `(field_name, raw_synonym)` that only inserts (the same
 key as the Silver 2 job's own fuzzy promotion), done with `deltalake`, without Spark:
@@ -558,8 +564,11 @@ replay tool (Task 108, `tools/replay.py quarantine`).
 
 **3. When Neo4j or the table is down**, Learn raises; the graph retries it and then
 ends the workflow `FAILED` with `error.node = learn`. Everything Learn writes is
-idempotent, and when the failure is delivered again the consumer runs Learn alone
-again (**relearn**, below).
+idempotent, and the agent runs Learn alone again (**relearn**, below) every
+`AGENT_RELEARN_INTERVAL_SECONDS` (300) until it succeeds, and at once if the failure is
+delivered again. The scanner does not publish a failure twice, so the timer is what
+normally retries it. At start the agent looks through every saved workflow for one
+that still needs Learn.
 
 Look at what was stored in the Neo4j browser (http://localhost:7474):
 
@@ -596,7 +605,9 @@ so a long stack does not get it dropped from the consumer group.
   (Neo4j or the reference table was down; the status is `FAILED` with
   `error.node = learn`), or it ended on the Learn stub before Task 107. Learn alone
   runs again, from the checkpoint saved just before it, so no fix, model call or
-  engineer's case is repeated. The status becomes the real one again.
+  engineer's case is repeated. The status becomes the real one again. The agent also
+  does this on its own, without a redelivery: at start for every saved workflow that
+  needs it, and every `AGENT_RELEARN_INTERVAL_SECONDS` for those still failing.
 
 ### Failures seen while steps were still stubs
 
@@ -642,7 +653,8 @@ docker compose exec recovery-agent python -m agent.show fd95d1c4c9991007
 Settings (`config.py`): `LOOKUP_OUTPUT_TOPIC`, `AGENT_DECISIONS_TOPIC`, `AGENT_CONSUMER_GROUP`,
 `AGENT_CHECKPOINT_PATH`, `AGENT_MAX_POLL_INTERVAL_MS`, `AGENT_NODE_MAX_ATTEMPTS`,
 `AGENT_NODE_RETRY_SECONDS`, `APPROVE_BORROWED_FIX_TIERS` (`P1`), Learn's (see the Learn
-section: `PROMOTE_MIN_OCCURRENCES`, `PROMOTE_MIN_BATCHES`, `NEO4J_*`, `LOOKUP_EMBED_MODEL`),
+section: `PROMOTE_MIN_OCCURRENCES`, `PROMOTE_MIN_BATCHES`, `NEO4J_*`, `LOOKUP_EMBED_MODEL`,
+`AGENT_RELEARN_INTERVAL_SECONDS`),
 and for Diagnose and the gate:
 
 | Setting | Default | Meaning |

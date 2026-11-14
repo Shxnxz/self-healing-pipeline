@@ -25,7 +25,8 @@ Why "similar" is not enough to remediate
 "Jule" and "June" are one edit apart and score ~0.9, but their fixes differ
 (JULY vs JUNE). A past fix is reused only when its parameters still fit:
 
-  exact signature                     -> reusable
+  exact signature                     -> reusable, unless verified fixes of
+                                         that signature disagree (ambiguous value)
   value failure, same column and the
     same value after normalisation    -> reusable (case / spaces / punctuation only)
   schema failure, identical column
@@ -145,6 +146,10 @@ def transferable(failure: StructuredFailure, incident: dict, components: Dict, e
     if incident.get("action") in (incidents.MANUAL, incidents.DISMISS):
         return False, "fixed by hand by an engineer; nothing to repeat, needs diagnosis"
     if exact:
+        fixes = incident.get("distinct_fixes") or []
+        if len(fixes) > 1:   # incidents.find_exact: verified fixes of this value disagree
+            return False, (f"past fixes of this exact value disagree ({'; '.join(sorted(fixes))}); "
+                           "the value is ambiguous, needs diagnosis")
         return True, "exact signature match"
     if failure.family == "VALUE":
         same_value = normalize_value(failure.signature_value) == normalize_value(incident.get("raw_value"))

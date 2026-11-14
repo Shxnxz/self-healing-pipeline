@@ -235,13 +235,22 @@ def find_exact(driver, table_name: str, column_name: Optional[str], raw_value: O
     is returned only when there is no other, and carries `borrowed` so the agent still
     asks for approval on P1 (agent/nodes/deterministic_lookup.py). An engineer's manual
     resolution has no fix to repeat and is left to the candidates.
+
+    `distinct_fixes` lists every different fix verified for this signature ("ACTION
+    {params}"). More than one means the value is ambiguous (MISTY fixed to FOG once and
+    to CLOUDY later): the lookup must not reuse either (lookup/patterns.py: transferable),
+    the same rule Learn's promotion applies (agent/promotion.py).
     """
     records, _, _ = driver.execute_query(
         f"""
         MATCH (i:Incident {{signature_key: $key}})
         WHERE i.verified = true AND i.outcome = 'SUCCESS' AND coalesce(i.action, '') <> '{MANUAL}'
-        RETURN {_RETURN_FIELDS}, 1.0 AS score
-        ORDER BY coalesce(i.borrowed, false) ASC, i.resolved_at DESC LIMIT 1
+        WITH i ORDER BY coalesce(i.borrowed, false) ASC, i.resolved_at DESC
+        WITH collect(i) AS hits,
+             collect(DISTINCT coalesce(i.action, '') + ' ' + coalesce(i.action_params, '{{}}')) AS fixes
+        WHERE size(hits) > 0
+        WITH hits[0] AS i, fixes
+        RETURN {_RETURN_FIELDS}, 1.0 AS score, fixes AS distinct_fixes
         """,
         key=signature_key(table_name, column_name, raw_value),
     )

@@ -287,3 +287,15 @@ def test_learn_and_the_lookup_embed_the_same_text():
     f = quarantine_failure(value=" jule ")
     assert signature_text(f, "silver2_crash1") == learned_text("silver2_crash1", "crash_month", " jule ",
                                                                "UNRESOLVED_VALUE")
+
+
+def test_an_exact_value_with_disagreeing_past_fixes_is_not_reused():
+    """MISTY fixed to FOG once and to CLOUDY later: both validated, neither may be reused."""
+    f = quarantine_failure(column="weather_condition", value="Misty")
+    exact = incident(column_name="weather_condition", raw_value="MISTY", action_params='{"canonical_value": "CLOUDY"}',
+                     distinct_fixes=['ADD_VARIANT {"canonical_value": "CLOUDY"}', 'ADD_VARIANT {"canonical_value": "FOG"}'])
+    ctx = evaluate(f, "silver2_crash1", exact, [], [])
+    assert not ctx["reusable"] and ctx["match"] is None
+    assert "past fixes of this exact value disagree" in ctx["reason"]
+    one = evaluate(f, "silver2_crash1", {**exact, "distinct_fixes": exact["distinct_fixes"][:1]}, [], [])
+    assert one["reusable"]

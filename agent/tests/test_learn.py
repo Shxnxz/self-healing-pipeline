@@ -389,3 +389,70 @@ def test_no_promote_travels_with_the_decision():
     assert [m["promote"] for m in sent] == [False, True]
     state = g.get_state(thread("f1")).values
     assert esc.check_decision(state, {**sent[0], "promote": "no"})[1] == ["promote must be true or false"]
+
+
+# --- review of PR #32 -------------------------------------------------------------------
+def test_an_engineers_approval_overrides_an_earlier_failure_of_the_same_fix():
+    """EL2: one earlier FAILED_VALIDATION of JULY (a record with a wrong crash_date) must
+    not block forever a JULY an engineer approved and that passed Validate."""
+    incident = {"incident_id": "now", "action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"},
+                "outcome": "SUCCESS", "verified": True, "column_name": "crash_month", "raw_key": "JULE",
+                "canonical_value": "JULY"}
+    failed = {"incident_id": "old", "action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"},
+              "outcome": "FAILED_VALIDATION", "verified": False}
+    approved = promotion.decide(incident=incident, history=[failed], existing=None, engineer_approved=True)
+    assert approved["status"] == "PROMOTED"
+    assert approved["overridden"] == ["the same fix failed validation before (incident old)"]
+    automatic = promotion.decide(incident=incident, history=[failed], existing=None, engineer_approved=False)
+    assert automatic["status"] == "BLOCKED"
+
+    # a conflicting value still blocks, approval or not
+    other = {**failed, "incident_id": "june", "action_params": {"canonical_value": "JUNE"}, "outcome": "SUCCESS",
+             "verified": True}
+    assert promotion.decide(incident=incident, history=[other], existing=None,
+                            engineer_approved=True)["status"] == "BLOCKED"
+
+
+def test_a_learn_that_failed_is_retried_without_waiting_for_a_redelivery(memory):
+    from agent.consumer import LearnRetry
+
+    now = [0.0]
+    g = build_graph(InMemorySaver(), nodes=AUTO, max_attempts=1, retry_seconds=0)
+    memory.down = True
+    g.invoke(initial_state("L1", item_in_batch("f1", 7)), thread("f1"))
+    g.invoke(initial_state("L1", item_in_batch("f2", 8)), thread("f2"))
+    assert g.get_state(thread("f1")).values["status"] == "FAILED"
+
+    retry = LearnRetry(g, interval=60, clock=lambda: now[0])
+    assert retry.scan() == 2 and retry.pending == {"f1", "f2"}
+    assert [s["delivery"] for s in retry.due()] == ["relearn", "relearn"]   # still down
+    assert retry.pending == {"f1", "f2"} and memory.incidents == {}
+
+    memory.down = False
+    now[0] = 30
+    assert retry.due() == []                                    # not yet: once a minute
+    now[0] = 61
+    done = retry.due()
+    assert [s["state"]["status"] for s in done] == ["RESOLVED", "RESOLVED"]
+    assert retry.pending == set() and set(memory.incidents) == {"f1", "f2"}
+    assert g.get_state(thread("f1")).values["learned"]["status"] == "STORED"
+
+
+def test_the_poll_loop_retries_learn_on_its_own(memory):
+    import json as json_
+
+    from agent.consumer import LearnRetry, run
+    from agent.tests.test_consumer import FakeConsumer, FakeMessage
+
+    g = build_graph(InMemorySaver(), nodes=AUTO, max_attempts=1, retry_seconds=0)
+    retry = LearnRetry(g, interval=60, clock=lambda: 0.0)
+    consumer = FakeConsumer([json_.dumps(lookup_message(item_in_batch("f1", 7))).encode()])
+    memory.down = True
+    run(consumer, g, max_messages=1, retry=retry)
+    assert retry.pending == {"f1"} and consumer.committed == [0] and memory.incidents == {}
+
+    memory.down = False
+    consumer.pending = [FakeMessage(b"not json", 1)]   # any later turn of the loop
+    run(consumer, g, max_messages=1, retry=retry)
+    assert retry.pending == set() and memory.incidents["f1"]["outcome"] == "SUCCESS"
+    assert consumer.paused is False

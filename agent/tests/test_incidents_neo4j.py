@@ -76,6 +76,17 @@ def test_exact_lookup_prefers_an_approved_fix_and_skips_manual_ones(driver):
     assert hit["incident_id"] == PREFIX + "approved" and hit["approved_by"] == "thay"
 
 
+def test_exact_lookup_reports_disagreeing_fixes(driver):
+    write(driver, "fog", canonical="JULY")
+    assert len(incidents.find_exact(driver, "silver2_crash1", "crash_month", "Jule")["distinct_fixes"]) == 1
+    write(driver, "cloudy", canonical="JUNE")
+    write(driver, "failed", canonical="MAY", outcome="FAILED_VALIDATION")   # not a verified fix
+    hit = incidents.find_exact(driver, "silver2_crash1", "crash_month", "Jule")
+    assert sorted(hit["distinct_fixes"]) == ['ADD_VARIANT {"canonical_value": "JULY"}',
+                                             'ADD_VARIANT {"canonical_value": "JUNE"}']
+    assert incidents.find_exact(driver, "silver2_crash1", "crash_month", "Nothing") is None
+
+
 def test_writing_again_updates_and_none_removes_a_property(driver):
     write(driver, "a", engineer_note="first")
     write(driver, "a", engineer_note=None, rows=1)

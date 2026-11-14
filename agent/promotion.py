@@ -18,8 +18,12 @@ and never when memory says the value is ambiguous:
 
   - another verified fix maps the same signature to a different value ("Ju" fixed to
     JUNE in one batch and to JULY in another: each group was right, the variant is not)
-  - the same fix failed Validate for the same signature before (some records disagreed)
   - the table already maps the raw value to something else
+
+An automatic promotion also waits while there is doubt, which an engineer approving
+this very fix overrides (EL2):
+
+  - the same fix failed Validate for the same signature before (some records disagreed)
   - an engineer declined promotion of this fix before
 
 A fix borrowed from a similar incident that nobody approved (`borrowed`, see
@@ -34,7 +38,7 @@ read and write the Delta table with `deltalake`, without Spark.
 """
 import json
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 from agent import actions, config
 from agent.memory import incidents
@@ -85,19 +89,22 @@ def counts(history: Iterable[dict], canonical: str) -> dict:
     return {"occurrences": rows, "batches": len(batches), "incidents": used}
 
 
-def _ambiguity(history: Iterable[dict], canonical: str, incident_id: str) -> List[str]:
-    reasons = []
+def _ambiguity(history: Iterable[dict], canonical: str, incident_id: str) -> Tuple[List[str], List[str]]:
+    """(conflicts, doubts). A conflict blocks every promotion: the value has been fixed
+    to something else. A doubt blocks only the automatic one; an engineer who approves
+    this very fix after it failed once, or was declined once, overrides it (EL2)."""
+    conflicts, doubts = [], []
     for inc in history:
         if inc.get("incident_id") == incident_id or inc.get("action") != actions.ADD_VARIANT:
             continue
         other = _canonical(inc.get("action_params"))
         if _is_success(inc) and other and other != canonical:
-            reasons.append(f"incident {inc.get('incident_id')} fixed the same value to {other}")
+            conflicts.append(f"incident {inc.get('incident_id')} fixed the same value to {other}")
         elif inc.get("outcome") == incidents.FAILED_VALIDATION and other == canonical:
-            reasons.append(f"the same fix failed validation before (incident {inc.get('incident_id')})")
+            doubts.append(f"the same fix failed validation before (incident {inc.get('incident_id')})")
         if inc.get("promote_declined") and other == canonical:
-            reasons.append(f"an engineer declined promoting this fix (incident {inc.get('incident_id')})")
-    return reasons
+            doubts.append(f"an engineer declined promoting this fix (incident {inc.get('incident_id')})")
+    return conflicts, doubts
 
 
 def decide(*, incident: dict, history: List[dict], existing: Optional[str], engineer_approved: bool,
@@ -127,12 +134,15 @@ def decide(*, incident: dict, history: List[dict], existing: Optional[str], engi
     if existing == canonical:
         result.update(status=ALREADY_IN_TABLE, reasons=[f"ref_canonical_mappings already maps it to {canonical}"])
         return result
-    blocked = _ambiguity(history, canonical, incident.get("incident_id"))
+    conflicts, doubts = _ambiguity(history, canonical, incident.get("incident_id"))
     if existing is not None:
-        blocked.insert(0, f"ref_canonical_mappings maps it to {existing}, not {canonical}")
+        conflicts.insert(0, f"ref_canonical_mappings maps it to {existing}, not {canonical}")
+    blocked = conflicts if engineer_approved and promote_requested else conflicts + doubts
     if blocked:
         result.update(status=BLOCKED, reasons=blocked)
         return result
+    if doubts:   # overridden by this engineer's approval
+        result["overridden"] = doubts
 
     if engineer_approved:
         if not promote_requested:

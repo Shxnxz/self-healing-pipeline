@@ -21,11 +21,16 @@ behaviours for a stack item:
              from the checkpoint before it, so nothing else (no fix, no model call, no
              engineer's case) is repeated.
 
+The scanner does not publish a failure twice, so a Learn that failed is not left
+waiting for a redelivery: `LearnRetry` finds such workflows when the agent starts and
+after every workflow, and relearns them every AGENT_RELEARN_INTERVAL_SECONDS.
+
 The offset is committed only after every item of the message was handled. A step
 that raises does not stop the agent (agent/graph.py: guarded). If the agent itself
 dies, the message is redelivered: finished items are skipped, the rest resume.
 """
 import json
+import time
 from typing import Callable, List, Optional
 
 from langgraph.types import Command
@@ -68,6 +73,66 @@ def before_learn(graph, thread: dict):
     return None
 
 
+def relearn(graph, failure_id: str) -> Optional[dict]:
+    """Run Learn alone again for a workflow that needs it. None when it does not."""
+    thread = {"configurable": {"thread_id": failure_id}}
+    if not needs_learn(graph.get_state(thread)):
+        return None
+    snapshot = before_learn(graph, thread)
+    if snapshot is None or set(snapshot.values.get("stubbed") or []):
+        return None
+    # Replays from that checkpoint: only Learn runs, on the state it had then.
+    return {"delivery": RELEARN, "failure_id": failure_id, "state": graph.invoke(None, snapshot.config)}
+
+
+def thread_ids(checkpointer) -> List[str]:
+    """Every workflow the checkpoints hold."""
+    conn = getattr(checkpointer, "conn", None)
+    if conn is not None:   # SqliteSaver: one query instead of loading every checkpoint
+        return [row[0] for row in conn.execute("SELECT DISTINCT thread_id FROM checkpoints")]
+    return sorted({c.config["configurable"]["thread_id"] for c in checkpointer.list(None)})
+
+
+class LearnRetry:
+    """Workflows whose Learn has to run again, retried on a timer.
+
+    Filled at start from every saved workflow (this also picks up the ones that ended
+    on the Learn stub before Task 107) and after every workflow the agent runs or
+    resumes. `due()` relearns them all when the interval has passed; a Learn that fails
+    again stays in the list for the next round.
+    """
+
+    def __init__(self, graph, interval: Optional[float] = None, clock: Callable[[], float] = time.monotonic):
+        self.graph, self.clock = graph, clock
+        self.interval = config.RELEARN_INTERVAL_SECONDS if interval is None else interval
+        self.pending: set = set()
+        self.next_at = 0.0
+
+    def scan(self) -> int:
+        for failure_id in thread_ids(self.graph.checkpointer):
+            self.note(failure_id)
+        return len(self.pending)
+
+    def note(self, failure_id: Optional[str]) -> None:
+        if failure_id and needs_learn(self.graph.get_state({"configurable": {"thread_id": failure_id}})):
+            self.pending.add(failure_id)
+
+    def due(self, between: Optional[Callable[[], None]] = None) -> List[dict]:
+        if not self.pending or self.interval <= 0 or self.clock() < self.next_at:
+            return []
+        self.next_at = self.clock() + self.interval
+        summaries = []
+        for failure_id in sorted(self.pending):
+            summary = relearn(self.graph, failure_id)
+            if summary is not None:
+                summaries.append(summary)
+            self.pending.discard(failure_id)
+            self.note(failure_id)      # still failing: keep it for the next round
+            if between is not None:
+                between()
+        return summaries
+
+
 def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
     """Start, resume, skip or rerun the workflow of one stack item. Returns a summary for the log."""
     failure = item.get("failure") if isinstance(item, dict) else None
@@ -83,10 +148,9 @@ def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
     if saved.values and saved.next:
         return {"delivery": RESUMED, "failure_id": failure_id, "state": graph.invoke(None, thread)}
     if needs_learn(saved):
-        snapshot = before_learn(graph, thread)
-        if snapshot is not None and not set(snapshot.values.get("stubbed") or []):
-            # Replays from that checkpoint: only Learn runs, on the state it had then.
-            return {"delivery": RELEARN, "failure_id": failure_id, "state": graph.invoke(None, snapshot.config)}
+        summary = relearn(graph, failure_id)
+        if summary is not None:
+            return summary
     if saved.values and not saved.values.get("stubbed"):
         return {"delivery": DUPLICATE, "failure_id": failure_id, "state": saved.values}
     if saved.values:
@@ -176,7 +240,7 @@ def parse(msg) -> Optional[dict]:
     return message
 
 
-def run(consumer, graph, max_messages: Optional[int] = None) -> None:
+def run(consumer, graph, max_messages: Optional[int] = None, retry: Optional[LearnRetry] = None) -> None:
     """Poll loop. `max_messages` stops it after that many messages (tests).
 
     A stack can hold many failures, and a workflow can be slow once Diagnose calls
@@ -193,8 +257,16 @@ def run(consumer, graph, max_messages: Optional[int] = None) -> None:
         if extra is not None and not extra.error():
             early.append(extra)
 
+    retry = retry or LearnRetry(graph)
     handled = 0
     while max_messages is None or handled < max_messages:
+        if retry.pending and not early:
+            assigned = consumer.assignment()
+            consumer.pause(assigned)
+            summaries = retry.due(between=keep_alive)
+            consumer.resume(assigned)
+            for summary in summaries:
+                print(describe(summary), flush=True)
         msg = early.pop(0) if early else consumer.poll(1.0)
         if msg is None:
             continue
@@ -210,12 +282,15 @@ def run(consumer, graph, max_messages: Optional[int] = None) -> None:
             if msg.topic() == config.DECISIONS_TOPIC:
                 summary = apply_decision(graph, message)
                 consumer.resume(assigned)
+                retry.note(summary.get("failure_id"))
                 print(f"[agent] decision {message.get('decision')} by {message.get('engineer')} "
                       f"on {message.get('escalation_id')}: {summary['delivery']}")
                 print(describe(summary), flush=True)
             else:
                 summaries = process_lookup(graph, message, between=keep_alive)
                 consumer.resume(assigned)
+                for summary in summaries:
+                    retry.note(summary.get("failure_id"))
                 print(f"[agent] lookup {message.get('lookup_id')}: {len(summaries)} failure(s)")
                 for summary in summaries:
                     print(describe(summary), flush=True)
@@ -255,8 +330,12 @@ def main() -> None:
     consumer.subscribe([config.LOOKUP_TOPIC, config.DECISIONS_TOPIC])
     print(f"[agent] Consuming {config.LOOKUP_TOPIC} and {config.DECISIONS_TOPIC} from {config.KAFKA_BOOTSTRAP} "
           f"(checkpoints {config.CHECKPOINT_PATH})", flush=True)
+    retry = LearnRetry(graph)
+    if retry.scan():
+        print(f"[agent] {len(retry.pending)} workflow(s) still need Learn; retrying every "
+              f"{retry.interval:g} s", flush=True)
     try:
-        run(consumer, graph)
+        run(consumer, graph, retry=retry)
     finally:
         consumer.close()
 

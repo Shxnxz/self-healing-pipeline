@@ -129,3 +129,7 @@ def _count(name: str, default: int) -> int:
 # either = only engineers' fixes are promoted. 0 below means NEVER.
 PROMOTE_MIN_OCCURRENCES = _count("PROMOTE_MIN_OCCURRENCES", 5)
 PROMOTE_MIN_BATCHES = _count("PROMOTE_MIN_BATCHES", 3)
+
+# A workflow whose Learn kept failing (Neo4j or the reference table down) is relearned
+# this often (agent/consumer.py: LearnRetry). 0 = only when the failure is delivered again.
+RELEARN_INTERVAL_SECONDS = float(os.environ.get("AGENT_RELEARN_INTERVAL_SECONDS", 300))
