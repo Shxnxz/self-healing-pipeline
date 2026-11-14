@@ -22,7 +22,7 @@ from typing import List, Optional
 
 from agent import config
 from agent import escalation as esc
-from agent.consumer import is_waiting
+from agent.consumer import is_waiting, pending_refusal
 
 
 def thread(failure_id: str) -> dict:
@@ -35,21 +35,31 @@ def open_graph(path: Optional[str] = None):
     return build_graph(open_checkpointer(path or config.CHECKPOINT_PATH))
 
 
-def thread_ids(checkpointer) -> List[str]:
-    """Every workflow saved. SqliteSaver has no index of threads, so ask the table."""
+# Threads whose latest checkpoint has a pending interrupt: the only ones that can be
+# waiting. Checkpoint ids sort by time (SqliteSaver orders by them too), so the few
+# open cases are found without loading every finished workflow.
+_PAUSED = """
+SELECT DISTINCT w.thread_id FROM writes w
+WHERE w.checkpoint_ns = '' AND w.channel = '__interrupt__'
+  AND w.checkpoint_id = (SELECT MAX(c.checkpoint_id) FROM checkpoints c
+                         WHERE c.thread_id = w.thread_id AND c.checkpoint_ns = '')
+"""
+
+
+def paused_thread_ids(checkpointer) -> List[str]:
+    """Candidates for open cases (is_waiting confirms each)."""
     if isinstance(getattr(checkpointer, "conn", None), sqlite3.Connection):
-        rows = checkpointer.conn.execute("SELECT DISTINCT thread_id FROM checkpoints").fetchall()
-        return [row[0] for row in rows]
+        return [row[0] for row in checkpointer.conn.execute(_PAUSED).fetchall()]
     return sorted({c.config["configurable"]["thread_id"] for c in checkpointer.list(None)})
 
 
 def open_cases(graph) -> List[dict]:
     """The workflows waiting for an engineer, highest priority first, then oldest."""
     cases = []
-    for failure_id in thread_ids(graph.checkpointer):
+    for failure_id in paused_thread_ids(graph.checkpointer):
         saved = graph.get_state(thread(failure_id))
         if is_waiting(saved):
-            cases.append(saved.values)
+            cases.append({**saved.values, "refused": pending_refusal(saved)})
     cases.sort(key=lambda s: (-((s.get("priority") or {}).get("score") or 0),
                               (s.get("escalation") or {}).get("escalated_at") or ""))
     return cases
@@ -62,7 +72,7 @@ def waiting_state(graph, failure_id: str) -> dict:
     if not is_waiting(saved):
         sys.exit(f"Failure {failure_id} is not waiting for an engineer (status {saved.values.get('status')}, "
                  f"next {list(saved.next) or 'nothing: it has ended'})")
-    return saved.values
+    return {**saved.values, "refused": pending_refusal(saved)}
 
 
 # ----------------------------------------------------------------------------
@@ -76,7 +86,8 @@ def summary_line(state: dict) -> str:
     return (f"{state.get('failure_id'):<18} {(state.get('priority') or {}).get('tier') or '-':<3} "
             f"{escalation.get('reason'):<22} {failure.get('folder') or '-'}:{what} "
             f"value={failure.get('raw_value')!r} rows={failure.get('rows_affected')} "
-            f"proposed={esc.fix_text(case.get('proposed_fix'))} since {escalation.get('escalated_at')}")
+            f"proposed={esc.fix_text(case.get('proposed_fix'))} since {escalation.get('escalated_at')}"
+            + (" [last decision REFUSED, see show]" if state.get("refused") else ""))
 
 
 def _lines(title: str, items) -> List[str]:
@@ -125,10 +136,19 @@ def render_case(state: dict) -> str:
                f"{(h.get('decision') or {}).get('decision')} by {(h.get('decision') or {}).get('engineer')}"
                for h in escalation.get("history") or []]
     out += _lines("Earlier rounds", history)
+    refused = state.get("refused")
+    if refused:
+        decision = refused.get("decision") or {}
+        out += ["", f"LAST DECISION REFUSED: {decision.get('decision')} by {decision.get('engineer')} "
+                    f"({esc.fix_text(decision) if decision.get('action') else 'no fix'}) was not applied:"]
+        out += [f"  - {p}" for p in refused.get("problems") or []] + ["  The case is still open: decide again."]
     fid = state.get("failure_id")
     out += ["", f"Proposed fix: {esc.fix_text(case.get('proposed_fix'))}", "Decide with one of:"]
-    if case.get("proposed_fix"):
+    if case.get("proposed_fix") and not failed_validation(case):
         out.append(f"  python -m agent.review approve {fid} --by NAME")
+    elif case.get("proposed_fix"):
+        out.append(f"  (approve is hidden: this fix just failed Validate and would fail the same way; "
+                   f"--force runs it again anyway)")
     if failure.get("column_name") and case.get("canonical_values"):
         out.append(f"  python -m agent.review fix {fid} <CANONICAL_VALUE> --by NAME")
     out += [f"  python -m agent.review retry {fid} --by NAME",
@@ -140,8 +160,13 @@ def render_case(state: dict) -> str:
 # ----------------------------------------------------------------------------
 # Deciding
 # ----------------------------------------------------------------------------
+def failed_validation(case: dict) -> bool:
+    """The proposed fix is the one Validate just failed: approving it repeats the same result."""
+    return case.get("reason") == esc.VALIDATION_FAILED
+
+
 def build_decision(state: dict, command: str, engineer: str, note: Optional[str],
-                   value: Optional[str] = None, promote: bool = True) -> dict:
+                   value: Optional[str] = None, force: bool = False, promote: bool = True) -> dict:
     escalation = state.get("escalation") or {}
     case = escalation.get("case") or {}
     kind = {"approve": esc.APPLY_FIX, "fix": esc.APPLY_FIX, "retry": esc.RETRY,
@@ -151,6 +176,9 @@ def build_decision(state: dict, command: str, engineer: str, note: Optional[str]
         fix = case.get("proposed_fix")
         if not fix:
             sys.exit("This case has no proposed fix to approve; use `fix`, `resolved` or `dismiss`.")
+        if failed_validation(case) and not force:
+            sys.exit("The proposed fix is the one that just failed Validate, and approving it would fail the "
+                     "same way. Use `fix VALUE` for another value, `dismiss`, or `approve --force` to run it again.")
         action, params = fix["action"], fix.get("action_params") or {}
     elif command == "fix":
         action, params = "ADD_VARIANT", {"canonical_value": (value or "").strip().upper()}
@@ -186,6 +214,9 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
             cmd.add_argument("value", help="a canonical value of the column")
         cmd.add_argument("--by", default=os.environ.get("ENGINEER_NAME"), help="your name (or ENGINEER_NAME)")
         cmd.add_argument("--note", help="required for resolved and dismiss")
+        if name == "approve":
+            cmd.add_argument("--force", action="store_true",
+                             help="approve a fix that just failed Validate (it will most likely fail again)")
         if name in ("approve", "fix"):
             cmd.add_argument("--no-promote", dest="promote", action="store_false",
                              help="heal these records only; do not add the variant to ref_canonical_mappings")
@@ -208,7 +239,7 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
         sys.exit("Say who decides: --by NAME (or set ENGINEER_NAME)")
     state = waiting_state(graph, args.failure_id)
     message = build_decision(state, args.command, args.by.strip(), args.note, getattr(args, "value", None),
-                             promote=getattr(args, "promote", True))
+                             getattr(args, "force", False), promote=getattr(args, "promote", True))
     _, problems = esc.check_decision(state, message)
     if problems:
         sys.exit("Not sent:\n" + "\n".join(f"  - {p}" for p in problems))

@@ -476,7 +476,20 @@ and resumes the workflow, and its log shows the result:
 ```
 
 A decision for a workflow that is not waiting, or for an older round, is refused and
-logged; the workflow keeps waiting. A decision delivered again after the agent died
+logged; the workflow keeps waiting. If `engineer_review` itself refuses a decision the
+agent had accepted (the reference table changed or could not be read in between), the
+log says `refused`, and `review list` / `show` mark the case with the refused decision
+and why, so nobody believes it is being applied.
+
+After a fix fails Validate, the proposed fix is that same fix: `approve` would replay
+the staged execution and fail the same way, so `show` hides it and `approve` refuses
+unless `--force` is given. Use `fix VALUE` for another value.
+
+**Assumption: whoever can write to `recovery.decisions` is trusted.** The topic is not
+authenticated and `--by` is free text, so any process that reaches Kafka can apply a
+fix in someone's name, and the audit and the workflow record that name as
+`approved_by`. That is acceptable for this project's single-host setup; a real
+deployment would need Kafka ACLs on the topic or signed decisions. A decision delivered again after the agent died
 while acting on it continues the workflow; delivered again after it finished, it is a
 duplicate. The agent creates both topics at start, so the first decision is not
 delayed by Kafka's metadata refresh.
@@ -593,14 +606,12 @@ LangGraph saves the state after every node in SQLite, under
 - **duplicate**: the workflow ended and every step it went through was real: skip
   it. Kafka delivers at least once.
 - **rerun**: the workflow ended on a stub (`stubbed` is not empty), so it was not
-  really finished: the saved state is dropped and the failure runs again. A fix
-  Remediate staged the first time is not executed twice, its idempotency check
+  really finished: the saved state is dropped and the failure runs again. **Except**
+  a workflow an engineer decided (`escalation.decision` set, or status
+  `RESOLVED_BY_ENGINEER` / `DISMISSED`): that is a duplicate (or relearned, below),
+  never rerun, so the engineer is not asked again and a released fix is not redone. A
+  fix Remediate staged the first time is not executed twice, its idempotency check
   finds the audit record and returns it.
-
-The Kafka offset is committed after the whole stack was handled. While a stack is
-being worked the agent pauses the partition and polls Kafka after every workflow,
-so a long stack does not get it dropped from the consumer group.
-
 - **relearn**: the workflow ended and only Learn is missing: Learn kept raising
   (Neo4j or the reference table was down; the status is `FAILED` with
   `error.node = learn`), or it ended on the Learn stub before Task 107. Learn alone
@@ -609,14 +620,19 @@ so a long stack does not get it dropped from the consumer group.
   does this on its own, without a redelivery: at start for every saved workflow that
   needs it, and every `AGENT_RELEARN_INTERVAL_SECONDS` for those still failing.
 
+The Kafka offset is committed after the whole stack was handled. While a stack is
+being worked the agent pauses the partition and polls Kafka after every workflow,
+so a long stack does not get it dropped from the consumer group.
+
 ### Failures seen while steps were still stubs
 
 A failure that went through a stub ended without its outcome being stored. It is not
 lost for good: the next time it is published it is handled properly. A workflow that
 only missed Learn (every workflow finished between Task 106 and Task 107, including
 cases an engineer already closed) is **relearned**: only Learn runs, nobody is asked
-again. One that went through an earlier stub is **rerun** from the start. To publish
-the failures again, reset the scanner:
+again, and the agent does this on its own at start. A workflow an engineer decided is
+never rerun from the start. One that went through an earlier stub is **rerun**. To
+publish the failures again, reset the scanner:
 
 ```bash
 docker compose rm -sf lookup-scanner

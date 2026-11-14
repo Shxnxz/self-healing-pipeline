@@ -15,7 +15,8 @@ behaviours for a stack item:
              at least once)
   rerun      saved state that ended on a stub step: nothing was really done, so
              forget it and run again. A failure handled before a step was built is
-             therefore picked up when it is published again afterwards.
+             therefore picked up when it is published again afterwards. Never a
+             workflow an engineer decided: that one is a duplicate (or relearned).
   relearn    saved state whose only missing piece is Learn: Learn kept raising (Neo4j
              or the reference table down) or was still the stub. Learn alone runs again
              from the checkpoint before it, so nothing else (no fix, no model call, no
@@ -38,7 +39,7 @@ from langgraph.types import Command
 from agent import config
 from agent import escalation as esc
 from agent.graph import build_graph, open_checkpointer
-from agent.state import initial_state
+from agent.state import STATUS_DISMISSED, STATUS_RESOLVED_BY_ENGINEER, initial_state
 
 NEW, RESUMED, DUPLICATE, RERUN, MALFORMED = "new", "resumed", "duplicate", "rerun", "malformed"
 RELEARN = "relearn"
@@ -48,6 +49,24 @@ DECIDED, REFUSED, UNKNOWN = "decided", "refused", "unknown"
 
 REVIEW_NODE = "engineer_review"
 LEARN_NODE = "learn"
+
+
+def engineer_decided(state: dict) -> bool:
+    """An engineer answered this workflow's escalation. Its outcome is theirs: it is never
+    dropped and run again, even when it ended on a stub, or the engineer would be asked
+    again for a failure they closed (and a fix already released would be redone)."""
+    return bool((state.get("escalation") or {}).get("decision")) or \
+        state.get("status") in (STATUS_RESOLVED_BY_ENGINEER, STATUS_DISMISSED)
+
+
+def pending_refusal(saved) -> Optional[dict]:
+    """The decision engineer_review refused when it re-checked it on resume, if any:
+    it lives only in the pending interrupt's value, so the review CLI reads it there."""
+    for pending in saved.interrupts or ():
+        value = getattr(pending, "value", None)
+        if isinstance(value, dict) and value.get("refused"):
+            return value["refused"]
+    return None
 
 
 def is_waiting(saved) -> bool:
@@ -147,11 +166,11 @@ def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
         return {"delivery": WAITING, "failure_id": failure_id, "state": saved.values}
     if saved.values and saved.next:
         return {"delivery": RESUMED, "failure_id": failure_id, "state": graph.invoke(None, thread)}
-    if needs_learn(saved):
+    if needs_learn(saved):   # before the duplicate check: a decided workflow is relearned too
         summary = relearn(graph, failure_id)
         if summary is not None:
             return summary
-    if saved.values and not saved.values.get("stubbed"):
+    if saved.values and (not saved.values.get("stubbed") or engineer_decided(saved.values)):
         return {"delivery": DUPLICATE, "failure_id": failure_id, "state": saved.values}
     if saved.values:
         graph.checkpointer.delete_thread(failure_id)
@@ -190,6 +209,9 @@ def apply_decision(graph, message: dict) -> dict:
     if problems:
         return {"delivery": REFUSED, "failure_id": failure_id, "state": saved.values, "problems": problems}
     state = graph.invoke(Command(resume=message), thread)
+    refused = pending_refusal(graph.get_state(thread))
+    if refused:   # accepted above, refused by engineer_review's own check a moment later
+        return {"delivery": REFUSED, "failure_id": failure_id, "state": state, "problems": refused["problems"]}
     return {"delivery": DECIDED, "failure_id": failure_id, "state": state}
 
 
