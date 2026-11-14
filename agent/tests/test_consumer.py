@@ -7,8 +7,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agent.consumer import describe, process_lookup, run
 from agent.graph import build_graph, open_checkpointer
 from agent.show import saved_state
-from agent.tests.helpers import (PAST_FIX, REUSE_PATH_BUILT, Killed, lookup_message, path, remediate_ok,
-                                 stack_item, trace)
+from agent.tests.helpers import (PAST_FIX, REUSE_PATH_BUILT, Killed, learn_ok, lookup_message, path, remediate_ok,
+                                 stack_item, stub, trace)
 
 
 def thread(failure_id):
@@ -48,9 +48,10 @@ def test_failure_handled_by_stubs_is_run_again_once_the_steps_are_built(tmp_path
     message = lookup_message(stack_item("f1", route="remediate", match=PAST_FIX))
 
     before = open_checkpointer(db)
-    (stubbed,) = process_lookup(build_graph(before), message)
+    (stubbed,) = process_lookup(build_graph(before, nodes={"remediate": remediate_ok, "validate": stub("validate", validation={"passed": True}),
+                                                           "learn": learn_ok}), message)
     before.conn.close()
-    assert stubbed["delivery"] == "new" and stubbed["state"]["status"] == "ESCALATED"
+    assert stubbed["delivery"] == "new" and stubbed["state"]["stubbed"] == ["validate"]
 
     after = open_checkpointer(db)
     built = build_graph(after, nodes=REUSE_PATH_BUILT)
@@ -60,7 +61,7 @@ def test_failure_handled_by_stubs_is_run_again_once_the_steps_are_built(tmp_path
     assert rerun["delivery"] == "rerun" and rerun["state"]["status"] == "RESOLVED"
     # a clean run, with nothing left over from the stub run
     assert path(rerun["state"]) == ["deterministic_lookup", "remediate", "validate", "learn"]
-    assert "escalation" not in rerun["state"] and rerun["state"]["stubbed"] == []
+    assert len(rerun["state"]["trace"]) == 4 and rerun["state"]["stubbed"] == []
     assert again["delivery"] == "duplicate"
 
 
@@ -108,15 +109,15 @@ def test_describe_shows_the_failure_the_outcome_and_the_path():
     (summary,) = process_lookup(build_graph(InMemorySaver()), lookup_message(stack_item("f1")))
     line = describe(summary)
     assert "f1" in line and "Crash1:crash_month" in line and "'Jule'" in line
-    assert "ESCALATED (deterministic_lookup > diagnose > policy_gate > escalate > learn)" in line
-    assert line.endswith("[stubs: escalate, learn]")   # Diagnose and the gate are real since Task 103
+    assert "ESCALATED NO_DIAGNOSIS, waiting for an engineer: python -m agent.review show f1" in line
+    assert line.endswith("(deterministic_lookup > diagnose > policy_gate > escalate)")   # no stub on this path
 
 
 def test_saved_state_can_be_read_back_by_failure_id():
     graph = build_graph(InMemorySaver())
     process_lookup(graph, lookup_message(stack_item("f1")))
     state = saved_state(graph, "f1")
-    assert state["status"] == "ESCALATED" and state["next"] == []
+    assert state["status"] == "ESCALATED" and state["next"] == ["engineer_review"]
     assert state["failure"]["raw_value"] == "Jule"
     assert saved_state(graph, "never-seen") == {}
 

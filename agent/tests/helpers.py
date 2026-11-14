@@ -74,6 +74,14 @@ def learn_ok(state):
             "status": state.get("status") or "RESOLVED", "trace": trace("learn")}
 
 
+def stub(name, **keys):
+    """A step as it was before it was built: does nothing (beyond `keys`) and says so in
+    `stubbed`. stub("validate", validation={"passed": True}) lets the workflow go on."""
+    def node(state):
+        return {**keys, "stubbed": [name], "trace": trace(name)}
+    return node
+
+
 def escalate_ok(state):
     return {"escalation": {"status": "PENDING_REVIEW", "reason": "asked"}, "status": "ESCALATED",
             "trace": trace("escalate")}
@@ -157,3 +165,114 @@ def write_quarantine(path, rows):
 def jule_quarantine(path, rows=10):
     """The quarantine behind stack_item(): `rows` records of Crash1 with crash_month = Jule."""
     return write_quarantine(path, [quarantine_row(f"r{n:02d}", {"crash_month": "Jule"}) for n in range(rows)])
+
+
+# --- Task 105: what a replay through Silver 2 reports (agent/replay.py) ----------------
+class FakeReplay:
+    """Stands in for agent.replay.Replay: a report and a release that only records calls."""
+
+    def __init__(self, target_table, record_ids, column, overlay, rows=None, existing_mapping=None,
+                 in_silver2=(), released_before=False, quarantine_version=3):
+        (raw, canonical), = overlay[column].items()
+        self.target_table, self.column, self.canonical = target_table, column, canonical
+        self.rows = rows if rows is not None else [fixed_row(rid, column, canonical) for rid in record_ids]
+        self.existing_mapping, self.in_silver2 = existing_mapping, list(in_silver2)
+        self.released_before, self.quarantine_version = released_before, quarantine_version
+        self.released, self.closed = [], False
+
+    def mark_released_before(self, execution_id):
+        pass
+
+    def report(self):
+        return {"rows": self.rows, "canonical_values": CANONICAL.get(self.column, []),
+                "existing_mapping": self.existing_mapping, "in_silver2": self.in_silver2,
+                "released_before": self.released_before, "quarantine_version": self.quarantine_version}
+
+    def release(self, execution_id, record_ids):
+        self.released.append((execution_id, list(record_ids)))
+        return {"appended": len(record_ids), "marked": len(record_ids)}
+
+    def close(self):
+        self.closed = True
+
+
+def fixed_row(record_id, column="crash_month", value="JULY", crash_date=None, before=None, after=None,
+              status="PENDING", resolved_by=None):
+    """One replayed record: by default it failed only `column` and is now fixed."""
+    return {"record_id": record_id, "healing_status": status, "resolved_by": resolved_by,
+            "before": before if before is not None else [column], "after": after or {},
+            "value": value, "crash_date": crash_date}
+
+
+def fixed_replay(target_table, record_ids, column, overlay):
+    """agent.replay.replay_group in tests: every staged record comes back fixed."""
+    return FakeReplay(target_table, record_ids, column, overlay)
+
+
+# --- Task 107: incident memory (Neo4j) and the reference table, in memory --------------
+class FakeMemory:
+    """Stands in for Neo4j (agent/memory/incidents.py) and for the promotion's reads and
+    writes of ref_canonical_mappings (agent/promotion.py). Same signatures, no I/O."""
+
+    def __init__(self, mappings=None):
+        self.incidents = {}      # incident_id -> stored properties
+        self.mappings = dict(mappings or {})   # (column, RAW) -> canonical value
+        self.promoted = []       # rows promote() inserted
+        self.writes = 0
+        self.down = False        # True: every call raises, like Neo4j being unreachable
+
+    def _check(self):
+        if self.down:
+            raise ConnectionError("Neo4j is down")
+
+    # agent.memory.incidents
+    def shared_driver(self):
+        self._check()
+        return self
+
+    def write_incident(self, driver, *, incident_id, table_name, column_name, raw_value, failure_type, diagnosis,
+                       action, action_params, outcome, resolved_by, confidence, verified, rows_affected,
+                       embedding, signature_text, extra=None):
+        from agent.memory.incidents import signature_key
+
+        self._check()
+        self.writes += 1
+        stored = dict(self.incidents.get(incident_id) or {})
+        stored.update(incident_id=incident_id, signature_key=signature_key(table_name, column_name, raw_value),
+                      signature_text=signature_text, table_name=table_name, column_name=column_name,
+                      raw_value=raw_value, failure_type=failure_type, diagnosis=diagnosis, action=action,
+                      action_params=dict(action_params), outcome=outcome, resolved_by=resolved_by,
+                      confidence=confidence, verified=verified, rows_affected=rows_affected,
+                      embedding=embedding)
+        for key, value in (extra or {}).items():
+            if value is None:
+                stored.pop(key, None)
+            else:
+                stored[key] = value
+        self.incidents[incident_id] = stored
+        return incident_id
+
+    def signature_history(self, driver, key):
+        self._check()
+        return [dict(i) for i in self.incidents.values() if i["signature_key"] == key]
+
+    def mark_promotion(self, driver, incident_id, promotion, reason):
+        self._check()
+        stored = self.incidents[incident_id]
+        stored.update(promotion=promotion, promotion_reason=reason,
+                      promoted=promotion == "PROMOTED" or stored.get("promoted", False))
+
+    # agent.promotion
+    def current_mapping(self, column, raw, path=None):
+        self._check()
+        return self.mappings.get((column, raw.strip().upper()))
+
+    def promote(self, column, raw, canonical, added_by, source, path=None):
+        self._check()
+        key = (column, raw.strip().upper())
+        if key in self.mappings:
+            return False
+        self.mappings[key] = canonical
+        self.promoted.append({"column": column, "raw": key[1], "canonical": canonical,
+                              "added_by": added_by, "source": source})
+        return True

@@ -11,7 +11,7 @@ from agent.consumer import run_workflow
 from agent.graph import build_graph
 from agent.nodes.remediate import make_remediate, remediate
 from agent.state import initial_state
-from agent.tests.helpers import (PAST_FIX, Killed, canonical_values, jule_quarantine, path, quarantine_row,
+from agent.tests.helpers import (PAST_FIX, stub, Killed, canonical_values, jule_quarantine, path, quarantine_row,
                                  schema_item, stack_item, write_quarantine)
 
 JULY = {"action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"}, "source": "DIAGNOSIS",
@@ -232,10 +232,11 @@ def test_a_step_retry_after_the_fix_was_executed_does_not_execute_it_again():
 
 
 def test_a_failure_rerun_because_a_later_step_is_a_stub_is_not_executed_again():
-    """Validate is still a stub, so the consumer runs the whole workflow again when the
-    failure is published again. Remediate is real and has already staged the fix."""
+    """A later step is a stub (as Validate and Learn once were), so the consumer runs the
+    whole workflow again when the failure is published again. Remediate is real and has
+    already staged the fix."""
     jule_quarantine(config.QUARANTINE_PATH)
-    graph = build_graph(InMemorySaver())
+    graph = build_graph(InMemorySaver(), nodes={"validate": stub("validate", validation={"passed": True})})
     item = stack_item(route="remediate", match=PAST_FIX)
     first = run_workflow(graph, "L1", item)
     assert first["delivery"] == "new" and first["state"]["execution"]["idempotent_replay"] is False
