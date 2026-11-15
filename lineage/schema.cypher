@@ -18,10 +18,11 @@
 //     table_name      STRING   affected Silver table, e.g. "silver2_crash3"
 //     column_name     STRING   failing column, e.g. "crash_month" (NULL for table-level failures)
 //     raw_value       STRING   value as it landed in quarantine, e.g. "Jule"
-//     diagnosis       STRING   root-cause text (LLM hypothesis or engineer note)
-//     action          STRING   one of the pre-approved actions, e.g. ADD_VARIANT
+//     diagnosis       STRING   root-cause text (LLM hypothesis, engineer note, or the failed checks)
+//     action          STRING   one of the pre-approved actions, e.g. ADD_VARIANT; MANUAL (an engineer
+//                              fixed it by hand: context, never reused) or DISMISS
 //     action_params   STRING   JSON, e.g. {"canonical_value": "JUNE"}
-//     outcome         STRING   SUCCESS | FAILED_VALIDATION | REJECTED
+//     outcome         STRING   SUCCESS | FAILED_VALIDATION | DISMISSED (REJECTED is reserved)
 //     resolved_by     STRING   LOOKUP | LLM | ENGINEER
 //     confidence      FLOAT    0..1, LLM self-reported (NULL when resolved_by = ENGINEER)
 //     verified        BOOLEAN  true only when validation passed or an engineer approved;
@@ -29,7 +30,23 @@
 //     rows_affected   INTEGER  quarantine rows in the group
 //     created_at      DATETIME
 //     resolved_at     DATETIME
-//     embedding       LIST<FLOAT>  vector over signature_text, see index below
+//     embedding       LIST<FLOAT>  vector over signature_text, see index below; absent when
+//                              no embedding model is configured
+//
+//     Provenance written by Learn (agent/nodes/learn.py), all optional:
+//     failure_id      STRING   the workflow (one SUCCESS/DISMISSED incident per workflow has
+//                              incident_id = failure_id; a failed attempt "<failure_id>:attempt:<round>")
+//     batch_ids       LIST<STRING>  "<table>:<silver2 batch>" the group came from; promotion counts them
+//     fix_source      STRING   DIAGNOSIS | INCIDENT | ENGINEER (action.source)
+//     matched_by      STRING   EXACT | STRUCTURED | EMBEDDING, when the fix was reused from an incident
+//     reused_incident_id STRING
+//     borrowed        BOOLEAN  the fix was borrowed from a similar incident (or from a borrowed one)
+//                              and no engineer approved it: still treated as borrowed on reuse
+//     approved_by     STRING   the engineer who approved or decided the fix
+//     engineer, engineer_note, escalation_reasons, priority_tier, execution_id, lookup_id,
+//     workflow_status, promote_declined, dismissed_fix, attempt_round
+//     promotion       STRING   Learn's promotion decision: PROMOTED | ALREADY_IN_TABLE |
+//                              BELOW_THRESHOLD | BLOCKED | DECLINED (+ promotion_reason, promotion_at, promoted)
 //   })
 //
 //   (:Incident)-[:AFFECTS]->(:Table {name})   table the failure was detected in; lets

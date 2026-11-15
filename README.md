@@ -25,6 +25,14 @@ The layout lives in `spark-jobs/sources.py`. `SOURCES` (default
 `crash1,crash2,crash3,crash4`) on the Spark services must name the same folders as
 the producer's `TABLES`; a source with no data blocks the layers after it.
 
+Slash and dash dates are ambiguous (`01/03/2021`), so each source declares its
+order. `DAY_FIRST_SOURCES` (default `crash3`) lists the sources that write
+`dd/MM/yyyy`; every other source is read `MM/dd/yyyy`. Silver 2 refuses to start if
+`DAY_FIRST_SOURCES` is set to something that is not in `SOURCES` (the default `crash3`
+is exempt, so a run with `SOURCES=crash4` needs no change). Day-first sources are
+strict (a value like `02/24/2021` goes to quarantine); month-first sources still fall
+back to day first for values like `25/12/2021`.
+
 ## Prerequisites
 
 - Docker + Docker Compose v2
@@ -161,6 +169,58 @@ structured failure, its lineage context (blast radius score 0-100 with a breakdo
 its incident context (best past fix, and whether it can be reused). `route` says
 `remediate` or `diagnose`. Unit tests: `python -m pytest lookup/tests`.
 
+## Replay and fault injection
+
+`tools/` has two one-off commands that run the pipeline's own Spark code
+([tools/README.md](tools/README.md)):
+
+- `python -m tools.replay` reprocesses one dead-lettered micro-batch (Silver 1 after a
+  column rename, Silver 2 after a crash) or a quarantine group that the current
+  reference table now fixes, without re-running the dataset (spec RM1).
+- `python -m tools.fault_injector` copies clean records, breaks one thing in each
+  (typos, ambiguous values, unseen variants and formats, schema changes, broken
+  messages), publishes them to Kafka, keeps the right answer for each in
+  `fault_injections`, and `status` follows every record through the pipeline. It
+  only runs in the separate evaluation stack (`docker-compose.eval.yml`: its own
+  Delta folder `./eval`, Kafka and Neo4j), so the agent never learns fixes from
+  test records in the real pipeline.
+
+```bash
+docker compose run --rm tools python -m tools.replay list
+docker compose -f docker-compose.yml -f docker-compose.eval.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
+```
+
+## Recovery agent (LangGraph loop)
+
+`agent/` reads `recovery.lookup` and runs one LangGraph workflow per failure:
+deterministic lookup, diagnose, policy gate, remediate, validate, escalate, learn.
+The state of every workflow is saved after each step (SQLite, volume `agent-state`),
+so a crashed workflow resumes and a redelivered one is skipped. See
+[agent/README.md](agent/README.md).
+
+Diagnose asks a reasoning model (Qwen on Ollama, `DIAGNOSE_MODEL`) for a root cause
+and one fix out of a pre-approved action list. The policy gate lets the fix run only
+when the model's confidence reaches `POLICY_CONFIDENCE_THRESHOLD` (0.85) and the
+action is in the safe set (today only `ADD_VARIANT`); everything else goes to an
+engineer with the reasons. Where a record can decide the value (`crash_month` and
+`crash_day_of_week` against `crash_date`) the gate checks it against the quarantined
+records; where nothing can, the stricter `POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD`
+(0.95) applies. `docker compose exec recovery-agent python -m agent.check_model`
+confirms the model answers.
+
+Remediate executes an approved fix exactly once: it checks the audit table first,
+stages the failure's quarantined records with the proposed mapping, and writes one
+audit record (action, parameters, affected records, timestamp) to the Delta table
+`delta/remediation_audit`. Staging changes nothing in Silver 2, the quarantine or the
+reference table. Print the records with
+`docker compose exec recovery-agent python -m agent.audit`.
+
+Validate and the steps after it are still stubs, so every failure currently ends
+`ESCALATED`. A failure that ended on a stub is run again when it is published again
+after the step is built; a fix Remediate already staged is then not executed a
+second time. Unit tests: `python -m pytest agent`.
+
 ## Swapping in the real dataset later
 
 1. Drop the real CSV into `data/` (e.g. `data/cars_dataset_2025.csv`).
@@ -177,8 +237,6 @@ its incident context (best past fix, and whether it can be reused). `route` says
   there; ask if you want to work through that pattern.
 - **Multi-source / schema-drift simulation** — vary formatting per
   simulated source, deliberately rename/drop a field mid-stream.
-- **Fault injection harness** — a corruption step between the CSV and the
-  producer.
 - **Detect/triage layer** — Great Expectations checkpoints on `silver_cars`,
   plus the severity-classification logic from the architecture doc.
 

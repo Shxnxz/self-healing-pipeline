@@ -156,8 +156,11 @@ FROM {bronze_flat}
 """
 
 
-def write_clean_batch(batch_df, batch_id, silver1_path, txn_app_id):
-    """Run the existing cleanup only after source schema validation."""
+def clean_batch(batch_df):
+    """Bronze rows (raw_value, topic, kafka_timestamp) -> Silver 1 rows, nothing written.
+
+    Also used by tools/fault_injector.py to predict what Silver 1 makes of a record.
+    """
     spark = batch_df.sparkSession
     flattened = batch_df.select(
         col("topic"),
@@ -176,9 +179,12 @@ def write_clean_batch(batch_df, batch_id, silver1_path, txn_app_id):
         ],
     )
 
-    silver1 = spark.sql(SILVER1_TRANSFORM_SQL, bronze_flat=flattened)
+    return spark.sql(SILVER1_TRANSFORM_SQL, bronze_flat=flattened)
 
-    idempotent_append(silver1, silver1_path, txn_app_id + "_clean", batch_id)
+
+def write_clean_batch(batch_df, batch_id, silver1_path, txn_app_id):
+    """Run the existing cleanup only after source schema validation."""
+    idempotent_append(clean_batch(batch_df), silver1_path, txn_app_id + "_clean", batch_id)
 
 
 def start(
