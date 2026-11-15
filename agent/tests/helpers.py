@@ -157,3 +157,45 @@ def write_quarantine(path, rows):
 def jule_quarantine(path, rows=10):
     """The quarantine behind stack_item(): `rows` records of Crash1 with crash_month = Jule."""
     return write_quarantine(path, [quarantine_row(f"r{n:02d}", {"crash_month": "Jule"}) for n in range(rows)])
+
+
+# --- Task 105: what a replay through Silver 2 reports (agent/replay.py) ----------------
+class FakeReplay:
+    """Stands in for agent.replay.Replay: a report and a release that only records calls."""
+
+    def __init__(self, target_table, record_ids, column, overlay, rows=None, existing_mapping=None,
+                 in_silver2=(), released_before=False, quarantine_version=3):
+        (raw, canonical), = overlay[column].items()
+        self.target_table, self.column, self.canonical = target_table, column, canonical
+        self.rows = rows if rows is not None else [fixed_row(rid, column, canonical) for rid in record_ids]
+        self.existing_mapping, self.in_silver2 = existing_mapping, list(in_silver2)
+        self.released_before, self.quarantine_version = released_before, quarantine_version
+        self.released, self.closed = [], False
+
+    def mark_released_before(self, execution_id):
+        pass
+
+    def report(self):
+        return {"rows": self.rows, "canonical_values": CANONICAL.get(self.column, []),
+                "existing_mapping": self.existing_mapping, "in_silver2": self.in_silver2,
+                "released_before": self.released_before, "quarantine_version": self.quarantine_version}
+
+    def release(self, execution_id, record_ids):
+        self.released.append((execution_id, list(record_ids)))
+        return {"appended": len(record_ids), "marked": len(record_ids)}
+
+    def close(self):
+        self.closed = True
+
+
+def fixed_row(record_id, column="crash_month", value="JULY", crash_date=None, before=None, after=None,
+              status="PENDING", resolved_by=None):
+    """One replayed record: by default it failed only `column` and is now fixed."""
+    return {"record_id": record_id, "healing_status": status, "resolved_by": resolved_by,
+            "before": before if before is not None else [column], "after": after or {},
+            "value": value, "crash_date": crash_date}
+
+
+def fixed_replay(target_table, record_ids, column, overlay):
+    """agent.replay.replay_group in tests: every staged record comes back fixed."""
+    return FakeReplay(target_table, record_ids, column, overlay)

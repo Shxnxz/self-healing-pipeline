@@ -1,7 +1,7 @@
 """No test may reach a real model or the pipeline's Delta tables by accident."""
 import pytest
 
-from agent import config, llm, reference
+from agent import config, llm, reference, replay
 from agent.tests import helpers
 
 
@@ -11,6 +11,15 @@ def temp_tables(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "REMEDIATION_AUDIT_PATH", str(tmp_path / "remediation_audit"))
     monkeypatch.setattr(config, "QUARANTINE_PATH", str(tmp_path / "silver2_quarantine"))
     monkeypatch.setattr(config, "REF_MAPPINGS_PATH", str(tmp_path / "ref_canonical_mappings"))
+    monkeypatch.setattr(config, "DELTA_ROOT", str(tmp_path))   # Validate's Silver 2 tables
+
+
+@pytest.fixture(autouse=True)
+def no_spark(monkeypatch, request):
+    """Validate replays through Spark. Unless a test asks for the real thing, the replay
+    finds every staged record fixed (helpers.fixed_replay), and no JVM is started."""
+    if "spark" not in request.keywords:
+        monkeypatch.setattr(replay, "replay_group", helpers.fixed_replay)
 
 
 @pytest.fixture(autouse=True)
@@ -29,3 +38,4 @@ def offline(monkeypatch, request):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "real_io: the test exercises llm.py or reference.py itself")
+    config.addinivalue_line("markers", "spark: the test replays through real Spark (agent/replay.py)")

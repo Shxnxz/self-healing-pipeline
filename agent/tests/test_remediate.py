@@ -232,7 +232,7 @@ def test_a_step_retry_after_the_fix_was_executed_does_not_execute_it_again():
 
 
 def test_a_failure_rerun_because_a_later_step_is_a_stub_is_not_executed_again():
-    """Validate is still a stub, so the consumer runs the whole workflow again when the
+    """Learn is still a stub, so the consumer runs the whole workflow again when the
     failure is published again. Remediate is real and has already staged the fix."""
     jule_quarantine(config.QUARANTINE_PATH)
     graph = build_graph(InMemorySaver())

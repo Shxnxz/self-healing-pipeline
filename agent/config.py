@@ -75,3 +75,13 @@ POLICY_SAFE_ACTIONS = None if not _safe else ([] if "NONE" in _safe else _safe)
 # The audit table: one row per execution, written by the agent and by nothing else.
 # It is the only table Remediate writes; the pipeline's own tables stay read only.
 REMEDIATION_AUDIT_PATH = os.environ.get("REMEDIATION_AUDIT_PATH", "/data/delta/remediation_audit")
+
+# --- Validate (spec VD1 to VD4) --------------------------------------------------
+# Validate re-runs Silver 2's own standardization (spark-jobs/silver2_job.py) on the
+# staged records, so it needs Spark and the pipeline's job code. The agent starts one
+# small local Spark session the first time it validates and keeps it.
+SPARK_JOBS_DIR = os.environ.get(
+    "SPARK_JOBS_DIR", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spark-jobs"))
+DELTA_ROOT = os.environ.get("DELTA_ROOT", "/data/delta").rstrip("/")
+VALIDATE_SPARK_MASTER = os.environ.get("VALIDATE_SPARK_MASTER", "local[2]")
+VALIDATE_SPARK_DRIVER_MEMORY = os.environ.get("VALIDATE_SPARK_DRIVER_MEMORY", "512m")

@@ -9,7 +9,7 @@ from langgraph.types import interrupt
 
 from agent import reference
 from agent.graph import build_graph
-from agent.state import NOT_IMPLEMENTED, initial_state
+from agent.state import initial_state
 from agent.tests.helpers import (PAST_FIX, canonical_values, diagnose_july, escalate_ok, gate_passes,
                                  gate_passes_without_action, jule_quarantine, learn_ok, path, remediate_ok,
                                  stack_item, trace, validate_fails, validate_ok)
@@ -61,15 +61,15 @@ def test_remediate_that_cannot_execute_never_claims_a_fix():
     assert state["status"] == "ESCALATED" and state["learned"]["written"] is False
 
 
-def test_executed_fix_goes_to_validate_which_is_still_a_stub(tmp_path, monkeypatch):
+def test_executed_fix_is_validated_and_goes_to_learn(tmp_path, monkeypatch):
     monkeypatch.setattr(reference, "read_canonical_values", canonical_values)
     jule_quarantine(tmp_path / "silver2_quarantine")
     state = run(stack_item(route="remediate", match=PAST_FIX))
-    assert path(state) == ["deterministic_lookup", "remediate", "validate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "remediate", "validate", "learn"]
     assert state["execution"]["status"] == "SUCCESS" and state["execution"]["rows_affected"] == 10
-    assert state["validation"]["status"] == NOT_IMPLEMENTED
-    assert state["escalation"]["reason"] == "VALIDATION_FAILED" and state["status"] == "ESCALATED"
-    assert state["stubbed"] == ["validate", "escalate", "learn"]   # Remediate is real since Task 104
+    assert state["validation"]["status"] == "PASSED" and state["validation"]["rows_released"] == 10
+    assert "escalation" not in state and state["status"] == "RESOLVED"
+    assert state["stubbed"] == ["learn"]   # Validate is real since Task 105
 
 
 def test_stubs_mark_the_workflow_so_it_is_not_taken_for_a_real_result():
