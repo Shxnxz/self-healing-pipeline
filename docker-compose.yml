@@ -269,10 +269,18 @@ services:
     restart: on-failure
     volumes:
       - agent-state:/state
-      # The pipeline's tables. The agent writes three kinds: delta/remediation_audit
-      # (Remediate), the healed rows appended to silver2_<source> and their quarantine
-      # rows marked RESOLVED (Validate). Everything else it only reads.
-      - ./delta:/data/delta
+      - ./delta:/data/delta:ro # the pipeline's tables, read only
+      # The tables the agent writes, mounted writable inside the read-only ./delta:
+      # Remediate's audit record, and the healed rows Validate releases (appended to
+      # silver2_<source>, their quarantine rows marked RESOLVED). A source added to
+      # SOURCES needs its silver2_<source> line here too, or Validate cannot release
+      # its rows (the write fails and the failure is escalated).
+      - ./delta/remediation_audit:/data/delta/remediation_audit
+      - ./delta/silver2_quarantine:/data/delta/silver2_quarantine
+      - ./delta/silver2_crash1:/data/delta/silver2_crash1
+      - ./delta/silver2_crash2:/data/delta/silver2_crash2
+      - ./delta/silver2_crash3:/data/delta/silver2_crash3
+      - ./delta/silver2_crash4:/data/delta/silver2_crash4
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       LOOKUP_OUTPUT_TOPIC: recovery.lookup
