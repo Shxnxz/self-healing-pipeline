@@ -11,15 +11,12 @@ is checked here:
   Learn       REF_MAPPINGS_PATH (promoted variants)
 """
 import re
-import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "spark-jobs"))
-import sources  # noqa: E402
 
 _DEFAULT = re.compile(r"^\$\{[A-Z_]+:-(.*)\}$")
 
@@ -28,6 +25,12 @@ def _value(raw):
     """A compose value, with ${NAME:-default} read as its default."""
     match = _DEFAULT.match(str(raw))
     return match.group(1) if match else str(raw)
+
+
+def _sources(raw):
+    """Source names as spark-jobs/sources.source_names reads SOURCES. Not imported:
+    sources.py fixes DELTA_ROOT when first imported, which test_validate_spark sets later."""
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
 
 
 @pytest.fixture(scope="module")
@@ -53,8 +56,8 @@ def written_tables(compose):
                      for s in compose["services"].values() if "SOURCES" in (s.get("environment") or {})}
     assert spark_sources, "no service sets SOURCES"
     names = []
-    for raw in sorted(spark_sources) + [env.get("SOURCES", sources.DEFAULT_SOURCES)]:
-        names += [n for n in sources.source_names(raw) if n not in names]
+    for raw in sorted(spark_sources) + ([env["SOURCES"]] if "SOURCES" in env else []):
+        names += [n for n in _sources(raw) if n not in names]
     tables = [env["REMEDIATION_AUDIT_PATH"], env["QUARANTINE_PATH"], env["REF_MAPPINGS_PATH"]]
     tables += [f"{root}/silver2_{name}" for name in names]
     return [t.rstrip("/") for t in tables]
