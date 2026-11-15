@@ -17,7 +17,9 @@
 #   docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
 #   docker compose -f docker-compose.yml -f docker-compose.eval.yml down -v   # then delete ./eval for a fresh start
 #
-# Needs Docker Compose 2.24.4 or newer (the !override tags replace the main file's ports).
+# Needs Docker Compose 2.24.4 or newer. `!override` replaces the main file's list
+# (ports, volumes) instead of merging into it: every service that touches tables
+# lists all its mounts here, so none of the main file's ./delta mounts survive.
 name: self-healing-eval
 
 services:
@@ -42,19 +44,25 @@ services:
 
   bronze-silver1-job:
     container_name: eval-bronze-silver1-job
-    volumes:
+    volumes: !override
+      - ./spark-jobs:/app
+      - ./qwen_classifier:/app/qwen_classifier:ro
       - ./eval/incidents:/data/incidents
       - ./eval/delta:/data/delta
       - ./eval/checkpoints:/data/checkpoints
+      - ivy-cache:/root/.ivy2
     environment:
       SOURCES: ${EVAL_SOURCES:-crash1,crash3}
 
   silver2-gold-job:
     container_name: eval-silver2-gold-job
-    volumes:
+    volumes: !override
+      - ./spark-jobs:/app
+      - ./qwen_classifier:/app/qwen_classifier:ro
       - ./eval/incidents:/data/incidents
       - ./eval/delta:/data/delta
       - ./eval/checkpoints:/data/checkpoints
+      - ivy-cache:/root/.ivy2
     environment:
       SOURCES: ${EVAL_SOURCES:-crash1,crash3}
 
@@ -72,20 +80,34 @@ services:
 
   lookup-scanner:
     container_name: eval-lookup-scanner
-    volumes:
+    volumes: !override
       - ./eval/delta:/data/delta:ro
+      - lookup-state:/state
 
   deterministic-lookup:
     container_name: eval-deterministic-lookup
 
   tools:
-    volumes:
+    volumes: !override
+      - .:/repo:ro
       - ./eval/delta:/data/delta
+      - ivy-cache:/root/.ivy2
     environment:
       PIPELINE_STACK: evaluation
       SOURCES: ${EVAL_SOURCES:-crash1,crash3}
 
   recovery-agent:
     container_name: eval-recovery-agent
-    volumes:
-      - ./eval/delta:/data/delta
+    # Same layout as the main file (tables read only, the ones the agent writes
+    # mounted writable), all from ./eval. Keep it in step with the main file's list:
+    # tools/tests/test_eval_stack.py fails if an eval service mounts the main tables.
+    volumes: !override
+      - agent-state:/state
+      - ./eval/delta:/data/delta:ro
+      - ./eval/delta/remediation_audit:/data/delta/remediation_audit
+      - ./eval/delta/silver2_quarantine:/data/delta/silver2_quarantine
+      - ./eval/delta/ref_canonical_mappings:/data/delta/ref_canonical_mappings
+      - ./eval/delta/silver2_crash1:/data/delta/silver2_crash1
+      - ./eval/delta/silver2_crash2:/data/delta/silver2_crash2
+      - ./eval/delta/silver2_crash3:/data/delta/silver2_crash3
+      - ./eval/delta/silver2_crash4:/data/delta/silver2_crash4

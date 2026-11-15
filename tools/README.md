@@ -63,8 +63,16 @@ docker compose -f docker-compose.yml -f docker-compose.eval.yml down -v
 ```
 
 It needs Docker Compose 2.24.4 or newer (Docker Desktop 4.27+), for the `!override`
-tags that replace the main file's host ports. Running both stacks at once needs
-memory for two sets of Spark drivers; stop the main one if the machine is short.
+tags: they replace the main file's host ports and each table-touching service's whole
+mount list, so none of the main file's `./delta` mounts (such as the agent's writable
+`./delta/silver2_<source>`) survive into the evaluation stack. When a mount is added to
+a service in `docker-compose.yml`, add its `./eval` twin in `docker-compose.eval.yml`;
+`tools/tests/test_eval_stack.py` reads the merged config (`docker compose config`) and
+fails if an evaluation service mounts anything from `./delta`, `./checkpoints` or
+`./incidents`, or if the eval agent lacks a table mount the main agent has.
+
+Running both stacks at once needs memory for two sets of Spark drivers; stop the
+main one if the machine is short.
 
 Learning inside the evaluation stack is intended: a second run of the same scenario
 measures what the first one taught (records predicted `CLEAN`). For independent runs,
