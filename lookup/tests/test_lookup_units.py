@@ -261,3 +261,41 @@ def test_quarantine_folder_comes_from_target_table():
              "columns_to_remediate": {"crash_month": "JULE"}}]
     (g,) = group_quarantine_rows(rows)
     assert g.folder == "crash3" and g.rows_affected == 2
+
+
+# --- what Learn stores (Task 107) ------------------------------------------------
+def test_a_manual_resolution_is_context_but_never_reused():
+    f = quarantine_failure()
+    past = incident(action="MANUAL", action_params="{}", diagnosis="re-sent the file")
+    ctx = evaluate(f, "silver2_crash1", past, [], [])
+    assert not ctx["reusable"] and ctx["match"] is None
+    assert ctx["candidates"][0]["diagnosis"] == "re-sent the file"
+    assert "fixed by hand" in ctx["candidates"][0]["reason"]
+
+
+def test_a_fix_learn_stored_as_borrowed_stays_borrowed_on_an_exact_match():
+    f = quarantine_failure()
+    ctx = evaluate(f, "silver2_crash1", incident(borrowed=True), [], [])
+    assert ctx["reusable"] and ctx["match"]["matched_by"] == "EXACT" and ctx["match"]["borrowed"] is True
+    plain = evaluate(f, "silver2_crash1", incident(), [], [])
+    assert plain["match"]["borrowed"] is False
+
+
+def test_learn_and_the_lookup_embed_the_same_text():
+    from patterns import signature_text
+    from agent.memory.incidents import signature_text as learned_text
+    f = quarantine_failure(value=" jule ")
+    assert signature_text(f, "silver2_crash1") == learned_text("silver2_crash1", "crash_month", " jule ",
+                                                               "UNRESOLVED_VALUE")
+
+
+def test_an_exact_value_with_disagreeing_past_fixes_is_not_reused():
+    """MISTY fixed to FOG once and to CLOUDY later: both validated, neither may be reused."""
+    f = quarantine_failure(column="weather_condition", value="Misty")
+    exact = incident(column_name="weather_condition", raw_value="MISTY", action_params='{"canonical_value": "CLOUDY"}',
+                     distinct_fixes=['ADD_VARIANT {"canonical_value": "CLOUDY"}', 'ADD_VARIANT {"canonical_value": "FOG"}'])
+    ctx = evaluate(f, "silver2_crash1", exact, [], [])
+    assert not ctx["reusable"] and ctx["match"] is None
+    assert "past fixes of this exact value disagree" in ctx["reason"]
+    one = evaluate(f, "silver2_crash1", {**exact, "distinct_fixes": exact["distinct_fixes"][:1]}, [], [])
+    assert one["reusable"]

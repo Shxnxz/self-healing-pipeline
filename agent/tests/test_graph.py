@@ -10,7 +10,7 @@ from langgraph.types import interrupt
 from agent import reference
 from agent.graph import build_graph
 from agent.state import initial_state
-from agent.tests.helpers import (PAST_FIX, canonical_values, diagnose_july, escalate_ok, gate_passes,
+from agent.tests.helpers import (PAST_FIX, stub, canonical_values, diagnose_july, escalate_ok, gate_passes,
                                  gate_passes_without_action, jule_quarantine, learn_ok, path, remediate_ok,
                                  stack_item, trace, validate_fails, validate_ok)
 
@@ -75,12 +75,14 @@ def test_executed_fix_is_validated_and_goes_to_learn(tmp_path, monkeypatch):
     assert state["execution"]["status"] == "SUCCESS" and state["execution"]["rows_affected"] == 10
     assert state["validation"]["status"] == "PASSED" and state["validation"]["rows_released"] == 10
     assert "escalation" not in state and state["status"] == "RESOLVED"
-    assert state["stubbed"] == ["learn"]   # Validate is real since Task 105
+    assert state["stubbed"] == []   # every step is real since Task 107
+    assert state["learned"]["status"] == "STORED" and state["learned"]["outcome"] == "SUCCESS"
 
 
 def test_stubs_mark_the_workflow_so_it_is_not_taken_for_a_real_result():
-    state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok, validate=validate_ok)
-    assert state["stubbed"] == ["learn"]   # Escalate is real since Task 106
+    state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok, validate=validate_ok,
+                learn=stub("learn"))
+    assert state["stubbed"] == ["learn"]
     built = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok,
                 validate=validate_ok, learn=learn_ok)
     assert built["stubbed"] == []

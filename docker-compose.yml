@@ -260,7 +260,9 @@ services:
   # gate decides whether its proposal may run, Remediate stages the fix and writes the
   # audit record, and Validate replays the staged records through Silver 2's own code
   # (a small local Spark session) and releases the ones that pass into Silver 2.
-  # Escalate and Learn are still stubs. See agent/README.md.
+  # Escalate hands everything else to an engineer (python -m agent.review), and
+  # Learn stores every outcome as an incident in Neo4j and promotes proven fixes into
+  # ref_canonical_mappings. See agent/README.md.
   recovery-agent:
     build:
       context: .
@@ -271,16 +273,18 @@ services:
       - agent-state:/state
       - ./delta:/data/delta:ro # the pipeline's tables, read only
       # The tables the agent writes, mounted writable inside the read-only ./delta:
-      # Remediate's audit record, and the healed rows Validate releases (appended to
-      # silver2_<source>, their quarantine rows marked RESOLVED). A source added to
-      # SOURCES needs its silver2_<source> line here too, or Validate cannot release
-      # its rows (the write fails and the failure is escalated).
+      # Remediate's audit record, the healed rows Validate releases (appended to
+      # silver2_<source>, their quarantine rows marked RESOLVED), and the variants Learn
+      # promotes into ref_canonical_mappings. A source added to SOURCES needs its
+      # silver2_<source> line here too, or Validate cannot release its rows (the write
+      # fails and the failure is escalated). agent/tests/test_compose.py checks the list.
       - ./delta/remediation_audit:/data/delta/remediation_audit
       - ./delta/silver2_quarantine:/data/delta/silver2_quarantine
       - ./delta/silver2_crash1:/data/delta/silver2_crash1
       - ./delta/silver2_crash2:/data/delta/silver2_crash2
       - ./delta/silver2_crash3:/data/delta/silver2_crash3
       - ./delta/silver2_crash4:/data/delta/silver2_crash4
+      - ./delta/ref_canonical_mappings:/data/delta/ref_canonical_mappings
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       LOOKUP_OUTPUT_TOPIC: recovery.lookup
@@ -302,9 +306,21 @@ services:
       POLICY_SAFE_ACTIONS: ${POLICY_SAFE_ACTIONS:-}
       # A fix borrowed from a similar (not exact) past incident waits for an engineer on these tiers.
       APPROVE_BORROWED_FIX_TIERS: ${APPROVE_BORROWED_FIX_TIERS:-P1}
+      # Learn: incidents go to Neo4j, embedded with the same model as the lookup's.
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-selfhealing}
+      LOOKUP_EMBED_MODEL: ${LOOKUP_EMBED_MODEL:-}
+      LOOKUP_EMBED_BASE_URL: ${LOOKUP_EMBED_BASE_URL:-http://host.docker.internal:11434}
+      # An automatic fix joins ref_canonical_mappings once it healed this many rows in this
+      # many micro-batches (an engineer's fix at once). NEVER = engineers' fixes only.
+      PROMOTE_MIN_OCCURRENCES: ${PROMOTE_MIN_OCCURRENCES:-5}
+      PROMOTE_MIN_BATCHES: ${PROMOTE_MIN_BATCHES:-3}
     depends_on:
       kafka:
         condition: service_healthy
+      neo4j-init:
+        condition: service_completed_successfully
 
 volumes:
   ivy-cache:

@@ -11,7 +11,7 @@ from agent.graph import build_graph
 from agent.nodes.escalate import escalate
 from agent.state import initial_state
 from agent.tests.helpers import (FakeModel, JULY_REPLY, PAST_FIX, canonical_values, diagnose_july, jule_quarantine,
-                                 july_samples, learn_ok, lookup_message, path, remediate_ok, stack_item, trace,
+                                 july_samples, learn_ok, lookup_message, path, remediate_ok, stack_item, stub, trace,
                                  validate_fails, validate_ok)
 
 
@@ -444,11 +444,12 @@ def test_a_borrowed_fix_that_no_longer_fits_is_diagnosed_not_sent_for_approval()
 # --- review of #31: a decided workflow is never thrown away -------------------------------
 @pytest.mark.parametrize("kind, params", [("DISMISS", None), ("APPLY_FIX", {"canonical_value": "JULY"})])
 def test_redelivered_lookup_never_reruns_a_workflow_an_engineer_decided(tmp_path, kind, params):
-    """Learn is still a stub, so the decided workflow ends with stubbed = ['learn']."""
+    """Decided while Learn was still a stub (stubbed = ['learn']): delivered again, only
+    Learn runs (Task 107 relearn), never the whole workflow, and the decision is kept."""
     from agent.graph import open_checkpointer
     jule_quarantine(config.QUARANTINE_PATH, rows=10)
     checkpointer = open_checkpointer(str(tmp_path / "checkpoints.sqlite"))
-    g = build_graph(checkpointer, retry_seconds=0)
+    g = build_graph(checkpointer, nodes={"learn": stub("learn")}, retry_seconds=0)
     message = lookup_message(stack_item("f1"))
     (first,) = process_lookup(g, message)
     state = first["state"]
@@ -456,11 +457,15 @@ def test_redelivered_lookup_never_reruns_a_workflow_an_engineer_decided(tmp_path
                                     params=params))
     assert done["delivery"] == "decided" and done["state"]["stubbed"] == ["learn"]
 
-    (again,) = process_lookup(g, message)
+    built = build_graph(checkpointer, retry_seconds=0)
+    (again,) = process_lookup(built, message)
+    (third,) = process_lookup(built, message)
     checkpointer.conn.close()
-    assert again["delivery"] == "duplicate"
+    assert again["delivery"] == "relearn" and again["state"]["stubbed"] == []
     assert again["state"]["escalation"]["decision"]["decision"] == kind      # the decision is kept
     assert again["state"]["status"] == done["state"]["status"]
+    assert path(again["state"]).count("engineer_review") == 1               # nobody was asked again
+    assert third["delivery"] == "duplicate"
 
 
 # --- review of #31: approving the fix that just failed Validate -----------------------------

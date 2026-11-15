@@ -7,8 +7,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agent.consumer import describe, process_lookup, run
 from agent.graph import build_graph, open_checkpointer
 from agent.show import saved_state
-from agent.tests.helpers import (PAST_FIX, REUSE_PATH_BUILT, Killed, lookup_message, path, remediate_ok,
-                                 stack_item, trace, validate_ok)
+from agent.tests.helpers import (PAST_FIX, REUSE_PATH_BUILT, Killed, learn_ok, lookup_message, path, remediate_ok,
+                                 stack_item, stub, trace)
 
 
 def thread(failure_id):
@@ -48,10 +48,10 @@ def test_failure_handled_by_stubs_is_run_again_once_the_steps_are_built(tmp_path
     message = lookup_message(stack_item("f1", route="remediate", match=PAST_FIX))
 
     before = open_checkpointer(db)
-    (stubbed,) = process_lookup(build_graph(before, nodes={"remediate": remediate_ok, "validate": validate_ok}),
-                                message)
+    (stubbed,) = process_lookup(build_graph(before, nodes={"remediate": remediate_ok, "validate": stub("validate", validation={"passed": True}),
+                                                           "learn": learn_ok}), message)
     before.conn.close()
-    assert stubbed["delivery"] == "new" and stubbed["state"]["stubbed"] == ["learn"]
+    assert stubbed["delivery"] == "new" and stubbed["state"]["stubbed"] == ["validate"]
 
     after = open_checkpointer(db)
     built = build_graph(after, nodes=REUSE_PATH_BUILT)

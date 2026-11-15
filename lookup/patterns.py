@@ -25,7 +25,8 @@ Why "similar" is not enough to remediate
 "Jule" and "June" are one edit apart and score ~0.9, but their fixes differ
 (JULY vs JUNE). A past fix is reused only when its parameters still fit:
 
-  exact signature                     -> reusable
+  exact signature                     -> reusable, unless verified fixes of
+                                         that signature disagree (ambiguous value)
   value failure, same column and the
     same value after normalisation    -> reusable (case / spaces / punctuation only)
   schema failure, identical column
@@ -142,7 +143,13 @@ def similarity(failure: StructuredFailure, table: Optional[str], incident: dict)
 
 
 def transferable(failure: StructuredFailure, incident: dict, components: Dict, exact: bool) -> Tuple[bool, str]:
+    if incident.get("action") in (incidents.MANUAL, incidents.DISMISS):
+        return False, "fixed by hand by an engineer; nothing to repeat, needs diagnosis"
     if exact:
+        fixes = incident.get("distinct_fixes") or []
+        if len(fixes) > 1:   # incidents.find_exact: verified fixes of this value disagree
+            return False, (f"past fixes of this exact value disagree ({'; '.join(sorted(fixes))}); "
+                           "the value is ambiguous, needs diagnosis")
         return True, "exact signature match"
     if failure.family == "VALUE":
         same_value = normalize_value(failure.signature_value) == normalize_value(incident.get("raw_value"))
@@ -177,9 +184,8 @@ ORDER BY i.resolved_at DESC LIMIT 10
 
 
 def signature_text(failure: StructuredFailure, table: Optional[str]) -> str:
-    """Text to embed. The Learn node must embed incidents with the same format and model."""
-    return (f"table={table or ''} column={(failure.column_name or '').strip()} "
-            f"value={(failure.signature_value or '').strip().upper()} failure={failure.failure_type}")
+    """Text to embed. The Learn node embeds incidents with the same function and model."""
+    return incidents.signature_text(table, failure.column_name, failure.signature_value, failure.failure_type)
 
 
 def _params(raw):
@@ -257,6 +263,9 @@ def evaluate(failure: StructuredFailure, table: Optional[str], exact: Optional[d
             "action": inc.get("action"),
             "action_params": params,
             "resolved_by": inc.get("resolved_by"),
+            # The past fix was itself borrowed from a similar incident and nobody approved
+            # it: the agent treats it as borrowed, not exact (APPROVE_BORROWED_FIX_TIERS).
+            "borrowed": bool(inc.get("borrowed")),
         })
 
     best = ranked[0] if ranked else None
