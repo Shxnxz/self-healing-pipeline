@@ -34,6 +34,8 @@ TABLES = {
     "dead_letter": "./delta/silver2_dead_letter",
     "silver2_dead_letter": "./delta/silver2_dead_letter",
     "remediation_audit": "./delta/remediation_audit",
+    "silver1_dead_letter": "./delta/silver1_dead_letter",
+    "fault_injections": "./delta/fault_injections",
     "gold": "./delta/gold",
     # Legacy aliases
     "silver_cars": "./delta/silver_cars",

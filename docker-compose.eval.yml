@@ -1,0 +1,113 @@
+# Evaluation stack: a second, separate copy of the pipeline for fault injection.
+#
+# The recovery agent cannot tell an injected record from a real one, so injecting
+# into the main stack would teach it: Learn would store the fixes as incidents and
+# promote invented spellings into ref_canonical_mappings. This file layers on top of
+# docker-compose.yml and gives the copy its own of everything that holds state:
+#   project name    self-healing-eval (own containers, network and named volumes:
+#                   Neo4j data, lookup and agent state)
+#   Kafka           its own broker, so its own topics and consumer offsets
+#   Delta tables    ./eval/delta        checkpoints  ./eval/checkpoints
+#   host ports      Kafka 39092, Kafka UI 18080, Neo4j 17474 / 17687
+# and tells the tools they are in it (PIPELINE_STACK=evaluation), the only place
+# tools.fault_injector will inject. Its producer sends a small clean sample of
+# Crash1 and Crash3 to inject faults into. See tools/README.md "Evaluation stack".
+#
+#   docker compose -f docker-compose.yml -f docker-compose.eval.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
+#   docker compose -f docker-compose.yml -f docker-compose.eval.yml down -v   # then delete ./eval for a fresh start
+#
+# Needs Docker Compose 2.24.4 or newer. `!override` replaces the main file's list
+# (ports, volumes) instead of merging into it: every service that touches tables
+# lists all its mounts here, so none of the main file's ./delta mounts survive.
+name: self-healing-eval
+
+services:
+  kafka:
+    container_name: eval-kafka
+    ports: !override
+      - "39092:29092" # host-facing listener
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:39092
+
+  kafka-ui:
+    container_name: eval-kafka-ui
+    ports: !override
+      - "18080:8080"
+
+  producer:
+    container_name: eval-producer
+    environment:
+      TABLES: ${EVAL_TABLES:-Crash1,Crash3}
+      CSV_FILES: ${EVAL_CSV_FILES:-}
+      MAX_ROWS_PER_TABLE: ${EVAL_ROWS_PER_TABLE:-2000}
+
+  bronze-silver1-job:
+    container_name: eval-bronze-silver1-job
+    volumes: !override
+      - ./spark-jobs:/app
+      - ./qwen_classifier:/app/qwen_classifier:ro
+      - ./eval/incidents:/data/incidents
+      - ./eval/delta:/data/delta
+      - ./eval/checkpoints:/data/checkpoints
+      - ivy-cache:/root/.ivy2
+    environment:
+      SOURCES: ${EVAL_SOURCES:-crash1,crash3}
+
+  silver2-gold-job:
+    container_name: eval-silver2-gold-job
+    volumes: !override
+      - ./spark-jobs:/app
+      - ./qwen_classifier:/app/qwen_classifier:ro
+      - ./eval/incidents:/data/incidents
+      - ./eval/delta:/data/delta
+      - ./eval/checkpoints:/data/checkpoints
+      - ivy-cache:/root/.ivy2
+    environment:
+      SOURCES: ${EVAL_SOURCES:-crash1,crash3}
+
+  neo4j:
+    container_name: eval-neo4j
+    ports: !override
+      - "17474:7474" # HTTP browser
+      - "17687:7687" # Bolt
+
+  neo4j-init:
+    container_name: eval-neo4j-init
+
+  lineage-consumer:
+    container_name: eval-lineage-consumer
+
+  lookup-scanner:
+    container_name: eval-lookup-scanner
+    volumes: !override
+      - ./eval/delta:/data/delta:ro
+      - lookup-state:/state
+
+  deterministic-lookup:
+    container_name: eval-deterministic-lookup
+
+  tools:
+    volumes: !override
+      - .:/repo:ro
+      - ./eval/delta:/data/delta
+      - ivy-cache:/root/.ivy2
+    environment:
+      PIPELINE_STACK: evaluation
+      SOURCES: ${EVAL_SOURCES:-crash1,crash3}
+
+  recovery-agent:
+    container_name: eval-recovery-agent
+    # Same layout as the main file (tables read only, the ones the agent writes
+    # mounted writable), all from ./eval. Keep it in step with the main file's list:
+    # tools/tests/test_eval_stack.py fails if an eval service mounts the main tables.
+    volumes: !override
+      - agent-state:/state
+      - ./eval/delta:/data/delta:ro
+      - ./eval/delta/remediation_audit:/data/delta/remediation_audit
+      - ./eval/delta/silver2_quarantine:/data/delta/silver2_quarantine
+      - ./eval/delta/ref_canonical_mappings:/data/delta/ref_canonical_mappings
+      - ./eval/delta/silver2_crash1:/data/delta/silver2_crash1
+      - ./eval/delta/silver2_crash2:/data/delta/silver2_crash2
+      - ./eval/delta/silver2_crash3:/data/delta/silver2_crash3
+      - ./eval/delta/silver2_crash4:/data/delta/silver2_crash4
