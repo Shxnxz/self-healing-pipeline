@@ -293,7 +293,7 @@ def test_a_confident_safe_diagnosis_reaches_remediate_with_the_checked_action():
 
 def test_a_rejected_diagnosis_reaches_the_engineer_with_the_reasons():
     state = run(stack_item(), {**JULY_REPLY, "confidence": 0.6}, remediate=remediate_ok, validate=validate_ok)
-    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate"]   # waits for the engineer
     assert state["action"] is None and "execution" not in state and state["status"] == "ESCALATED"
     assert state["escalation"]["reason"] == "POLICY_GATE_REJECTED"
     assert state["escalation"]["details"] == ["confidence 0.60 is below the threshold 0.85"]
@@ -314,7 +314,7 @@ def test_a_model_that_asks_for_an_engineer_reaches_one_without_a_blocked_fix():
     reply = {"hypothesis": "The records point to June and July alike.", "action": "ESCALATE",
              "canonical_value": None, "confidence": 0.4}
     state = run(stack_item(), reply)
-    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate"]   # waits for the engineer
     assert state["policy"]["outcome"] == "ENGINEER_REQUESTED"
     assert state["escalation"]["reason"] == "ENGINEER_REQUESTED"
     assert state["escalation"]["details"] == [
@@ -325,7 +325,7 @@ def test_a_model_that_asks_for_an_engineer_reaches_one_without_a_blocked_fix():
 def settings(monkeypatch, **env):
     """agent.config as it would load with these environment variables."""
     for name in ("POLICY_SAFE_ACTIONS", "POLICY_CONFIDENCE_THRESHOLD", "POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD",
-                 "DIAGNOSE_THINK"):
+                 "DIAGNOSE_THINK", "APPROVE_BORROWED_FIX_TIERS"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -389,3 +389,11 @@ def test_a_threshold_outside_the_range_stops_the_agent_at_start(monkeypatch, env
 def test_diagnose_think_setting(monkeypatch, value, expected):
     env = {} if value is None else {"DIAGNOSE_THINK": value}
     assert settings(monkeypatch, **env)["DIAGNOSE_THINK"] is expected
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, {"P1"}), ("p1, p2", {"P1", "P2"}), ("NONE", set()), ("all", {"P1", "P2", "P3"}),
+])
+def test_approval_tiers_for_borrowed_fixes(monkeypatch, value, expected):
+    env = {} if value is None else {"APPROVE_BORROWED_FIX_TIERS": value}
+    assert settings(monkeypatch, **env)["APPROVE_BORROWED_FIX_TIERS"] == expected

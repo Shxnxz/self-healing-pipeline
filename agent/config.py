@@ -5,6 +5,8 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 # Same variable the Deterministic Lookup service publishes with (lookup/config.py).
 LOOKUP_TOPIC = os.environ.get("LOOKUP_OUTPUT_TOPIC", "recovery.lookup")
 GROUP_ID = os.environ.get("AGENT_CONSUMER_GROUP", "recovery-agent")
+# Engineers' decisions on escalated failures (agent/review.py publishes, the agent resumes).
+DECISIONS_TOPIC = os.environ.get("AGENT_DECISIONS_TOPIC", "recovery.decisions")
 
 # LangGraph checkpoints: the saved state of every recovery workflow.
 CHECKPOINT_PATH = os.environ.get("AGENT_CHECKPOINT_PATH", "/state/recovery_checkpoints.sqlite")
@@ -70,6 +72,15 @@ POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD = max(POLICY_CONFIDENCE_THRESHOLD, _thres
 # safe in agent/actions.py. It cannot add an action to the safe set.
 _safe = [a.strip().upper() for a in os.environ.get("POLICY_SAFE_ACTIONS", "").split(",") if a.strip()]
 POLICY_SAFE_ACTIONS = None if not _safe else ([] if "NONE" in _safe else _safe)
+
+# A past fix the lookup reused from a SIMILAR incident (matched_by STRUCTURED or
+# EMBEDDING, not EXACT) waits for an engineer's approval before it runs when the
+# failure is in one of these priority tiers (Thay, 2026-11-14: P1). After the
+# approval Learn stores the incident for this table, so the next one is EXACT.
+# NONE = never ask; ALL = ask on every tier.
+_tiers = [t.strip().upper() for t in os.environ.get("APPROVE_BORROWED_FIX_TIERS", "P1").split(",") if t.strip()]
+APPROVE_BORROWED_FIX_TIERS = frozenset() if "NONE" in _tiers else (
+    frozenset({"P1", "P2", "P3"}) if "ALL" in _tiers else frozenset(_tiers))
 
 # --- Remediate (spec RD1, RD2, TA2) --------------------------------------------
 # The audit table: one row per execution, written by the agent and by nothing else.

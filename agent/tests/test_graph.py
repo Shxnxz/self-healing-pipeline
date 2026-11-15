@@ -28,17 +28,23 @@ def test_graph_has_the_edges_of_the_spec():
         ("policy_gate", "remediate"), ("policy_gate", "escalate"),
         ("remediate", "validate"), ("remediate", "escalate"),
         ("validate", "learn"), ("validate", "escalate"),
-        ("escalate", "learn"),
+        ("escalate", "engineer_review"),
+        # the engineer's decision: run a fix, run the automated path again, or close the case
+        ("engineer_review", "remediate"), ("engineer_review", "deterministic_lookup"),
+        ("engineer_review", "learn"),
         ("learn", "__end__"),
-        # a step that keeps raising goes to the engineer from anywhere
+        # a step that keeps raising goes to the engineer from anywhere, and a past fix
+        # can need an engineer's approval
         ("deterministic_lookup", "escalate"), ("diagnose", "escalate"),
+        # Escalate that keeps raising opens no case: the workflow ends FAILED
+        ("escalate", "learn"),
     }
 
 
 # --- with the steps built so far: nothing is released, everything reaches an engineer
 def test_new_failure_is_diagnosed_then_escalated_by_the_gate():
     state = run(stack_item(route="diagnose"))
-    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "diagnose", "policy_gate", "escalate"]   # waits for the engineer
     assert state["status"] == "ESCALATED"
     assert state["escalation"]["reason"] == "NO_DIAGNOSIS"   # no model in tests: nothing for the gate to reject
     assert state["action"] is None and "execution" not in state
@@ -46,7 +52,7 @@ def test_new_failure_is_diagnosed_then_escalated_by_the_gate():
 
 def test_known_failure_skips_the_llm_and_carries_the_past_fix():
     state = run(stack_item(route="remediate", match=PAST_FIX))
-    assert path(state) == ["deterministic_lookup", "remediate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "remediate", "escalate"]
     assert state["action"] == {"action": "ADD_VARIANT", "action_params": {"canonical_value": "JULY"},
                                "source": "INCIDENT", "incident_id": "i1"}
     assert "diagnosis" not in state
@@ -58,7 +64,7 @@ def test_remediate_that_cannot_execute_never_claims_a_fix():
     assert state["execution"]["status"] == "FAILED" and state["execution"]["rows_affected"] == 0
     assert state["escalation"]["reason"] == "REMEDIATION_FAILED"
     assert state["escalation"]["details"] == state["execution"]["reasons"] != []
-    assert state["status"] == "ESCALATED" and state["learned"]["written"] is False
+    assert state["status"] == "ESCALATED" and "learned" not in state   # waits for the engineer
 
 
 def test_executed_fix_is_validated_and_goes_to_learn(tmp_path, monkeypatch):
@@ -73,8 +79,8 @@ def test_executed_fix_is_validated_and_goes_to_learn(tmp_path, monkeypatch):
 
 
 def test_stubs_mark_the_workflow_so_it_is_not_taken_for_a_real_result():
-    state = run(stack_item(route="diagnose"))
-    assert state["stubbed"] == ["escalate", "learn"]   # Diagnose and the gate are real since Task 103
+    state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok, validate=validate_ok)
+    assert state["stubbed"] == ["learn"]   # Escalate is real since Task 106
     built = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok,
                 validate=validate_ok, learn=learn_ok)
     assert built["stubbed"] == []
@@ -139,9 +145,9 @@ def test_gate_that_passes_without_an_action_still_escalates():
 
 def test_failed_validation_is_escalated():
     state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_ok, validate=validate_fails)
-    assert path(state) == ["deterministic_lookup", "remediate", "validate", "escalate", "learn"]
-    assert state["escalation"] == {"status": "PENDING_REVIEW", "reason": "VALIDATION_FAILED",
-                                   "details": ["new failure in weather_condition"]}
+    assert path(state) == ["deterministic_lookup", "remediate", "validate", "escalate"]
+    assert state["escalation"]["reason"] == "VALIDATION_FAILED"
+    assert state["escalation"]["details"] == ["new failure in weather_condition"]
 
 
 # --- a step that raises must not stop the agent ---------------------------------------
@@ -154,7 +160,7 @@ def test_step_that_keeps_raising_is_retried_then_escalated():
 
     state = run(stack_item(route="remediate", match=PAST_FIX), remediate=remediate_broken)
     assert len(calls) == 3
-    assert path(state) == ["deterministic_lookup", "remediate", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "remediate", "escalate"]
     assert state["error"] == {"node": "remediate", "error": "RuntimeError: Spark is down", "attempts": 3}
     assert state["escalation"]["reason"] == "STEP_FAILED"
     assert "remediate: RuntimeError: Spark is down" in state["escalation"]["details"][0]
@@ -180,7 +186,7 @@ def test_broken_diagnose_goes_to_the_engineer_not_to_the_gate():
         raise TimeoutError("LLM did not answer")
 
     state = run(stack_item(route="diagnose"), diagnose=diagnose_broken)
-    assert path(state) == ["deterministic_lookup", "diagnose", "escalate", "learn"]
+    assert path(state) == ["deterministic_lookup", "diagnose", "escalate"]
     assert state["escalation"]["reason"] == "STEP_FAILED"
 
 

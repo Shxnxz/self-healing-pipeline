@@ -1,49 +1,49 @@
-"""Escalate (spec EL1). STUB: the engineer review is built in Task 106.
+"""Escalate (spec EL1): open a case for an engineer.
 
-Reads   everything: an engineer gets the whole state, not a bare alert
-Writes  escalation = {"status", "reason", "details"}, status = "ESCALATED"
+Reads   everything: an engineer gets the whole picture, not a bare alert
+Writes  escalation = {"status": "WAITING", "escalation_id", "round", "reason", "details",
+                      "case", "escalated_at", "decision": None, "history"}
+        status = "ESCALATED"
 
-The stub records why the failure was escalated and moves on; nobody is asked yet.
-Task 106 makes the workflow wait here for the engineer's decision.
+The case (agent/escalation.py: build_case) is saved in the workflow's state: the
+failure and its table, the blast radius and lineage, the closest past incidents and
+earlier failed attempts, the model's hypothesis and confidence, what the gate,
+Remediate or Validate said, sample records, the column's canonical values and the
+fix that `approve` would apply.
+
+The next node, engineer_review, pauses the workflow until the engineer decides
+(`python -m agent.review`). Escalate itself only writes the state, so the graph can
+retry it safely. A failure that comes back to an engineer (their fix did not validate,
+a retry was escalated again) gets a new round; the earlier rounds are kept in
+`history`.
 """
-from agent.state import EXECUTION_SUCCESS, STATUS_ESCALATED, RecoveryState, step
+from agent import escalation as esc
+from agent.state import STATUS_ESCALATED, RecoveryState, step
 
 NAME = "escalate"
 
-STEP_FAILED = "STEP_FAILED"
-POLICY_GATE_REJECTED = "POLICY_GATE_REJECTED"   # a proposed fix was stopped by a check
-ENGINEER_REQUESTED = "ENGINEER_REQUESTED"       # Diagnose itself proposed ESCALATE
-NO_DIAGNOSIS = "NO_DIAGNOSIS"                   # model unreachable or its reply unusable
-POLICY_OUTCOME_REASONS = {"ENGINEER_REQUESTED": ENGINEER_REQUESTED, "NO_DIAGNOSIS": NO_DIAGNOSIS}
-GATE_PASSED_WITHOUT_ACTION = "GATE_PASSED_WITHOUT_ACTION"
-REMEDIATION_FAILED = "REMEDIATION_FAILED"
-VALIDATION_FAILED = "VALIDATION_FAILED"
-
-
-def escalation_reason(state: RecoveryState) -> tuple:
-    """Which step sent the failure here: the last one that ran and did not succeed."""
-    error = state.get("error")
-    if error:  # the step itself kept raising, so it left no result to read
-        return STEP_FAILED, [f"{error.get('node')}: {error.get('error')} ({error.get('attempts')} attempts)"]
-    validation = state.get("validation")
-    if validation is not None and validation.get("passed") is not True:
-        return VALIDATION_FAILED, validation.get("reasons") or []
-    execution = state.get("execution")
-    if execution is not None and execution.get("status") != EXECUTION_SUCCESS:
-        return REMEDIATION_FAILED, execution.get("reasons") or []
-    policy = state.get("policy") or {}
-    if policy.get("passed") is True:  # approved, but there is nothing to execute
-        return GATE_PASSED_WITHOUT_ACTION, ["the policy gate passed but set no action"]
-    # The gate says whether it stopped a fix or there was none to stop (policy.outcome).
-    reason = POLICY_OUTCOME_REASONS.get(policy.get("outcome"), POLICY_GATE_REJECTED)
-    return reason, policy.get("reasons") or []
+# Kept here too: earlier tasks and tests import the reasons from this module.
+STEP_FAILED, POLICY_GATE_REJECTED = esc.STEP_FAILED, esc.POLICY_GATE_REJECTED
+ENGINEER_REQUESTED, NO_DIAGNOSIS = esc.ENGINEER_REQUESTED, esc.NO_DIAGNOSIS
+GATE_PASSED_WITHOUT_ACTION = esc.GATE_PASSED_WITHOUT_ACTION
+REMEDIATION_FAILED, VALIDATION_FAILED = esc.REMEDIATION_FAILED, esc.VALIDATION_FAILED
+APPROVAL_REQUIRED = esc.APPROVAL_REQUIRED
+escalation_reason = esc.escalation_reason
 
 
 def escalate(state: RecoveryState) -> dict:
-    reason, details = escalation_reason(state)
-    return {
-        "escalation": {"status": "PENDING_REVIEW", "reason": reason, "details": details},
-        "status": STATUS_ESCALATED,
-        "stubbed": [NAME],
-        "trace": [step(NAME, f"stub: {reason}, no engineer asked yet (Task 106)")],
+    previous = state.get("escalation") or {}
+    history = list(previous.get("history") or [])
+    if previous.get("escalation_id"):
+        history.append({k: previous.get(k) for k in ("escalation_id", "round", "reason", "details",
+                                                     "escalated_at", "decision")})
+    round_ = int(previous.get("round") or 0) + 1
+    reason, details = esc.escalation_reason(state)
+    case = esc.build_case(state, reason, details, round_)
+    escalation = {
+        "status": esc.WAITING, "escalation_id": case["escalation_id"], "round": round_,
+        "reason": reason, "details": details, "case": case, "escalated_at": esc.now(),
+        "decision": None, "history": history,
     }
+    note = f"{reason}: waiting for an engineer ({case['escalation_id']}); proposed fix {esc.fix_text(case['proposed_fix'])}"
+    return {"escalation": escalation, "status": STATUS_ESCALATED, "trace": [step(NAME, note)]}
