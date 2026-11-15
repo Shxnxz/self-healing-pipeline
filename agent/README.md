@@ -76,7 +76,7 @@ its own keys:
 | `diagnose` | `diagnosis` = `{status, hypothesis, confidence, proposed_action, model, allowed_actions, evidence, reasons}` |
 | `policy_gate` | `policy` = `{passed, outcome, reasons, checks, threshold, unverified_threshold, safe_actions}`, and `action` when it passes |
 | `remediate` | `execution` = `{status: SUCCESS or FAILED, execution_id, action, action_params, source, target_table, overlay, rows_expected, rows_affected, rows_with_other_failures, sample_record_ids, quarantine_version, executed_at, idempotent_replay, audit, reasons}` |
-| `validate` | `validation` = `{status: PASSED or FAILED, passed, reasons, checks, execution_id, target_table, column, canonical_value, rows_staged, rows_valid, rows_remaining, rows_released, rows_already_released, crash_date, quarantine_version, validated_at}` |
+| `validate` | `validation` = `{status: PASSED or FAILED, passed, reasons, checks, execution_id, target_table, column, canonical_value, rows_staged, rows_valid, rows_remaining, rows_released, rows_marked_resolved, rows_already_released, crash_date, quarantine_version, validated_at}` |
 | `escalate` | `escalation` = `{status: WAITING, escalation_id, round, reason, details, case, escalated_at, decision: None, history}`, `status` = `ESCALATED` |
 | `engineer_review` | `escalation` with `status: DECIDED` and `decision`, `status`, and for `APPLY_FIX` the engineer's `action` (`source: ENGINEER`) |
 | `learn` | `learned` = `{status: STORED or SKIPPED, written, incident_id, outcome, resolved_by, verified, borrowed, embedded, embed_error, attempts, promotion, learned_at}`, `status` |
@@ -379,8 +379,18 @@ so the graph retries the step and then escalates it as `STEP_FAILED`.
 `txnAppId = recovery_agent_release:<execution_id>`, so Delta skips it if it already
 landed, and the quarantine update only touches rows still waiting. If the agent
 stops between the append and the update, the next run sees the transaction in
-Silver 2, skips the append and marks the rows. Records this execution already
-released are counted in `rows_already_released`, not written again.
+Silver 2, skips the append and marks the rows. The counts say what each run
+really wrote: `rows_released` (appended to Silver 2 now, 0 when the append had
+already landed) and `rows_marked_resolved` (quarantine rows set to RESOLVED now).
+Records this execution had fully released before are counted in
+`rows_already_released`, not written again.
+
+**Fuzzy corrections are not logged again.** The Silver 2 job already wrote the fuzzy
+corrections of these records to `silver2_fuzzy_audit` when it quarantined them (it
+logs every row of a micro-batch, quarantined ones too), and
+`promote_fuzzy_variants` counts rows, so a second entry would count each correction
+twice. A replay cannot make a correction the first pass did not: the fuzzy anchors
+are fixed, and the overlay makes the targeted column an exact match.
 
 What it does not do (later tasks):
 
@@ -692,9 +702,12 @@ Compose passes `DIAGNOSE_MODEL`, `DIAGNOSE_BASE_URL`, `DIAGNOSE_THINK` and the t
 size are `DIAGNOSE_NUM_CTX` (8192) and `DIAGNOSE_NUM_PREDICT` (1024).
 
 `REMEDIATION_AUDIT_PATH` (`/data/delta/remediation_audit`) is the audit table.
-Compose mounts `./delta` writable: the agent writes the audit table, the healed rows
-of `silver2_<source>`, the status of their quarantine rows and the promoted variants
-of `ref_canonical_mappings`, and only reads the rest. Validate's settings: `DELTA_ROOT` (where `silver2_<source>` is),
+Compose mounts `./delta` read only, with writable mounts inside it for the tables
+the agent writes: `remediation_audit`, `silver2_quarantine`, `silver2_crash1` to
+`silver2_crash4` and `ref_canonical_mappings` (Learn's promotions). A source added to
+`SOURCES` needs its own `silver2_<source>` line in `docker-compose.yml`, or Validate's
+release fails on the read-only folder and the failure is escalated (`STEP_FAILED`);
+`agent/tests/test_compose.py` fails until the line is there. Validate's settings: `DELTA_ROOT` (where `silver2_<source>` is),
 `DAY_FIRST_SOURCES` (must match the Silver 2 job, Compose passes the same default),
 `VALIDATE_SPARK_DRIVER_MEMORY` (`512m`) and `VALIDATE_SPARK_MASTER` (`local[2]`).
 The Spark session adds roughly 1 to 1.5 GB to the agent's memory once it has started.
@@ -729,6 +742,10 @@ validates and releases them with real Spark. It needs Java and downloads the Del
 jars once (about 2 minutes); without Java it is skipped.
 It also promotes an engineer's fix into the Spark-written `ref_canonical_mappings`
 with Learn and reads it back with the Silver 2 job's own loader.
+
+`test_compose.py` reads `docker-compose.yml` and fails when a table the agent writes
+(the audit table, the quarantine, every `silver2_<source>` of `SOURCES`,
+`ref_canonical_mappings`) has no writable mount inside the read-only `./delta`.
 
 Neo4j is an in-memory fake (`helpers.FakeMemory`, the `memory` fixture) except in
 `test_incidents_neo4j.py`, which runs the real Cypher of Learn and the lookup against

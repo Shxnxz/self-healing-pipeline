@@ -271,11 +271,20 @@ services:
     restart: on-failure
     volumes:
       - agent-state:/state
-      # The pipeline's tables. The agent writes four kinds: delta/remediation_audit
-      # (Remediate), the healed rows appended to silver2_<source> and their quarantine
-      # rows marked RESOLVED (Validate), and promoted variants added to
-      # ref_canonical_mappings (Learn). Everything else it only reads.
-      - ./delta:/data/delta
+      - ./delta:/data/delta:ro # the pipeline's tables, read only
+      # The tables the agent writes, mounted writable inside the read-only ./delta:
+      # Remediate's audit record, the healed rows Validate releases (appended to
+      # silver2_<source>, their quarantine rows marked RESOLVED), and the variants Learn
+      # promotes into ref_canonical_mappings. A source added to SOURCES needs its
+      # silver2_<source> line here too, or Validate cannot release its rows (the write
+      # fails and the failure is escalated). agent/tests/test_compose.py checks the list.
+      - ./delta/remediation_audit:/data/delta/remediation_audit
+      - ./delta/silver2_quarantine:/data/delta/silver2_quarantine
+      - ./delta/silver2_crash1:/data/delta/silver2_crash1
+      - ./delta/silver2_crash2:/data/delta/silver2_crash2
+      - ./delta/silver2_crash3:/data/delta/silver2_crash3
+      - ./delta/silver2_crash4:/data/delta/silver2_crash4
+      - ./delta/ref_canonical_mappings:/data/delta/ref_canonical_mappings
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       LOOKUP_OUTPUT_TOPIC: recovery.lookup

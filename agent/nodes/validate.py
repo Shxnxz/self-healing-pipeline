@@ -4,8 +4,12 @@ Reads   failure, execution (and the audit record of the execution)
 Writes  validation = {"status": PASSED | FAILED, "passed", "reasons", "checks",
                       "execution_id", "target_table", "column", "canonical_value",
                       "rows_staged", "rows_valid", "rows_remaining", "rows_released",
-                      "rows_already_released", "crash_date", "quarantine_version",
-                      "validated_at"}
+                      "rows_marked_resolved", "rows_already_released", "crash_date",
+                      "quarantine_version", "validated_at"}
+
+rows_released is what this run appended to Silver 2; rows_marked_resolved what it set
+to RESOLVED in quarantine. They differ only when an earlier run of the step appended
+and stopped before the quarantine update.
 
   1. The group      the records Remediate staged: `audit.find(execution_id)["record_ids"]`
                     with its overlay and target table (VD1). The state only keeps a
@@ -46,6 +50,10 @@ def _note(result: dict) -> str:
         return "failed: " + "; ".join(result["reasons"])
     note = (f"passed: {result['column']} resolves to {result['canonical_value']} in all "
             f"{result['rows_staged']} record(s); {result['rows_released']} released to {result['target_table']}")
+    landed_before = result["rows_marked_resolved"] - result["rows_released"]
+    if landed_before > 0:
+        note += (f", {landed_before} were already in {result['target_table']} from an earlier run "
+                 "of this step and are marked RESOLVED now")
     if result["rows_already_released"]:
         note += f", {result['rows_already_released']} were already released by this execution"
     if result["rows_remaining"]:
@@ -64,7 +72,8 @@ def make_validate(replay: Optional[Callable] = None, audit_path: Optional[str] =
             "execution_id": execution.get("execution_id"), "target_table": execution.get("target_table"),
             "column": failure.get("column_name"), "canonical_value": None,
             "rows_staged": 0, "rows_valid": 0, "rows_remaining": 0, "rows_released": 0,
-            "rows_already_released": 0, "crash_date": None, "quarantine_version": None,
+            "rows_marked_resolved": 0, "rows_already_released": 0, "crash_date": None,
+            "quarantine_version": None,
             "validated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -113,7 +122,8 @@ def make_validate(replay: Optional[Callable] = None, audit_path: Optional[str] =
 
             # 4. Release the records that are fixed.
             released = group.release(result["execution_id"], verdict["to_release"])
-            result.update(status=PASSED, passed=True, reasons=[], rows_released=released["appended"])
+            result.update(status=PASSED, passed=True, reasons=[], rows_released=released["appended"],
+                          rows_marked_resolved=released["marked"])
             return done()
         finally:
             group.close()

@@ -182,8 +182,22 @@ class Replay:
             self.released_before = version is not None
 
     def release(self, execution_id: str, record_ids: List[str]) -> dict:
-        """Append the replayed rows of `record_ids` to Silver 2, then mark them RESOLVED."""
+        """Append the replayed rows of `record_ids` to Silver 2, then mark them RESOLVED.
+
+        Returns what this call really wrote: `appended` is 0 when this execution's
+        append had already landed (the step is running again), `marked` counts the
+        quarantine rows this call set to RESOLVED.
+
+        The replay's fuzzy corrections (`_fuzzy_audit_entries`) are not written to
+        silver2_fuzzy_audit: the Silver 2 job already logged them for these records
+        when it quarantined them (it logs every row of a micro-batch, quarantined ones
+        too), and ref_mappings.promote_fuzzy_variants counts rows, so logging them again
+        would count each correction twice. A replay cannot produce a correction the
+        first pass did not: the fuzzy anchors are fixed seeds, and the only mapping
+        added (the overlay) turns the targeted column into an exact match.
+        """
         from delta.tables import DeltaTable
+        from deltalake import DeltaTable as Table
         from pyspark.sql import functions as F
 
         from common import idempotent_append
@@ -191,10 +205,14 @@ class Replay:
         if not record_ids:
             return {"appended": 0, "marked": 0}
         ids = sorted(set(record_ids))
+        app_id = release_app_id(execution_id)
         rows = self.replayed.filter(F.col("record_id").isin(ids) & (F.size("columns_to_remediate") == 0))
         rows = rows.drop(*_NOT_IN_SILVER2)
+        landed = os.path.isdir(os.path.join(self.silver2_path, "_delta_log")) and \
+            Table(self.silver2_path).transaction_version(app_id) is not None
+        appended = 0 if landed else rows.count()
         # Idempotent: Delta skips the append if this execution's txnAppId already wrote.
-        idempotent_append(rows, self.silver2_path, release_app_id(execution_id), 0)
+        idempotent_append(rows, self.silver2_path, app_id, 0)
 
         quarantine = DeltaTable.forPath(self.spark, self.quarantine_path)
         if "resolved_by" not in quarantine.toDF().columns:
@@ -204,10 +222,11 @@ class Replay:
             quarantine = DeltaTable.forPath(self.spark, self.quarantine_path)
         condition = ((F.col("target_table") == self.target_table) & F.col("record_id").isin(ids)
                      & F.col("healing_status").isin(*WAITING))
+        marked = quarantine.toDF().filter(condition).count()
         _retry("mark quarantine rows RESOLVED", lambda: quarantine.update(condition, {
             "healing_status": F.lit(RESOLVED), "resolved_by": F.lit(execution_id),
             "resolved_at": F.current_timestamp()}))
-        return {"appended": len(ids), "marked": len(ids)}
+        return {"appended": appended, "marked": marked}
 
     def close(self) -> None:
         self.replayed.unpersist()
