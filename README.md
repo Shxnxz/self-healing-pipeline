@@ -343,7 +343,7 @@ them needs Kafka, Ollama or the Docker images. To run them locally, from the rep
 | Lineage consumer | `pip install -r lineage/requirements.txt pytest` | `cd lineage && python -m pytest tests` | nothing (real-Neo4j tests with `NEO4J_TEST_URI`) |
 | Deterministic Lookup | `pip install -r lookup/requirements.txt pytest` | `python -m pytest lookup/tests` | nothing |
 | Qwen triage, handoff, schema guard | `pip install -r lineage/requirements.txt pytest` | `python -m pytest tests/test_qwen.py tests/test_handoff.py tests/test_schema_guard.py` | nothing (the model is faked) |
-| Spark jobs | `pip install -r spark-jobs/requirements.txt pytest` | `cd spark-jobs && python -m pytest test_sources.py test_date_order.py test_openlineage_config.py test_per_source_pipeline.py test_damerau_levenshtein.py -k "not test_spark"` and `python test_damerau_levenshtein.py` | Java 17+ |
+| Spark jobs | `pip install -r spark-jobs/requirements.txt pytest` | `cd spark-jobs && python -m pytest test_sources.py test_date_order.py test_openlineage_config.py test_damerau_levenshtein.py -k "not test_spark"`, then `python -m pytest test_per_source_pipeline.py` and `python test_damerau_levenshtein.py`, each in its own process (a Spark session left by one would be reused by the next) | Java 17+ |
 | Recovery agent | `pip install -r agent/requirements.txt pytest pyyaml` | `python -m pytest agent` | Java for `test_validate_spark.py`, `NEO4J_TEST_URI` for `test_incidents_neo4j.py` (both skipped without) |
 | Replay tool, fault injector | `pip install -r spark-jobs/requirements.txt deltalake pyarrow pytest` | `python -m pytest tools/tests` | Java, `docker compose` for `test_eval_stack.py` |
 

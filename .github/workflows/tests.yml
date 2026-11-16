@@ -91,7 +91,12 @@ jobs:
         run: >-
           python -m pytest -rs
           test_sources.py test_date_order.py test_openlineage_config.py
-          test_per_source_pipeline.py test_damerau_levenshtein.py -k "not test_spark"
+          test_damerau_levenshtein.py -k "not test_spark"
+      # Its own process: test_date_order.py leaves a Spark session without Delta
+      # running, and build_spark() would reuse it.
+      - name: Per-source pipeline (Bronze to Gold on real Delta tables)
+        working-directory: spark-jobs
+        run: python -m pytest -rs test_per_source_pipeline.py
       - name: Damerau-Levenshtein on Spark (script, needs its own session)
         working-directory: spark-jobs
         run: python test_damerau_levenshtein.py
