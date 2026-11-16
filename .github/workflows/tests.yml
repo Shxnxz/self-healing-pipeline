@@ -1,0 +1,164 @@
+# Runs every test suite of the repository (Task 110). How to run the same suites
+# locally is in README.md, section "Tests".
+#
+# Four jobs run side by side. The Spark ones download the Delta and Kafka jars once
+# and keep them in the Actions cache (~/.ivy2). Two jobs start a Neo4j service, so
+# the tests that need a real Neo4j run here instead of being skipped. Nothing here
+# needs Ollama, Kafka or the Docker images of the services.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, Golf]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The service images use python:3.11-slim.
+  PYTHON_VERSION: "3.11"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  # Spark's Python workers must be the same Python as the driver (setup-python's).
+  PYSPARK_PYTHON: python
+
+jobs:
+  lineage-lookup-qwen:
+    name: Lineage, lookup and Qwen triage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/selfhealing
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p selfhealing 'RETURN 1'"
+          --health-interval 5s --health-timeout 10s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            lineage/requirements.txt
+            lookup/requirements.txt
+      - name: Install
+        run: pip install -r lineage/requirements.txt -r lookup/requirements.txt pytest
+      - name: Lineage consumer (retry tests against the real Neo4j service)
+        working-directory: lineage
+        env:
+          NEO4J_TEST_URI: bolt://localhost:7687
+        run: python -m pytest tests -rs
+      - name: Deterministic lookup
+        run: python -m pytest lookup/tests -rs
+      - name: Qwen triage, incident handoff and Silver 1 schema guard
+        run: python -m pytest tests/test_qwen.py tests/test_handoff.py tests/test_schema_guard.py -rs
+
+  spark-jobs:
+    name: Spark jobs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: spark-jobs/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.ivy2
+          key: ivy-spark-jobs-${{ hashFiles('spark-jobs/common.py', 'spark-jobs/requirements.txt') }}
+          restore-keys: ivy-
+      - name: Install
+        run: pip install -r spark-jobs/requirements.txt pytest
+      - name: Tests
+        working-directory: spark-jobs
+        run: >-
+          python -m pytest -rs
+          test_sources.py test_date_order.py test_openlineage_config.py
+          test_per_source_pipeline.py test_damerau_levenshtein.py -k "not test_spark"
+      - name: Damerau-Levenshtein on Spark (script, needs its own session)
+        working-directory: spark-jobs
+        run: python test_damerau_levenshtein.py
+
+  agent:
+    name: Recovery agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/selfhealing
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p selfhealing 'RETURN 1'"
+          --health-interval 5s --health-timeout 10s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: agent/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.ivy2
+          key: ivy-agent-${{ hashFiles('spark-jobs/common.py', 'agent/requirements.txt') }}
+          restore-keys: ivy-
+      - name: Install
+        # pyyaml: agent/tests/test_compose.py reads docker-compose.yml
+        run: pip install -r agent/requirements.txt pytest pyyaml
+      - name: Tests (incl. real Spark replay and real Neo4j incidents)
+        env:
+          NEO4J_TEST_URI: bolt://localhost:7687
+        run: python -m pytest agent -rs
+
+  tools:
+    name: Replay tool and fault injector
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: spark-jobs/requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ~/.ivy2
+          key: ivy-tools-${{ hashFiles('spark-jobs/common.py', 'spark-jobs/requirements.txt') }}
+          restore-keys: ivy-
+      - name: Install
+        run: pip install -r spark-jobs/requirements.txt "deltalake>=1.0,<2" "pyarrow>=15" pytest
+      - name: Compose files are valid
+        run: |
+          docker compose config -q
+          docker compose -f docker-compose.yml -f docker-compose.eval.yml config -q
+      - name: Tests (real Spark end to end; the eval stack check uses docker compose config)
+        run: python -m pytest tools/tests -rs
