@@ -85,6 +85,8 @@ services:
       QWEN_ENABLED: ${QWEN_ENABLED:-false}
       QWEN_BASE_URL: ${QWEN_BASE_URL:-http://host.docker.internal:11434}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3:4b-instruct}
+      QWEN_ASYNC: ${QWEN_ASYNC:-true}
+      QWEN_TIMEOUT_SECONDS: ${QWEN_TIMEOUT_SECONDS:-60}
       QWEN_INCIDENT_DIR: /data/incidents
       QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
@@ -125,6 +127,8 @@ services:
       QWEN_ENABLED: ${QWEN_ENABLED:-false}
       QWEN_BASE_URL: ${QWEN_BASE_URL:-http://host.docker.internal:11434}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3:4b-instruct}
+      QWEN_ASYNC: ${QWEN_ASYNC:-true}
+      QWEN_TIMEOUT_SECONDS: ${QWEN_TIMEOUT_SECONDS:-60}
       QWEN_INCIDENT_DIR: /data/incidents
       QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}

@@ -155,7 +155,9 @@ def open_checkpointer(path: str):
     from langgraph.checkpoint.sqlite import SqliteSaver
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    return SqliteSaver(sqlite3.connect(path, check_same_thread=False))
+    saver = SqliteSaver(sqlite3.connect(path, check_same_thread=False))
+    saver.setup()   # a fresh agent-state volume has no tables yet: create them before anything reads them
+    return saver
 
 
 if __name__ == "__main__":  # python -m agent.graph  -> Mermaid diagram of the compiled graph

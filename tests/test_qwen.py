@@ -68,3 +68,49 @@ class Tests(unittest.TestCase):
         result = QwenClassifier().classify(ERROR + ' join OtherTable', table='Crash4')
         self.assertEqual(result['table'], 'Crash4')
         self.assertEqual(result['classification_status'], 'INVALID_OUTPUT')
+
+    # --- Task 109: grounding ------------------------------------------------------
+    SUGGESTED = ('[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name '
+                 '`crash_mnth` cannot be resolved. Did you mean one of the following? [`crash_month`, `crash_date`].')
+
+    @patch('qwen_classifier.classifier.urlopen')
+    def test_column_from_a_suggestion_list_is_not_evidence(self, call):
+        call.return_value = reply(dict(GOOD, column='crash_month'))
+        result = QwenClassifier().classify(self.SUGGESTED)
+        self.assertEqual(result['classification_status'], 'INVALID_OUTPUT')
+        self.assertTrue(result['needs_review'])
+        call.return_value = reply(dict(GOOD, column='crash_mnth'))
+        self.assertEqual(QwenClassifier().classify(self.SUGGESTED)['classification_status'], 'OK')
+
+    @patch('qwen_classifier.classifier.urlopen')
+    def test_column_must_be_a_whole_name(self, call):
+        call.return_value = reply(dict(GOOD, column='crash'))   # only inside `crash_month`
+        self.assertEqual(QwenClassifier().classify(ERROR)['classification_status'], 'INVALID_OUTPUT')
+
+    @patch('qwen_classifier.classifier.urlopen')
+    def test_column_must_be_the_unresolved_one(self, call):
+        text = ERROR + ' while reading crash_date from the plan'
+        call.return_value = reply(dict(GOOD, column='crash_date'))    # in the text, but not the failing one
+        self.assertEqual(QwenClassifier().classify(text)['classification_status'], 'INVALID_OUTPUT')
+
+    @patch('qwen_classifier.classifier.urlopen')
+    def test_schema_drift_is_the_schema_type(self, call):
+        call.return_value = reply(dict(GOOD, failure_type='SCHEMA_MISMATCH', column=None))
+        self.assertEqual(QwenClassifier().classify(ERROR)['classification_status'], 'INVALID_OUTPUT')
+        call.return_value = reply(dict(GOOD, failure_type='SCHEMA_DRIFT', column=None))
+        self.assertEqual(QwenClassifier().classify(ERROR)['failure_type'], 'SCHEMA_DRIFT')
+
+    @patch('qwen_classifier.integration.publish_incident')
+    @patch('qwen_classifier.integration.QwenClassifier')
+    def test_background_worker_records_the_incident(self, client, publish):
+        import time
+        client.return_value.classify.return_value = dict(GOOD, classification_status='OK')
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, QWEN_ENABLED='true', QWEN_INCIDENT_DIR=directory, QWEN_ASYNC='true'):
+                queued = capture_exception(ValueError('x'), job_name='silver2', batch_id=3)
+                waiting, deadline = Path(directory) / 'outbox', time.time() + 5
+                while list(waiting.glob('*.json')) and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertEqual(publish.call_count, 1)
+                self.assertTrue((Path(directory) / (queued['incident_id'] + '.json')).exists())
+                self.assertEqual(list((Path(directory) / 'outbox').glob('*.json')), [])

@@ -34,6 +34,7 @@ that raises does not stop the agent (agent/graph.py: guarded). If the agent itse
 dies, the message is redelivered: finished items are skipped, the rest resume.
 """
 import json
+import sqlite3
 import time
 from typing import Callable, List, Optional
 
@@ -114,7 +115,10 @@ def thread_ids(checkpointer) -> List[str]:
     """Every workflow the checkpoints hold."""
     conn = getattr(checkpointer, "conn", None)
     if conn is not None:   # SqliteSaver: one query instead of loading every checkpoint
-        return [row[0] for row in conn.execute("SELECT DISTINCT thread_id FROM checkpoints")]
+        try:
+            return [row[0] for row in conn.execute("SELECT DISTINCT thread_id FROM checkpoints")]
+        except sqlite3.OperationalError:   # fresh volume, the saver has not created its tables yet
+            return []
     return sorted({c.config["configurable"]["thread_id"] for c in checkpointer.list(None)})
 
 

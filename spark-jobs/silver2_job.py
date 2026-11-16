@@ -615,8 +615,8 @@ def make_batch_processor(
         except Exception as exc:
             _dead_letter_batch(batch_df, batch_id, exc, txn_app_id, target_table)
             # Classify only after the raw batch is durably preserved (IC2/IC4).
-            from qwen_classifier.integration import capture_exception
-            capture_exception(exc, job_name="Silver2", batch_id=batch_id,
+            from schema_guard import record_incident
+            record_incident(exc, job_name="Silver2", batch_id=batch_id,
                               table=target_table, dead_letter_path=DEAD_LETTER_PATH)
             return
 

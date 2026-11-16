@@ -14,7 +14,10 @@
 //                              layer, not table, so a fix learned on silver2_crash1 is
 //                              found again for silver2_crash3 (agent/memory/incidents.py)
 //     signature_text  STRING   text that was embedded (table, column, raw value, failure type)
-//     failure_type    STRING   e.g. UNRESOLVED_VALUE | AMBIGUOUS_VALUE | SCHEMA_DRIFT | CORRUPT_RECORD
+//     failure_type    STRING   UNRESOLVED_VALUE | AMBIGUOUS_VALUE |
+//                              SCHEMA_DRIFT | MISSING_COLUMN | TYPE_MISMATCH | PARSE_ERROR |
+//                              CORRUPT_RECORD | UNKNOWN (one list: qwen_classifier TYPES +
+//                              lookup/failures.py; SCHEMA_MISMATCH is read as SCHEMA_DRIFT)
 //     table_name      STRING   affected Silver table, e.g. "silver2_crash3"
 //     column_name     STRING   failing column, e.g. "crash_month" (NULL for table-level failures)
 //     raw_value       STRING   value as it landed in quarantine, e.g. "Jule"

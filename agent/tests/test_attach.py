@@ -279,3 +279,22 @@ def test_quarantine_claimed_by_the_trigger_is_still_readable():
     failure = merge(batch_item("f1", "7", 3)["failure"], batch_item("f2", "8", 4)["failure"])
     group = reference.failure_records(failure)
     assert len(group["rows"]) == 7 and group["not_waiting"] == 0
+
+
+def test_fresh_agent_state_volume_starts(tmp_path):
+    """A fresh volume has no checkpoint tables: start-up must not crash-loop on them."""
+    import sqlite3
+
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from agent.consumer import LearnRetry, thread_ids
+    from agent.graph import build_graph, open_checkpointer
+    from agent.upkeep import checkpoint_count
+
+    bare = SqliteSaver(sqlite3.connect(str(tmp_path / "bare.sqlite"), check_same_thread=False))
+    assert thread_ids(bare) == [] and checkpoint_count(bare, "x") == 0     # no tables at all
+    graph = build_graph(open_checkpointer(str(tmp_path / "state" / "checkpoints.sqlite")))
+    assert thread_ids(graph.checkpointer) == []
+    LearnRetry(graph).scan()
+    assert OpenWorkflows(graph).scan(thread_ids(graph.checkpointer)) == 0
+    assert Upkeep(graph).start(thread_ids(graph.checkpointer)) == {"threads": 0, "checkpoints_removed": 0}

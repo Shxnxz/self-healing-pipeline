@@ -7,6 +7,7 @@ from unittest.mock import patch
 os.environ['OPENLINEAGE_ENABLED'] = 'false'
 os.environ['QWEN_ENABLED'] = 'true'
 os.environ['QWEN_KAFKA_ENABLED'] = 'true'
+os.environ['QWEN_ASYNC'] = 'false'   # deliver inside the batch, so the asserts below see every message
 os.environ['QWEN_INCIDENT_TOPIC'] = 'test.recovery.incidents'
 os.environ['QWEN_INCIDENT_DIR'] = tempfile.mkdtemp(prefix='qwen-conditions-')
 from common import build_spark

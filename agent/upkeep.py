@@ -66,7 +66,10 @@ def checkpoint_count(checkpointer, thread_id: str) -> int:
     conn = _conn(checkpointer)
     if conn is None:
         return 0
-    return conn.execute("SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?", (thread_id,)).fetchone()[0]
+    try:
+        return conn.execute("SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?", (thread_id,)).fetchone()[0]
+    except sqlite3.OperationalError:   # no tables yet
+        return 0
 
 
 def prune_thread(graph, thread_id: str, dry_run: bool = False) -> int:
