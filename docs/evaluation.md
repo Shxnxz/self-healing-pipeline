@@ -129,6 +129,33 @@ What it shows:
 - **One case per micro-batch.** 4 fixable values in 3 batches made 12 workflows, so the
   engineer was asked 12 times for 4 decisions. This is the known behaviour Task 109 fixes
   (a later batch attaches to the open workflow, PR #37); expect 4 cases after it merges.
+  Confirmed by run `combined-1` below.
+
+### Run `combined-1`: with Task 109 (later batches attach)
+
+Measured 2026-11-16 in a cloud container (Docker, 4 CPUs, still no reasoning model) on
+Golf `3738312` with PRs #35, #36, #37 and #38 merged together, same scenario and
+command (`python -m evaluation run --label combined-1`):
+
+| Metric | Round 1 | Round 2 |
+|---|---|---|
+| Handled right on entry / silent errors | 100% / 0 | 100% / 0 |
+| Mapped at Silver 2 thanks to round 1 | 0 | 30 |
+| MTTD median / p90 (s) | 34 / 38 | 32 / 38 |
+| Quarantined records | 38 | 8 |
+| Resolution rate incl. engineer | 100% (30 of 30) | (nothing left to fix) |
+| Wrong-fix rate / unsafe fixes | 0% / 0 | - / 0 |
+| Time to recover median / p90 (s) | 136 / 174 | - |
+| Recovery workflows (later batches attached) | 8 (9) | 4 (1) |
+| Workflows that asked the model | 7 | 3 |
+| Engineer decisions | 8 (4 fixes, 4 dismissals) | 4 dismissals |
+| Promotions into `ref_canonical_mappings` | 4 | 0 |
+
+The 4 fixable values now make 4 cases instead of 12: the 9 later batches joined the
+workflow already open for their value, so the engineer decided each value once and
+the fix healed all its batches together. The median time to recover also fell from
+192 s to 136 s, probably because fewer workflows queue for the one agent. Everything
+else matches `cloud-1`.
 
 ### Still to measure
 
