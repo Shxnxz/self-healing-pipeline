@@ -99,9 +99,10 @@ jars get pulled). Subsequent runs are fast.
 - **bronze-silver1-job logs** — one Spark driver running 8 queries (2 per source):
   - `[bronze_crash1]` streams its topic into `delta/bronze_crash1`
   - `[silver1_crash1]` unpacks JSON into 49 fields and runs formatting/cleaning SQL -> `delta/silver1_crash1`
-- **silver2-gold-job logs** — one Spark driver running 5 queries:
+- **silver2-gold-job logs** — one Spark driver running 6 queries:
   - `[silver2_crash1]` standardizes Silver 1 -> `delta/silver2_crash1`, failures -> `delta/silver2_quarantine`
   - `[gold]` streams the UNION ALL of every Silver 2 table into `delta/gold`
+  - `[gold_metrics]` refreshes the `gold_*` business tables every minute ([docs/gold-metrics.md](docs/gold-metrics.md))
 - **lineage-consumer logs** — `[lineage] write_gold COMPLETED (n of m events written)`
 - **Neo4j browser** — http://localhost:7474 (user `neo4j`, password `NEO4J_PASSWORD`, default
   `selfhealing`) — try `MATCH p=(:Table)-[:FEEDS*]->(:Table) RETURN p`
@@ -154,7 +155,8 @@ To stop: `docker compose down`. To wipe all state and start clean:
 - **`spark-jobs/silver2_job.py`** — Silver 1 → Silver 2. Provides
   `SILVER2_TRANSFORM_SQL` for data standardization.
 - **`spark-jobs/gold_job.py`** — Silver 2 → Gold. Provides
-  `GOLD_TRANSFORM_SQL` for business-ready fields and metrics.
+  `GOLD_TRANSFORM_SQL` for business-ready fields; `gold_metrics.py` builds the `gold_*`
+  aggregate tables on it ([docs/gold-metrics.md](docs/gold-metrics.md)).
 - **`spark-jobs/sources.py`, `ref_mappings.py`, `schema_guard.py`** — the per-source
   table layout, the reference mappings (`ref_canonical_mappings`, seeded on start) with
   Damerau-Levenshtein fuzzy matching, and Silver 1's check of the payload's columns.
@@ -167,10 +169,12 @@ To stop: `docker compose down`. To wipe all state and start clean:
 - **`tools/`** — replay tool and fault injector; `docker-compose.eval.yml` is the
   separate evaluation stack the injector runs in. See
   [Replay and fault injection](#replay-and-fault-injection).
+- **`evaluation/`** — the evaluation harness and the "Jule" demo on the evaluation
+  stack ([docs/evaluation.md](docs/evaluation.md), [docs/demo.md](docs/demo.md)).
 - **`delta/`** — every Delta table: per source `bronze_<source>`, `silver1_<source>`,
   `silver2_<source>`; shared `silver1_dead_letter`, `silver2_quarantine`,
-  `silver2_dead_letter`, `silver2_fuzzy_audit`, `ref_canonical_mappings`, `gold`; the
-  agent's `remediation_audit`. Inspect with `verify_delta.py`.
+  `silver2_dead_letter`, `silver2_fuzzy_audit`, `ref_canonical_mappings`, `gold` and the
+  `gold_*` aggregates; the agent's `remediation_audit`. Inspect with `verify_delta.py`.
 - **`checkpoints/`** — Structured Streaming's checkpoint state per job.
 - **Docker volumes** — `neo4j-data` (lineage and incidents), `agent-state` (the agent's
   saved workflows), `lookup-state` (the scanner's progress), `ivy-cache` (Spark jars).
@@ -280,12 +284,18 @@ docker compose -f docker-compose.yml -f docker-compose.eval.yml up -d --build
 docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
 ```
 
+`python -m evaluation` runs a whole experiment on that stack (a fixed fault scenario,
+an oracle engineer, two rounds) and writes the metrics: see
+[docs/evaluation.md](docs/evaluation.md). [docs/demo.md](docs/demo.md) walks through
+one value, "Jule", from injection to promotion.
+
 ## Recovery agent (LangGraph loop)
 
 `agent/` reads `recovery.lookup` and runs one LangGraph workflow per failure:
 deterministic lookup, diagnose, policy gate, remediate, validate, escalate, learn.
 The state of every workflow is saved after each step (SQLite, volume `agent-state`),
-so a crashed workflow resumes and a redelivered one is skipped. See
+so a crashed workflow resumes and a redelivered one is skipped. A later batch of the
+same problem joins the workflow still open for it instead of starting another. See
 [agent/README.md](agent/README.md).
 
 Diagnose asks a reasoning model (Qwen on Ollama, `DIAGNOSE_MODEL`) for a root cause
@@ -326,7 +336,8 @@ fix of the same value has healed 5 rows in 3 micro-batches. Records still waitin
 promoted value are released with `python -m tools.replay quarantine`.
 
 A workflow ends `RESOLVED`, `RESOLVED_BY_ENGINEER`, `DISMISSED` or `FAILED`, and is
-`ESCALATED` while it waits. Everything a workflow did is printed by
+`ESCALATED` while it waits; a failure that joined an open workflow ends `ATTACHED`.
+Everything a workflow did is printed by
 `docker compose exec recovery-agent python -m agent.show <failure_id>`. Failures the
 agent handled while its steps were still stubs can be run again:
 [agent/README.md](agent/README.md#failures-seen-while-steps-were-still-stubs).
@@ -343,9 +354,10 @@ them needs Kafka, Ollama or the Docker images. To run them locally, from the rep
 | Lineage consumer | `pip install -r lineage/requirements.txt pytest` | `cd lineage && python -m pytest tests` | nothing (real-Neo4j tests with `NEO4J_TEST_URI`) |
 | Deterministic Lookup | `pip install -r lookup/requirements.txt pytest pyyaml` | `python -m pytest lookup/tests` | nothing |
 | Qwen triage, handoff, schema guard | `pip install -r lineage/requirements.txt pytest` | `python -m pytest tests/test_qwen.py tests/test_handoff.py tests/test_schema_guard.py` | nothing (the model is faked) |
-| Spark jobs | `pip install -r spark-jobs/requirements.txt pytest` | `cd spark-jobs && python -m pytest test_sources.py test_date_order.py test_openlineage_config.py test_damerau_levenshtein.py -k "not test_spark"`, then `python -m pytest test_per_source_pipeline.py` and `python test_damerau_levenshtein.py`, each in its own process (a Spark session left by one would be reused by the next) | Java 17+ |
+| Spark jobs | `pip install -r spark-jobs/requirements.txt pytest` | `cd spark-jobs && python -m pytest test_sources.py test_date_order.py test_openlineage_config.py test_damerau_levenshtein.py -k "not test_spark"`, then `python -m pytest test_per_source_pipeline.py`, `python -m pytest test_gold_metrics.py` and `python test_damerau_levenshtein.py`, each in its own process (a Spark session left by one would be reused by the next) | Java 17+ |
 | Recovery agent | `pip install -r agent/requirements.txt pytest pyyaml` | `python -m pytest agent` | Java for `test_validate_spark.py`, `NEO4J_TEST_URI` for `test_incidents_neo4j.py` (both skipped without) |
 | Replay tool, fault injector | `pip install -r spark-jobs/requirements.txt deltalake pyarrow pytest` | `python -m pytest tools/tests` | Java, `docker compose` for `test_eval_stack.py` |
+| Evaluation harness | `pip install pytest` | `python -m pytest evaluation/tests` | nothing (standard library) |
 
 The Spark suites build real Delta tables with the pipeline's own jobs from rows of
 `data/` and download the Delta and Kafka jars on the first run (a few minutes in all).
@@ -371,8 +383,9 @@ by name.
 
 ## Known limitations
 
-- **Gold** is a typed projection of the union of the Silver 2 tables, without business
-  aggregates. The two-table Silver join is not built.
+- **Gold** is the union of the Silver 2 tables with a few derived fields, plus five
+  business aggregate tables (`spark-jobs/gold_metrics.py`,
+  [docs/gold-metrics.md](docs/gold-metrics.md)). The two-table Silver join is not built.
 - **Weather values without a canonical target** (`OTHER`, `FREEZING RAIN/DRIZZLE`,
   `FOG/SMOKE/HAZE`, `SLEET/HAIL`, `BLOWING SNOW`, ...) stay quarantined until canonical
   values are chosen for them. The agent can only map a value to a canonical value that
@@ -387,10 +400,11 @@ by name.
 - **One agent process.** The service has a fixed `container_name`; two agents on the
   same failure could both stage it. `recovery.decisions` is not authenticated: whoever
   can write to Kafka can decide a case.
-- **A value that keeps arriving becomes a new failure each time the scanner finds new
-  rows of it** (the failure id includes the batches), so it gets its own workflow, and
-  without a reusable fix its own model call or case. The agent's checkpoints and the
-  audit table grow with every workflow and are never compacted.
+- **A problem an engineer dismissed opens a new case on its next batch.** A value that
+  keeps arriving attaches to its open workflow (one case, one model call); a new
+  workflow starts only after the previous one reached Validate or ended, and a
+  dismissed workflow has ended. Checkpoints of finished workflows are pruned and the
+  audit table is compacted by `agent/upkeep.py`.
 - Not tested on Docker Desktop for Windows: the agent's `deltalake` writes onto the
   bind-mounted `./delta` (audit table, promotions).
 

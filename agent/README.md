@@ -676,12 +676,15 @@ decisions on `recovery.decisions` are not read again.
 Things to know before doing it:
 
 - **Kafka keeps messages 7 days** (the broker default; Compose sets nothing else).
-  Older lookup messages are gone and cannot be delivered again. For those, the only way
-  is to publish the quarantine again by resetting the scanner (`docker compose rm -sf
-  lookup-scanner && docker volume rm self-healing-pipeline_lookup-state && docker
-  compose up -d lookup-scanner`). That re-reads every `PENDING` row, but groups them
-  afresh, so the failures get **new** `failure_id`s (the id includes the batches): they
-  run as new workflows, and the old stub-ended workflows stay as they are.
+  Older lookup messages are gone and cannot be delivered again. Resetting the scanner
+  does not publish them again either: the scanner claims the rows it publishes
+  (`IN_PROGRESS`), and the first scan after an upgrade claims the rows the old scanner
+  had already published ([lookup/README.md](../lookup/README.md)). Rows that the current
+  reference table fixes are released with `python -m tools.replay quarantine` (it
+  includes `IN_PROGRESS` rows by default); for the agent to see the others again, set
+  their `healing_status` back to `PENDING`. They are then published as **new** failures
+  (the id includes the batches) and run as new workflows; the old stub-ended workflows
+  stay as they are.
 - A rerun failure goes through the whole graph again, so without a reusable past fix it
   costs one model call.
 - If its records were healed in the meantime by another workflow, Remediate finds
