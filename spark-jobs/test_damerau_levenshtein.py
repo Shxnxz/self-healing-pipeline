@@ -11,9 +11,11 @@ from pyspark.sql import SparkSession
 
 from ref_mappings import (
     CANONICAL_ANCHORS,
+    _score_anchors,
     damerau_levenshtein,
     damerau_levenshtein_udf,
     fuzzy_canonical,
+    spelling_distance,
 )
 
 
@@ -35,6 +37,45 @@ def test_distance() -> None:
     # Symmetric
     assert damerau_levenshtein("SUNDAY", "SATURDAY") == damerau_levenshtein("SATURDAY", "SUNDAY")
     print("  -> damerau_levenshtein distances: PASSED")
+
+
+def _fuzzy(field: str, value: str):
+    """fuzzy_canonical's guardrails in plain Python (same scoring function)."""
+    key = value.strip().upper()
+    if len(key) < 4:
+        return None
+    best, canonical, second = _score_anchors(key, CANONICAL_ANCHORS[field])
+    second = 1000 if second is None else second
+    return canonical if best <= max(1, int(len(key) * 0.25)) and second - best >= 2 else None
+
+
+def test_accepted_spellings() -> None:
+    """Typos of a seed SYNONYM are fixed too (Task 109); values seen in the dirty data."""
+    weather = CANONICAL_ANCHORS["weather_condition"]
+    assert weather["CLEAR WEATHER"] == "CLEAR" and weather["RAINY"] == "RAIN"
+    assert "O" not in weather and "C" not in weather  # codes are too short to be anchors
+    assert "N, L" not in CANONICAL_ANCHORS["lighting_condition"]
+    assert "01" not in CANONICAL_ANCHORS["crash_month"]
+    assert _fuzzy("weather_condition", "Clear Weagher") == "CLEAR"
+    assert _fuzzy("weather_condition", "Rriny") == "RAIN"
+    assert _fuzzy("weather_condition", "NOT KNWON") == "UNKNOWN"
+    assert _fuzzy("weather_condition", "Clqudy") == "CLOUDY"       # canonical anchor as before
+    assert _fuzzy("crash_month", "FEBR") == "FEBRUARY"            # via FEB
+    assert _fuzzy("crash_month", "OCT.") == "OCTOBER"
+    assert _fuzzy("crash_day_of_week", "TUES") == "TUESDAY"
+    assert _fuzzy("lighting_condition", "NIGHT WITH LIGHX") == "DARKNESS, LIGHTED ROAD"
+    # Still no guessing.
+    assert _fuzzy("crash_month", "JULE") is None                  # JUNE / JUL(Y): one edit each
+    assert _fuzzy("crash_month", "MARY") is None                  # MAR / MAY
+    assert _fuzzy("crash_day_of_week", "THUR") is None            # THU 1 edit, TUE 2: no margin
+    # A synonym only wins from at most 2 edits: UNLIGHTED is not LIGHTED.
+    assert _fuzzy("lighting_condition", "NIGHT UNLIGHTED") is None
+    assert _fuzzy("weather_condition", "OTHER") is None
+    # Spellings of one value never compete with each other for the margin.
+    assert _score_anchors("CLEAR WEATHER", weather)[:2] == (0, "CLEAR")
+    # The fuzzy audit records the distance to the spelling that matched.
+    assert spelling_distance("CLEAR WEAGHER", "CLEAR", weather) == 1
+    print("  -> fuzzy matching against accepted spellings: PASSED")
 
 
 def test_spark(spark: SparkSession) -> None:
@@ -72,6 +113,7 @@ def test_spark(spark: SparkSession) -> None:
 if __name__ == "__main__":
     print("[TEST] Damerau-Levenshtein fuzzy matching")
     test_distance()
+    test_accepted_spellings()
     spark = SparkSession.builder.master("local[1]").appName("dl_test").getOrCreate()
     try:
         test_spark(spark)

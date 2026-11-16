@@ -5,8 +5,9 @@ Handles seed definitions, Delta table initialization, and dictionary lookups
 for categorical standardization in Silver 2 and self-healing LLM loops.
 """
 
+import os
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -139,16 +140,57 @@ FUZZY_CANONICAL_FIELDS = [
     "crash_day_of_week",
 ]
 
-# Canonical seed anchors for fuzzy matching (auto-derived from taxonomy)
-CANONICAL_ANCHORS: Dict[str, List[str]] = {
-    field: list(CANONICAL_TAXONOMY[field].keys())
+# Fuzzy matching compares a value with every ACCEPTED SPELLING of the seed taxonomy,
+# not only with the canonical value itself: "Clear Weagher" is one edit from the seed
+# spelling CLEAR WEATHER and fixed to CLEAR, "Rriny" one edit from RAINY -> RAIN.
+# Only spellings with at least this many letters are anchors: codes such as N, S, O,
+# "N, L" or the digits of a month are too short to say which value a typo meant.
+# FUZZY_ACCEPTED_SPELLINGS=false goes back to the canonical values alone.
+FUZZY_SPELLING_MIN_LETTERS = 3
+FUZZY_SPELLING_MAX_DISTANCE = 2
+NO_MATCH_DISTANCE = 1000
+FUZZY_ACCEPTED_SPELLINGS = os.environ.get("FUZZY_ACCEPTED_SPELLINGS", "true").strip().lower() != "false"
+
+
+def _letters(value: str) -> int:
+    return sum(ch.isalpha() for ch in value)
+
+
+def fuzzy_anchors(field: str, accepted_spellings: bool = True) -> Dict[str, str]:
+    """Anchor spelling -> canonical value of one field, from the SEED taxonomy only.
+
+    Every canonical value is an anchor of itself. With `accepted_spellings`, so is each
+    seed synonym that has at least FUZZY_SPELLING_MIN_LETTERS letters. A spelling that
+    two canonical values share is dropped: it cannot say which one a typo meant.
+    Promoted rows of ref_canonical_mappings never become anchors (guardrail 4).
+    """
+    groups = CANONICAL_TAXONOMY[field]
+    owners: Dict[str, set] = {}
+    for canonical, synonyms in groups.items():
+        owners.setdefault(canonical.strip().upper(), set()).add(canonical)
+        if not accepted_spellings:
+            continue
+        for synonym in synonyms:
+            spelling = synonym.strip().upper()
+            if _letters(spelling) >= FUZZY_SPELLING_MIN_LETTERS:
+                owners.setdefault(spelling, set()).add(canonical)
+    anchors = {spelling: next(iter(found)) for spelling, found in owners.items() if len(found) == 1}
+    for canonical in groups:  # a canonical value always stays its own anchor
+        anchors[canonical.strip().upper()] = canonical
+    return anchors
+
+
+# Anchor spelling -> canonical value per fuzzy field (auto-derived from the taxonomy).
+# Iterating one of these dicts gives the anchor spellings.
+CANONICAL_ANCHORS: Dict[str, Dict[str, str]] = {
+    field: fuzzy_anchors(field, FUZZY_ACCEPTED_SPELLINGS)
     for field in FUZZY_CANONICAL_FIELDS
 }
 
-# Anchor -> canonical stored value (shared by Silver 2 and promotion)
+# Anchor -> canonical stored value (shared by Silver 2 and promotion). fuzzy_canonical
+# already returns the canonical value, which maps to itself here.
 ANCHOR_TO_CANONICAL: Dict[str, Dict[str, str]] = {
-    field: {anchor: anchor for anchor in CANONICAL_TAXONOMY[field].keys()}
-    for field in FUZZY_CANONICAL_FIELDS
+    field: dict(CANONICAL_ANCHORS[field]) for field in FUZZY_CANONICAL_FIELDS
 }
 
 
@@ -215,30 +257,77 @@ _FUZZY_SCORE_SCHEMA = StructType(
 )
 
 
-def _score_anchors(key: Optional[str], anchors: List[str]) -> Optional[Tuple]:
-    """(best distance, best anchor, runner-up distance) of `key` against `anchors`."""
+Anchors = Union[Mapping[str, str], List[str]]
+
+
+def _as_mapping(anchors: Anchors) -> Dict[str, str]:
+    """Anchor spelling -> canonical value; a plain list maps each anchor to itself."""
+    if isinstance(anchors, Mapping):
+        return {str(k).strip().upper(): v for k, v in anchors.items()}
+    return {str(a).strip().upper(): a for a in anchors}
+
+
+def _score_anchors(key: Optional[str], anchors: Anchors) -> Optional[Tuple]:
+    """(best distance, best canonical value, runner-up distance) of `key` against `anchors`.
+
+    The distance of a canonical value is that of its closest spelling, and the runner-up
+    is the closest OTHER canonical value: CLEAR and CLEAR WEATHER are one value, so they
+    never compete with each other for the margin rule.
+    """
     if key is None:
         return None
-    # Sorting (distance, anchor) keeps ties deterministic, like the old struct sort
-    scored = sorted((damerau_levenshtein(key, a), a) for a in anchors)
-    second_d = scored[1][0] if len(scored) > 1 else None
-    return scored[0][0], scored[0][1], second_d
+    nearest: Dict[str, int] = {}   # closest spelling of each value: the margin rule
+    winning: Dict[str, int] = {}   # closest spelling that may win
+    for spelling, canonical in _as_mapping(anchors).items():
+        d = damerau_levenshtein(key, spelling)
+        nearest[canonical] = min(d, nearest.get(canonical, d))
+        # A synonym wins only from at most FUZZY_SPELLING_MAX_DISTANCE edits away, so a
+        # long one does not pull in a different meaning ("NIGHT UNLIGHTED" is 3 edits
+        # from "NIGHT, LIGHTED"). It still counts as a runner-up at any distance.
+        if spelling == canonical.strip().upper() or d <= FUZZY_SPELLING_MAX_DISTANCE:
+            winning[canonical] = min(d, winning.get(canonical, d))
+    if not winning:   # nothing close enough: a distance no limit accepts
+        return NO_MATCH_DISTANCE, None, None
+    # Sorting (distance, value) keeps ties deterministic, like the old struct sort
+    best_d, best_v = min((d, v) for v, d in winning.items())
+    others = [d for v, d in nearest.items() if v != best_v]
+    return best_d, best_v, (min(others) if others else None)
 
 
-def fuzzy_canonical(col, anchors: List[str], max_frac: float = 0.25):
+def spelling_distance(key: Optional[str], canonical: Optional[str], anchors: Anchors) -> Optional[int]:
+    """Edit distance from `key` to the closest anchor spelling of `canonical` (the
+    distance the fuzzy match accepted). Falls back to the canonical value itself."""
+    if key is None or canonical is None:
+        return None
+    spellings = [s for s, v in _as_mapping(anchors).items() if v == canonical] or [canonical]
+    return min(damerau_levenshtein(key.strip().upper(), s) for s in spellings)
+
+
+def fuzzy_distance(col, matched, anchors: Anchors):
+    """Column: spelling_distance of `col` to the value `matched` (for the fuzzy audit)."""
+    mapping = _as_mapping(anchors)
+    c = F.col(col) if isinstance(col, str) else col
+    m = F.col(matched) if isinstance(matched, str) else matched
+    return F.udf(lambda k, v: spelling_distance(k, v, mapping), IntegerType())(F.upper(F.trim(c)), m)
+
+
+def fuzzy_canonical(col, anchors: Anchors, max_frac: float = 0.25):
     """
-    Deterministic Damerau-Levenshtein matching against seed canonical anchors.
+    Deterministic Damerau-Levenshtein matching against the seed anchors of a field:
+    its canonical values and their accepted spellings (CANONICAL_ANCHORS). Returns the
+    canonical value, or NULL.
 
     Guardrails:
     1. Minimum length of 4: protects against single-character ambiguity like N/S/E/W.
     2. Distance scaled to length: limit = greatest(1, floor(length * max_frac)).
-    3. Unique winner with a margin: second["d"] - best["d"] >= 2 (e.g. JUNY is 1 edit
-       from both JUNE and JULY, so it stays in quarantine instead of guessing).
+    3. Unique winner with a margin: the closest OTHER canonical value must be at least
+       2 edits further (e.g. JUNY is 1 edit from both JUNE and JULY, so it stays in
+       quarantine instead of guessing). Spellings of the same value never compete.
     4. Anchors are seed values only: dynamic or promoted entries must never be anchors.
     """
     c = F.col(col) if isinstance(col, str) else col
     key = F.upper(F.trim(c))
-    anchors = list(anchors)
+    anchors = _as_mapping(anchors)
     # Spark SQL higher-order lambdas cannot call Python UDFs, so one UDF scores all anchors
     score = F.udf(lambda k: _score_anchors(k, anchors), _FUZZY_SCORE_SCHEMA)(key)
     # A single-anchor list has no runner-up: treat it as infinitely far away

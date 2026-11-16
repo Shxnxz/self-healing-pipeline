@@ -57,8 +57,8 @@ from sources import (
 from ref_mappings import (
     ANCHOR_TO_CANONICAL,
     CANONICAL_ANCHORS,
-    damerau_levenshtein_udf,
     fuzzy_canonical,
+    fuzzy_distance,
     init_fuzzy_audit,
     init_ref_mappings,
     load_mappings_dict,
@@ -164,7 +164,8 @@ def _fuzzy_audit_struct(
             record_id.alias("record_id"),
             raw_col.alias("raw"),
             effective_fuzzy.alias("matched"),
-            damerau_levenshtein_udf(F.upper(F.trim(raw_col)), effective_fuzzy).alias("distance"),
+            # Distance to the accepted spelling it matched (CLEAR WEAGHER -> CLEAR WEATHER: 1)
+            fuzzy_distance(raw_col, effective_fuzzy, CANONICAL_ANCHORS[field]).alias("distance"),
         ),
     ).otherwise(None)
 
