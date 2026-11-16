@@ -205,7 +205,8 @@ services:
         condition: service_completed_successfully
 
   # --- Deterministic Lookup ---------------------------------------------
-  # Groups new silver2_quarantine rows and publishes them to recovery.failures.
+  # Groups PENDING silver2_quarantine rows, publishes them to recovery.failures and
+  # claims them IN_PROGRESS (the one table it writes, so the only writable mount).
   lookup-scanner:
     build:
       context: .
@@ -215,6 +216,7 @@ services:
     restart: on-failure
     volumes:
       - ./delta:/data/delta:ro
+      - ./delta/silver2_quarantine:/data/delta/silver2_quarantine
       - lookup-state:/state
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092

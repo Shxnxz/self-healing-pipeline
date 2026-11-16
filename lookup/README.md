@@ -13,8 +13,27 @@ silver2_quarantine --lookup-scanner--> recovery.failures --+       |
 
 | Service | Reads | Writes |
 |---|---|---|
-| `lookup-scanner` (`scanner.py`) | new `PENDING` rows in `delta/silver2_quarantine` | one message per (folder, column, value) group to `recovery.failures` |
+| `lookup-scanner` (`scanner.py`) | `PENDING` rows in `delta/silver2_quarantine` | one message per (folder, column, value) group to `recovery.failures`, then the rows `IN_PROGRESS` |
 | `deterministic-lookup` (`consumer.py`) | `recovery.incidents` + `recovery.failures` | one ranked stack per window to `recovery.lookup` |
+
+**The trigger claims what it publishes** (spec section 3: "marks the group IN_PROGRESS
+so it is not picked up twice"). Every scan reads the `PENDING` rows, publishes their
+groups largest first, waits for Kafka's acknowledgement and only then sets the rows
+`IN_PROGRESS` (deltalake UPDATE, the scanner's only write: Compose mounts the quarantine
+writable for it). A crash in between publishes the group again, it is never lost. The
+claim is limited to the micro-batches that were read, so a batch Silver 2 commits during
+the scan stays `PENDING` for the next one. `IN_PROGRESS` rows are not picked up again:
+Validate sets the rows it releases to `RESOLVED`; rows an engineer dismissed, or that
+still fail another column, stay `IN_PROGRESS` until a later fix, a promotion plus
+`tools/replay.py quarantine --include-in-progress`, or an engineer. A later batch of the
+same problem is a new failure (its id includes the batch), and the recovery agent
+attaches it to the workflow still open for that problem ([agent/README.md](../agent/README.md),
+"How state is kept"). A scanner state file left by the old watermark scanner is
+honoured once: the rows it had published are claimed without being published again.
+
+The files deltalake's UPDATE writes keep their strings as Arrow `string_view`. Spark
+reads them as usual; a pyarrow dataset filter on a string column must cast it first
+(`ds.field(name).cast(pa.string())`, see `agent/reference.py: text_field`).
 
 Qwen incidents reach Kafka only with `QWEN_ENABLED=true` **and**
 `QWEN_KAFKA_ENABLED=true` (see `.env.example`). Without them the lookup still

@@ -122,7 +122,7 @@ docker compose run --rm tools python -m tools.replay dead-letter silver1 --sourc
   - a fix in Silver 2's code.
 
   `quarantine --source crash1 --column weather_condition --value "FREEZING RAIN"`.
-  Rows that still fail stay `PENDING`, untouched. No overlay is used and nothing is
+  Rows that still fail keep their status, untouched. No overlay is used and nothing is
   promoted: the replay trusts `ref_canonical_mappings` exactly as the Silver 2 job does.
 
 **Records the agent is working on are left out.** A waiting row that Remediate staged
@@ -131,8 +131,10 @@ being validated, waiting for an engineer's approval, or a fix that did not hold.
 Releasing it here would make that workflow's Validate stop at `rows_conserved` and
 open another round for rows already fixed, so the command skips them and reports
 `held_by_agent` with the execution ids (`python -m agent.audit <execution_id>`).
-`--force` takes them anyway, for example after the engineer dismissed the case. By
-default only `PENDING` rows are taken; `--include-in-progress` adds `IN_PROGRESS`.
+`--force` takes them anyway, for example after the engineer dismissed the case. Waiting
+rows are `PENDING` and `IN_PROGRESS`: the recovery trigger claims every group it
+publishes, so almost every waiting row is `IN_PROGRESS`, and both are taken by default
+(Task 109; `--pending-only` takes only rows not claimed yet).
 
 Rows released here that another column was fuzzy-fixed in on the way get their
 `silver2_fuzzy_audit` rows, as in the stream.

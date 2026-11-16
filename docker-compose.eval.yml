@@ -82,6 +82,7 @@ services:
     container_name: eval-lookup-scanner
     volumes: !override
       - ./eval/delta:/data/delta:ro
+      - ./eval/delta/silver2_quarantine:/data/delta/silver2_quarantine
       - lookup-state:/state
 
   deterministic-lookup:

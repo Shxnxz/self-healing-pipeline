@@ -3,12 +3,15 @@
   recovery.lookup (lookup/consumer.py) --> for each stack item, top first --> graph (agent/graph.py)
   recovery.decisions (agent/review.py)  --> resume the workflow waiting for that decision
 
-Each workflow is checkpointed under thread_id = failure_id, which gives five
+Each workflow is checkpointed under thread_id = failure_id, which gives these
 behaviours for a stack item:
 
   waiting    saved state paused in engineer_review: the failure is with an engineer,
              leave it alone (the decision resumes it, not a new publish)
-  new        no saved state: start the workflow
+  attached   no saved state, but a workflow of the same problem (same folder, column
+             and value; a later batch) is still open: the failure joins that workflow
+             instead of starting another one (agent/attach.py, Task 109)
+  new        no saved state and nothing open for the problem: start the workflow
   resumed    saved state that stopped part-way (the agent was killed): continue
              from the last finished node
   duplicate  saved state that ended with every step real: skip it (Kafka delivers
@@ -38,12 +41,15 @@ from langgraph.types import Command
 
 from agent import config
 from agent import escalation as esc
+from agent.attach import OpenWorkflows, attach
+from agent.upkeep import Upkeep
 from agent.graph import build_graph, open_checkpointer
 from agent.state import STATUS_DISMISSED, STATUS_RESOLVED_BY_ENGINEER, initial_state
 
 NEW, RESUMED, DUPLICATE, RERUN, MALFORMED = "new", "resumed", "duplicate", "rerun", "malformed"
 RELEARN = "relearn"
 WAITING = "waiting"
+ATTACHED = "attached"
 # What happened to a decision from recovery.decisions.
 DECIDED, REFUSED, UNKNOWN = "decided", "refused", "unknown"
 
@@ -152,8 +158,10 @@ class LearnRetry:
         return summaries
 
 
-def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
-    """Start, resume, skip or rerun the workflow of one stack item. Returns a summary for the log."""
+def run_workflow(graph, lookup_id: Optional[str], item: dict,
+                 open_workflows: Optional[OpenWorkflows] = None) -> dict:
+    """Start, resume, skip, rerun or attach the workflow of one stack item. Returns a
+    summary for the log. Without `open_workflows` nothing is attached (tests)."""
     failure = item.get("failure") if isinstance(item, dict) else None
     failure_id = failure.get("failure_id") if isinstance(failure, dict) else None
     if not failure_id:
@@ -175,6 +183,10 @@ def run_workflow(graph, lookup_id: Optional[str], item: dict) -> dict:
     if saved.values:
         graph.checkpointer.delete_thread(failure_id)
         delivery = RERUN
+    elif open_workflows is not None:
+        target = open_workflows.find(failure)
+        if target is not None:
+            return {"delivery": ATTACHED, **attach(graph, target, lookup_id, item)}
     state = graph.invoke(initial_state(lookup_id, item), thread)
     return {"delivery": delivery, "failure_id": failure_id, "state": state}
 
@@ -215,15 +227,21 @@ def apply_decision(graph, message: dict) -> dict:
     return {"delivery": DECIDED, "failure_id": failure_id, "state": state}
 
 
-def process_lookup(graph, message: dict, between: Optional[Callable[[], None]] = None) -> List[dict]:
+def process_lookup(graph, message: dict, between: Optional[Callable[[], None]] = None,
+                   open_workflows: Optional[OpenWorkflows] = None) -> List[dict]:
     """Work through one recovery.lookup message from the top of its stack.
-    `between` is called after each workflow (the poll loop uses it to stay in the group)."""
+    `between` is called after each workflow (the poll loop uses it to stay in the group).
+    With `open_workflows`, a later batch of a problem whose workflow is still open joins
+    it, and the index is kept up to date."""
     stack = message.get("stack")
     if not isinstance(stack, list):
         return []
     summaries = []
     for item in stack:
-        summaries.append(run_workflow(graph, message.get("lookup_id"), item))
+        summary = run_workflow(graph, message.get("lookup_id"), item, open_workflows)
+        summaries.append(summary)
+        if open_workflows is not None:
+            open_workflows.note(summary.get("attached_to") or summary.get("failure_id"))
         if between is not None:
             between()
     return summaries
@@ -233,6 +251,12 @@ def describe(summary: dict) -> str:
     state = summary["state"]
     if summary["delivery"] == MALFORMED:
         return "[agent] Skipping stack item or decision without a failure_id"
+    if summary["delivery"] == ATTACHED:
+        failure = state.get("failure") or {}
+        what = failure.get("column_name") or failure.get("failure_type")
+        return (f"[agent] {summary['failure_id']} {ATTACHED:<9} to {summary['attached_to']} "
+                f"{failure.get('folder') or '-'}:{what} value={failure.get('signature_value')!r}: same problem, "
+                f"now {failure.get('rows_affected')} row(s) in batch(es) {failure.get('batch_id')} -> {state.get('status')}")
     if not state:
         return f"[agent] decision for {summary['failure_id']} {summary['delivery']}: {'; '.join(summary.get('problems') or [])}"
     failure = state.get("failure") or {}
@@ -262,7 +286,8 @@ def parse(msg) -> Optional[dict]:
     return message
 
 
-def run(consumer, graph, max_messages: Optional[int] = None, retry: Optional[LearnRetry] = None) -> None:
+def run(consumer, graph, max_messages: Optional[int] = None, retry: Optional[LearnRetry] = None,
+        open_workflows: Optional[OpenWorkflows] = None, upkeep=None) -> None:
     """Poll loop. `max_messages` stops it after that many messages (tests).
 
     A stack can hold many failures, and a workflow can be slow once Diagnose calls
@@ -280,6 +305,16 @@ def run(consumer, graph, max_messages: Optional[int] = None, retry: Optional[Lea
             early.append(extra)
 
     retry = retry or LearnRetry(graph)
+
+    def finished(summaries) -> None:
+        """Keep the indexes up to date and prune what ended (agent/upkeep.py)."""
+        for summary in summaries:
+            for failure_id in (summary.get("failure_id"), summary.get("attached_to")):
+                if open_workflows is not None:
+                    open_workflows.note(failure_id)
+                if upkeep is not None:
+                    upkeep.finished(failure_id)
+
     handled = 0
     while max_messages is None or handled < max_messages:
         if retry.pending and not early:
@@ -287,8 +322,13 @@ def run(consumer, graph, max_messages: Optional[int] = None, retry: Optional[Lea
             consumer.pause(assigned)
             summaries = retry.due(between=keep_alive)
             consumer.resume(assigned)
+            finished(summaries)
             for summary in summaries:
                 print(describe(summary), flush=True)
+        if upkeep is not None and not early:
+            compacted = upkeep.due()
+            if compacted is not None and compacted.get("status") != "SKIPPED":
+                print(f"[agent] remediation_audit upkeep: {compacted}", flush=True)
         msg = early.pop(0) if early else consumer.poll(1.0)
         if msg is None:
             continue
@@ -305,14 +345,16 @@ def run(consumer, graph, max_messages: Optional[int] = None, retry: Optional[Lea
                 summary = apply_decision(graph, message)
                 consumer.resume(assigned)
                 retry.note(summary.get("failure_id"))
+                finished([summary])
                 print(f"[agent] decision {message.get('decision')} by {message.get('engineer')} "
                       f"on {message.get('escalation_id')}: {summary['delivery']}")
                 print(describe(summary), flush=True)
             else:
-                summaries = process_lookup(graph, message, between=keep_alive)
+                summaries = process_lookup(graph, message, between=keep_alive, open_workflows=open_workflows)
                 consumer.resume(assigned)
                 for summary in summaries:
                     retry.note(summary.get("failure_id"))
+                finished(summaries)
                 print(f"[agent] lookup {message.get('lookup_id')}: {len(summaries)} failure(s)")
                 for summary in summaries:
                     print(describe(summary), flush=True)
@@ -356,8 +398,18 @@ def main() -> None:
     if retry.scan():
         print(f"[agent] {len(retry.pending)} workflow(s) still need Learn; retrying every "
               f"{retry.interval:g} s", flush=True)
+    saved = thread_ids(graph.checkpointer)
+    open_workflows = OpenWorkflows(graph)
+    if open_workflows.scan(saved):
+        print(f"[agent] {len(open_workflows.by_signature)} open workflow(s): later batches of the same "
+              f"problem join them", flush=True)
+    upkeep = Upkeep(graph)
+    pruned = upkeep.start(saved)
+    if pruned["checkpoints_removed"]:
+        print(f"[agent] Pruned {pruned['checkpoints_removed']} checkpoint(s) of {pruned['threads']} "
+              f"finished workflow(s)", flush=True)
     try:
-        run(consumer, graph, retry=retry)
+        run(consumer, graph, retry=retry, open_workflows=open_workflows, upkeep=upkeep)
     finally:
         consumer.close()
 
