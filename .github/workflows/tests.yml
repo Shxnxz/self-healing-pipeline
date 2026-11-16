@@ -53,7 +53,8 @@ jobs:
             lineage/requirements.txt
             lookup/requirements.txt
       - name: Install
-        run: pip install -r lineage/requirements.txt -r lookup/requirements.txt pytest
+        # pyyaml: lookup/tests/test_scanner.py (Task 109) reads docker-compose.yml
+        run: pip install -r lineage/requirements.txt -r lookup/requirements.txt pytest pyyaml
       - name: Lineage consumer (retry tests against the real Neo4j service)
         working-directory: lineage
         env:
