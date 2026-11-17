@@ -10,16 +10,19 @@ The worker takes the outbox files oldest first: classify, save the incident to
 <QWEN_INCIDENT_DIR>/<incident_id>.json, publish it, then delete the outbox file. If
 any step fails it keeps the file and tries again later (backoff up to
 QWEN_OUTBOX_MAX_BACKOFF_SECONDS), and an incident already classified is not
-classified again. Files left by a stopped driver are drained when run_job starts the
-next one. Delivery stays at least once: consumers deduplicate on incident_id.
+classified again. A worker claims a file by renaming it first, so two drivers sharing
+the folder never take the same one. Files left by a stopped driver are put back and
+drained when run_job starts the next one. Delivery stays at least once: consumers deduplicate on incident_id.
 
 QWEN_ASYNC=false keeps the old behaviour: classify, save and publish inside the call,
 and a broker failure fails the batch.
 """
 import json
 import os
+import socket
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +31,11 @@ from .classifier import QwenClassifier
 from .handoff import build_incident, incident_id_for, publish_incident, save_incident
 
 OUTBOX = 'outbox'
+CLAIMED = '.claimed.'      # <incident_id>.json.claimed.<host>-<pid>: a worker is on it
+
+
+def _owner():
+    return f'{socket.gethostname()}-{os.getpid()}'
 
 
 def enabled():
@@ -97,21 +105,55 @@ class Outbox:
             return []
         return sorted(self.path.glob('*.json'), key=lambda p: (p.stat().st_mtime, p.name))
 
+    def claim(self, item):
+        """Take the file for this process by renaming it (atomic on one file system), so
+        two drivers sharing the incidents folder never classify the same incident twice
+        (review of #37). Returns the claimed path, or None when another worker took it."""
+        claimed = item.with_name(f'{item.name}{CLAIMED}{_owner()}')
+        try:
+            os.rename(item, claimed)
+        except FileNotFoundError:
+            return None
+        return claimed
+
+    def release(self, claimed):
+        """Give a claimed file back to the queue (it failed; a later round retries it)."""
+        os.rename(claimed, claimed.with_name(claimed.name.split(CLAIMED)[0]))
+
+    def recover(self, stale_seconds=None):
+        """Put back files a stopped worker had claimed: every claim of this host (its
+        processes before this start are gone) and any claim older than `stale_seconds`."""
+        stale = float(stale_seconds if stale_seconds is not None
+                      else os.getenv('QWEN_OUTBOX_STALE_SECONDS', 3600))
+        if not self.path.is_dir():
+            return 0
+        mine, now, recovered = f'{CLAIMED}{socket.gethostname()}-', time.time(), 0
+        for claimed in self.path.glob(f'*.json{CLAIMED}*'):
+            try:
+                if mine in claimed.name or now - claimed.stat().st_mtime > stale:
+                    self.release(claimed)
+                    recovered += 1
+            except FileNotFoundError:
+                continue
+        return recovered
+
     def drain(self):
         """Process every pending file once. Returns (done, failed)."""
         done = failed = 0
         for item in self.pending():
-            try:
-                record = json.loads(item.read_text(encoding='utf-8'))
-                process(record, self.directory)
-            except FileNotFoundError:
+            claimed = self.claim(item)
+            if claimed is None:
                 continue                       # another worker took it
-            except Exception as error:          # keep the file, try again later
+            try:
+                record = json.loads(claimed.read_text(encoding='utf-8'))
+                process(record, self.directory)
+            except Exception as error:          # give the file back, try again later
                 failed += 1
                 print(f'[qwen] incident {item.stem} not recorded yet: {type(error).__name__}: {error}',
                       file=sys.stderr)
+                self.release(claimed)
                 continue
-            item.unlink(missing_ok=True)
+            claimed.unlink(missing_ok=True)
             done += 1
         return done, failed
 
@@ -170,8 +212,10 @@ def run_job(main, *, job_name):
     outbox files a previous driver left behind are drained in the background."""
     if enabled() and asynchronous():
         try:
-            if outbox().pending():
-                outbox().start()
+            box = outbox()
+            box.recover()
+            if box.pending():
+                box.start()
         except Exception as error:
             print(f'[qwen] outbox not started: {type(error).__name__}', file=sys.stderr)
     try:

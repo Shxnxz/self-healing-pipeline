@@ -206,6 +206,37 @@ def test_waiting_and_relearn_workflows_are_not_pruned(tmp_path):
     saver.conn.close()
 
 
+def test_start_up_loads_each_saved_workflow_once(tmp_path, monkeypatch):
+    """Learn retry, open-workflow index and pruning share one load per saved workflow
+    at start (review of #37), with the same result as their own scans."""
+    from agent.consumer import LearnRetry, start_up
+
+    saver = open_checkpointer(str(tmp_path / "checkpoints.sqlite"))
+
+    def learn_down(state):
+        raise ConnectionError("neo4j down")
+
+    process_lookup(escalating_graph(saver), lookup_message(batch_item("f1", "7", 3)))   # waits
+    broken = build_graph(saver, nodes={**REUSE_PATH_BUILT, "learn": learn_down}, retry_seconds=0)
+    process_lookup(broken, lookup_message(batch_item("f2", "7", 3, value="Ju", route="remediate", match=PAST_FIX)))
+    done = build_graph(saver, nodes=REUSE_PATH_BUILT)
+    process_lookup(done, lookup_message(batch_item("f3", "7", 3, value="JUNEE", route="remediate", match=PAST_FIX)))
+    assert checkpoint_count(saver, "f3") > 1
+
+    g = escalating_graph(saver)
+    loads = []
+    real_get_state = g.get_state
+    monkeypatch.setattr(g, "get_state", lambda config, *a, **k: loads.append(config) or real_get_state(config, *a, **k))
+    retry, index, upkeep = LearnRetry(g), OpenWorkflows(g), Upkeep(g, prune=True, interval=0)
+    result = start_up(g, retry, index, upkeep)
+    assert len(loads) == 3                                       # one per saved workflow
+    assert retry.pending == {"f2"}
+    assert list(index.by_signature.values()) == ["f1"]
+    assert result["threads"] == 1 and checkpoint_count(saver, "f3") == 1
+    assert checkpoint_count(saver, "f1") > 1 and checkpoint_count(saver, "f2") > 1
+    saver.conn.close()
+
+
 def test_upkeep_off_prunes_nothing(tmp_path):
     saver = open_checkpointer(str(tmp_path / "checkpoints.sqlite"))
     g = build_graph(saver, nodes=REUSE_PATH_BUILT)

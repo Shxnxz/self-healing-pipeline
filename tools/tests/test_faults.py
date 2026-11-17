@@ -122,7 +122,7 @@ def test_scenario_files_are_valid():
 def test_values_meant_for_quarantine_are_not_fuzzy_fixed():
     """Unseen variants, unknown and ambiguous values must reach the quarantine: none may
     be within reach of Silver 2's fuzzy match, which also knows the accepted seed
-    spellings since Task 109 ("Apr." -> APR, "Tues" -> TUE)."""
+    spellings since Task 109 (CLEAR WEATHER, NIGHT WITH LIGHT, ...)."""
     pytest.importorskip("pyspark")
     from tools import session
     from tools.fault_injector import fuzzy_fixes
@@ -135,4 +135,7 @@ def test_values_meant_for_quarantine_are_not_fuzzy_fixed():
                             for values in by_value.values() for value in values]
     meant_for_quarantine += [(column, value) for column, values in faults.UNKNOWN_VALUES.items()
                              for value in values]
+    # One edit from a short seed spelling of a DIFFERENT value: never fixed (review of #37).
+    meant_for_quarantine += [("lighting_condition", "LIGHT"), ("lighting_condition", "Light"),
+                             ("crash_day_of_week", "MOON"), ("lighting_condition", "NIGHT, UNLIGHTED")]
     assert [pair for pair in meant_for_quarantine if fuzzy_fixes(*pair)] == []

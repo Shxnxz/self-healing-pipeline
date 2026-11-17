@@ -81,15 +81,13 @@ UNSEEN_VARIANTS: Dict[str, Dict[str, List[str]]] = {
         "DAWN": ["SUNRISE", "DAYBREAK"],
     },
     "crash_month": {
-        # Not "Apr.", "Sept", "Noviembre": within 2 edits of an accepted spelling
-        # (APR, SEPT, NOVEMBER), so Silver 2's fuzzy match fixes them (Task 109).
-        "JANUARY": ["Enero"], "FEBRUARY": ["Febrero"], "MARCH": ["Marzo"], "APRIL": ["Abr."],
+        # Not "Noviembre": two edits from NOVEMBER itself, so Silver 2's fuzzy match fixes it.
+        "JANUARY": ["Enero"], "FEBRUARY": ["Febrero"], "MARCH": ["Marzo"], "APRIL": ["Apr."],
         "MAY": ["Mayo"], "JUNE": ["Junio"], "JULY": ["Julio"], "AUGUST": ["Agosto"],
-        "SEPTEMBER": ["Setiembre"], "OCTOBER": ["Octubre"], "NOVEMBER": ["Novbre"], "DECEMBER": ["Diciembre"],
+        "SEPTEMBER": ["Sept"], "OCTOBER": ["Octubre"], "NOVEMBER": ["Novbre"], "DECEMBER": ["Diciembre"],
     },
     "crash_day_of_week": {
-        # Not "Tues", "Weds": the fuzzy match fixes them from TUE / WED.
-        "MONDAY": ["Lunes"], "TUESDAY": ["Martes"], "WEDNESDAY": ["Miercoles"], "THURSDAY": ["Thurs"],
+        "MONDAY": ["Lunes"], "TUESDAY": ["Tues"], "WEDNESDAY": ["Weds"], "THURSDAY": ["Thurs"],
         "FRIDAY": ["Viernes"], "SATURDAY": ["Sabado"], "SUNDAY": ["Domingo"],
     },
     "street_direction": {

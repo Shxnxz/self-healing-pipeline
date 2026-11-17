@@ -86,6 +86,49 @@ class HandoffTests(unittest.TestCase):
                 self.assertEqual(published, json.loads(saved.read_text()))
                 self.assertEqual(box.pending(), [])
 
+    @patch('qwen_classifier.integration.Outbox.start')
+    @patch('qwen_classifier.integration.QwenClassifier')
+    def test_two_drivers_never_take_the_same_outbox_file(self, classifier, start):
+        """Both Spark drivers share incidents/: a file is claimed by rename before it is
+        classified, so the other driver skips it (review of #37)."""
+        from qwen_classifier.integration import Outbox
+        classifier.return_value.classify.return_value = self.classification()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, QWEN_ENABLED='true', QWEN_INCIDENT_DIR=directory, QWEN_ASYNC='true'):
+                capture_exception(ValueError('x'), job_name='job', batch_id=1)
+                first, second = Outbox(directory), Outbox(directory)
+                [item] = first.pending()
+                claimed = first.claim(item)
+                self.assertIsNotNone(claimed)
+                self.assertEqual(second.pending(), [])             # the other driver sees nothing
+                self.assertIsNone(second.claim(item))
+                self.assertEqual(second.drain(), (0, 0))
+                first.release(claimed)                             # a failed attempt gives it back
+                with patch('qwen_classifier.integration.publish_incident') as publish:
+                    self.assertEqual(second.drain(), (1, 0))
+                self.assertEqual(publish.call_count, 1)
+                self.assertEqual(classifier.return_value.classify.call_count, 1)
+
+    @patch('qwen_classifier.integration.Outbox.start')
+    @patch('qwen_classifier.integration.QwenClassifier')
+    def test_claims_of_a_stopped_driver_are_put_back(self, classifier, start):
+        from qwen_classifier.integration import Outbox
+        classifier.return_value.classify.return_value = self.classification()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, QWEN_ENABLED='true', QWEN_INCIDENT_DIR=directory, QWEN_ASYNC='true'):
+                capture_exception(ValueError('mine'), job_name='job', batch_id=1)
+                capture_exception(ValueError('other host'), job_name='job', batch_id=2)
+                box = Outbox(directory)
+                mine, other = box.pending()
+                box.claim(mine)                                    # this host, before a restart
+                taken = other.with_name(other.name + '.claimed.other-host-7')
+                os.rename(other, taken)
+                self.assertEqual(box.recover(stale_seconds=3600), 1)   # the other host may be alive
+                self.assertEqual(len(box.pending()), 1)
+                os.utime(taken, (0, 0))                           # ...until its claim is stale
+                self.assertEqual(box.recover(stale_seconds=3600), 1)
+                self.assertEqual(len(box.pending()), 2)
+
     @patch('qwen_classifier.integration.QwenClassifier')
     def test_async_and_sync_give_the_same_incident_id(self, classifier):
         classifier.return_value.classify.side_effect = lambda text, **kw: dict(

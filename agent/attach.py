@@ -157,11 +157,12 @@ class OpenWorkflows:
             self.note(failure_id)
         return len(self.by_signature)
 
-    def note(self, failure_id: Optional[str]) -> None:
+    def note(self, failure_id: Optional[str], saved=None) -> None:
         """Record the workflow as open, or forget it when it is not open any more."""
         if not failure_id:
             return
-        saved = self._saved(failure_id)
+        if saved is None:
+            saved = self._saved(failure_id)
         sig = signature((saved.values or {}).get("failure"))
         if sig is None:
             return

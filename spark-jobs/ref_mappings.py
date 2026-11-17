@@ -140,20 +140,34 @@ FUZZY_CANONICAL_FIELDS = [
     "crash_day_of_week",
 ]
 
-# Fuzzy matching compares a value with every ACCEPTED SPELLING of the seed taxonomy,
+# Fuzzy matching compares a value with the ACCEPTED SPELLINGS of the seed taxonomy too,
 # not only with the canonical value itself: "Clear Weagher" is one edit from the seed
-# spelling CLEAR WEATHER and fixed to CLEAR, "Rriny" one edit from RAINY -> RAIN.
-# Only spellings with at least this many letters are anchors: codes such as N, S, O,
-# "N, L" or the digits of a month are too short to say which value a typo meant.
+# spelling CLEAR WEATHER and fixed to CLEAR.
+# Spellings with at least FUZZY_SPELLING_MIN_LETTERS letters are anchors (codes such as
+# N, O, "N, L" or 01 are not), but a synonym can only WIN when it has at least
+# FUZZY_SPELLING_MIN_WIN_LETTERS letters and is at most FUZZY_SPELLING_MAX_DISTANCE edits
+# away. A short one would turn a neighbour with a different meaning into its value: LIGHT
+# is one edit from NIGHT (DARKNESS), MOON from MON (MONDAY), and the margin rule cannot
+# see it because the other canonical values are far away (review of #37). Short synonyms
+# still count as runner-ups, so "Mayo" stays quarantined (MAY 1 edit, MAR 2: no margin),
+# and "NIGHT, UNLIGHTED" (2 edits from "NIGHT, LIGHTED") is never read as lighted.
 # FUZZY_ACCEPTED_SPELLINGS=false goes back to the canonical values alone.
 FUZZY_SPELLING_MIN_LETTERS = 3
-FUZZY_SPELLING_MAX_DISTANCE = 2
+FUZZY_SPELLING_MIN_WIN_LETTERS = 6
+FUZZY_SPELLING_MAX_DISTANCE = 1
 NO_MATCH_DISTANCE = 1000
 FUZZY_ACCEPTED_SPELLINGS = os.environ.get("FUZZY_ACCEPTED_SPELLINGS", "true").strip().lower() != "false"
 
 
 def _letters(value: str) -> int:
     return sum(ch.isalpha() for ch in value)
+
+
+def _may_win(spelling: str, canonical: str, distance: int) -> bool:
+    """A canonical value always may; a synonym only when it is long and close."""
+    if spelling == canonical.strip().upper():
+        return True
+    return _letters(spelling) >= FUZZY_SPELLING_MIN_WIN_LETTERS and distance <= FUZZY_SPELLING_MAX_DISTANCE
 
 
 def fuzzy_anchors(field: str, accepted_spellings: bool = True) -> Dict[str, str]:
@@ -281,10 +295,9 @@ def _score_anchors(key: Optional[str], anchors: Anchors) -> Optional[Tuple]:
     for spelling, canonical in _as_mapping(anchors).items():
         d = damerau_levenshtein(key, spelling)
         nearest[canonical] = min(d, nearest.get(canonical, d))
-        # A synonym wins only from at most FUZZY_SPELLING_MAX_DISTANCE edits away, so a
-        # long one does not pull in a different meaning ("NIGHT UNLIGHTED" is 3 edits
-        # from "NIGHT, LIGHTED"). It still counts as a runner-up at any distance.
-        if spelling == canonical.strip().upper() or d <= FUZZY_SPELLING_MAX_DISTANCE:
+        # A synonym wins only when it is long and close (see FUZZY_SPELLING_MIN_WIN_LETTERS);
+        # it still counts as a runner-up at any distance.
+        if _may_win(spelling, canonical, d):
             winning[canonical] = min(d, winning.get(canonical, d))
     if not winning:   # nothing close enough: a distance no limit accepts
         return NO_MATCH_DISTANCE, None, None
@@ -299,8 +312,11 @@ def spelling_distance(key: Optional[str], canonical: Optional[str], anchors: Anc
     distance the fuzzy match accepted). Falls back to the canonical value itself."""
     if key is None or canonical is None:
         return None
-    spellings = [s for s, v in _as_mapping(anchors).items() if v == canonical] or [canonical]
-    return min(damerau_levenshtein(key.strip().upper(), s) for s in spellings)
+    key = key.strip().upper()
+    distances = [(spelling, damerau_levenshtein(key, spelling))
+                 for spelling, value in _as_mapping(anchors).items() if value == canonical]
+    winning = [d for spelling, d in distances if _may_win(spelling, canonical, d)]
+    return min(winning or [damerau_levenshtein(key, canonical.strip().upper())])
 
 
 def fuzzy_distance(col, matched, anchors: Anchors):

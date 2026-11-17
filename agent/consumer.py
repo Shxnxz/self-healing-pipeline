@@ -142,8 +142,12 @@ class LearnRetry:
             self.note(failure_id)
         return len(self.pending)
 
-    def note(self, failure_id: Optional[str]) -> None:
-        if failure_id and needs_learn(self.graph.get_state({"configurable": {"thread_id": failure_id}})):
+    def note(self, failure_id: Optional[str], saved=None) -> None:
+        if not failure_id:
+            return
+        if saved is None:
+            saved = self.graph.get_state({"configurable": {"thread_id": failure_id}})
+        if needs_learn(saved):
             self.pending.add(failure_id)
 
     def due(self, between: Optional[Callable[[], None]] = None) -> List[dict]:
@@ -383,6 +387,22 @@ def ensure_topics(topics: List[str]) -> None:
             print(f"[agent] Topic {topic}: {exc}", flush=True)
 
 
+def start_up(graph, retry: LearnRetry, open_workflows: OpenWorkflows, upkeep: Upkeep) -> dict:
+    """Load every saved workflow ONCE and let each start-up scan look at it: the Learn
+    retry list, the index of open workflows and the pruning of finished ones."""
+    pruned = threads = 0
+    for failure_id in thread_ids(graph.checkpointer):
+        saved = graph.get_state({"configurable": {"thread_id": failure_id}})
+        retry.note(failure_id, saved)
+        open_workflows.note(failure_id, saved)
+        gone = upkeep.finished(failure_id, saved) if upkeep.prune else 0
+        pruned += gone
+        threads += 1 if gone else 0
+    if pruned:
+        upkeep.vacuum()
+    return {"threads": threads, "checkpoints_removed": pruned}
+
+
 def main() -> None:
     from confluent_kafka import Consumer
 
@@ -398,17 +418,14 @@ def main() -> None:
     consumer.subscribe([config.LOOKUP_TOPIC, config.DECISIONS_TOPIC])
     print(f"[agent] Consuming {config.LOOKUP_TOPIC} and {config.DECISIONS_TOPIC} from {config.KAFKA_BOOTSTRAP} "
           f"(checkpoints {config.CHECKPOINT_PATH})", flush=True)
-    retry = LearnRetry(graph)
-    if retry.scan():
+    retry, open_workflows, upkeep = LearnRetry(graph), OpenWorkflows(graph), Upkeep(graph)
+    pruned = start_up(graph, retry, open_workflows, upkeep)
+    if retry.pending:
         print(f"[agent] {len(retry.pending)} workflow(s) still need Learn; retrying every "
               f"{retry.interval:g} s", flush=True)
-    saved = thread_ids(graph.checkpointer)
-    open_workflows = OpenWorkflows(graph)
-    if open_workflows.scan(saved):
+    if open_workflows.by_signature:
         print(f"[agent] {len(open_workflows.by_signature)} open workflow(s): later batches of the same "
               f"problem join them", flush=True)
-    upkeep = Upkeep(graph)
-    pruned = upkeep.start(saved)
     if pruned["checkpoints_removed"]:
         print(f"[agent] Pruned {pruned['checkpoints_removed']} checkpoint(s) of {pruned['threads']} "
               f"finished workflow(s)", flush=True)

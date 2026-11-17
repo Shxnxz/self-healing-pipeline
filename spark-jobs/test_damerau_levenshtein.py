@@ -50,25 +50,31 @@ def _fuzzy(field: str, value: str):
 
 
 def test_accepted_spellings() -> None:
-    """Typos of a seed SYNONYM are fixed too (Task 109); values seen in the dirty data."""
+    """Typos of a long seed SYNONYM are fixed too (Task 109); values seen in the dirty data."""
     weather = CANONICAL_ANCHORS["weather_condition"]
-    assert weather["CLEAR WEATHER"] == "CLEAR" and weather["RAINY"] == "RAIN"
+    assert weather["CLEAR WEATHER"] == "CLEAR"
     assert "O" not in weather and "C" not in weather  # codes are too short to be anchors
     assert "N, L" not in CANONICAL_ANCHORS["lighting_condition"]
     assert "01" not in CANONICAL_ANCHORS["crash_month"]
     assert _fuzzy("weather_condition", "Clear Weagher") == "CLEAR"
-    assert _fuzzy("weather_condition", "Rriny") == "RAIN"
     assert _fuzzy("weather_condition", "NOT KNWON") == "UNKNOWN"
     assert _fuzzy("weather_condition", "Clqudy") == "CLOUDY"       # canonical anchor as before
-    assert _fuzzy("crash_month", "FEBR") == "FEBRUARY"            # via FEB
-    assert _fuzzy("crash_month", "OCT.") == "OCTOBER"
-    assert _fuzzy("crash_day_of_week", "TUES") == "TUESDAY"
     assert _fuzzy("lighting_condition", "NIGHT WITH LIGHX") == "DARKNESS, LIGHTED ROAD"
+    # Short synonyms never win: a neighbour of NIGHT or MON is not that value. They still
+    # count as runner-ups, so they make the fuzzy match more careful, never bolder.
+    assert CANONICAL_ANCHORS["lighting_condition"]["NIGHT"] == "DARKNESS"
+    assert _fuzzy("lighting_condition", "LIGHT") is None          # NIGHT is DARKNESS (review of #37)
+    assert _fuzzy("lighting_condition", "Light") is None
+    assert _fuzzy("crash_day_of_week", "MOON") is None            # MON
+    assert _fuzzy("crash_day_of_week", "TUES") is None            # TUE
+    assert _fuzzy("crash_month", "FEBR") is None                  # FEB
+    assert _fuzzy("weather_condition", "Rriny") is None           # RAINY
     # Still no guessing.
-    assert _fuzzy("crash_month", "JULE") is None                  # JUNE / JUL(Y): one edit each
-    assert _fuzzy("crash_month", "MARY") is None                  # MAR / MAY
-    assert _fuzzy("crash_day_of_week", "THUR") is None            # THU 1 edit, TUE 2: no margin
-    # A synonym only wins from at most 2 edits: UNLIGHTED is not LIGHTED.
+    assert _fuzzy("crash_month", "JULE") is None                  # JUNE / JULY: one edit each
+    assert _fuzzy("crash_month", "MARY") is None
+    assert _fuzzy("crash_month", "Mayo") is None                  # MAY 1 edit, MAR 2: no margin
+    # A synonym only wins from one edit: UNLIGHTED is not LIGHTED.
+    assert _fuzzy("lighting_condition", "NIGHT, UNLIGHTED") is None
     assert _fuzzy("lighting_condition", "NIGHT UNLIGHTED") is None
     assert _fuzzy("weather_condition", "OTHER") is None
     # Spellings of one value never compete with each other for the margin.

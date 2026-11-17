@@ -72,11 +72,16 @@ def checkpoint_count(checkpointer, thread_id: str) -> int:
         return 0
 
 
-def prune_thread(graph, thread_id: str, dry_run: bool = False) -> int:
+def prune_thread(graph, thread_id: str, dry_run: bool = False, saved=None) -> int:
     """Drop every checkpoint of a finished workflow but its last. Returns how many
-    checkpoints went (0 when the workflow is not finished or the saver is not SQLite)."""
+    checkpoints went (0 when the workflow is not finished or the saver is not SQLite).
+    `saved` is the workflow's state when the caller already loaded it."""
     conn = _conn(graph.checkpointer)
-    if conn is None or not prunable(graph.get_state({"configurable": {"thread_id": thread_id}})):
+    if conn is None:
+        return 0
+    if saved is None:
+        saved = graph.get_state({"configurable": {"thread_id": thread_id}})
+    if not prunable(saved):
         return 0
     extra = checkpoint_count(graph.checkpointer, thread_id) - 1
     if extra <= 0 or dry_run:
@@ -101,10 +106,16 @@ def prune_all(graph, thread_ids: Iterable[str], dry_run: bool = False) -> dict:
         gone = prune_thread(graph, thread_id, dry_run=dry_run)
         pruned += gone
         threads += 1 if gone else 0
-    conn = _conn(graph.checkpointer)
-    if pruned and conn is not None and not dry_run:
-        conn.execute("VACUUM")
+    if pruned and not dry_run:
+        vacuum(graph)
     return {"threads": threads, "checkpoints_removed": pruned}
+
+
+def vacuum(graph) -> None:
+    """Give the space of pruned checkpoints back to the file system."""
+    conn = _conn(graph.checkpointer)
+    if conn is not None:
+        conn.execute("VACUUM")
 
 
 def compact_audit(path: Optional[str] = None, min_files: Optional[int] = None,
@@ -150,15 +161,22 @@ class Upkeep:
     def start(self, thread_ids: List[str]) -> dict:
         return prune_all(self.graph, thread_ids) if self.prune else {"threads": 0, "checkpoints_removed": 0}
 
-    def finished(self, thread_id: Optional[str]) -> int:
-        """Called after every workflow the agent ran, resumed or decided."""
+    def finished(self, thread_id: Optional[str], saved=None) -> int:
+        """Called after every workflow the agent ran, resumed or decided (and at start
+        for every saved one, with the state the start-up scan loaded)."""
         if not self.prune or not thread_id:
             return 0
         try:
-            return prune_thread(self.graph, thread_id)
+            return prune_thread(self.graph, thread_id, saved=saved)
         except Exception as exc:   # upkeep never stops the agent
             print(f"[agent] pruning the checkpoints of {thread_id} failed: {exc}", flush=True)
             return 0
+
+    def vacuum(self) -> None:
+        try:
+            vacuum(self.graph)
+        except Exception as exc:   # upkeep never stops the agent
+            print(f"[agent] VACUUM of the checkpoints failed: {exc}", flush=True)
 
     def due(self) -> Optional[dict]:
         if self.interval <= 0 or self.clock() < self.next_at:
