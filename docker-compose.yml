@@ -130,6 +130,8 @@ services:
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       SOURCES: ${SOURCES:-crash1,crash2,crash3,crash4}
+      # Sources whose slash dates are dd/MM/yyyy (Crash3); the rest read MM/dd/yyyy.
+      DAY_FIRST_SOURCES: ${DAY_FIRST_SOURCES:-crash3}
       DELTA_ROOT: /data/delta
       CHECKPOINT_ROOT: /data/checkpoints
       SPARK_DRIVER_MEMORY: ${SILVER2_GOLD_DRIVER_MEMORY:-2g}
@@ -251,8 +253,118 @@ services:
       neo4j-init:
         condition: service_completed_successfully
 
+  # --- Tools: replay and fault injection (not started by `up`) ------------
+  # tools/README.md. One-off commands on the Spark jobs' image, with the repo
+  # mounted read-only and the tables writable:
+  #   docker compose run --rm tools python -m tools.replay list
+  # Fault injection runs only in the evaluation stack (docker-compose.eval.yml):
+  #   docker compose -f docker-compose.yml -f docker-compose.eval.yml run --rm tools python -m tools.fault_injector inject jule
+  tools:
+    build: ./spark-jobs
+    profiles: [ "tools" ]
+    working_dir: /repo
+    command: [ "python", "-m", "tools.replay", "--help" ]
+    volumes:
+      - .:/repo:ro
+      - ./delta:/data/delta
+      - ivy-cache:/root/.ivy2
+    environment:
+      PYTHONPATH: /repo/spark-jobs:/repo
+      # tools.fault_injector refuses to inject unless this is "evaluation" (set by docker-compose.eval.yml).
+      PIPELINE_STACK: main
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # Same tables and settings as the Spark jobs above: the tools run their code.
+      SOURCES: ${SOURCES:-crash1,crash2,crash3,crash4}
+      DAY_FIRST_SOURCES: ${DAY_FIRST_SOURCES:-crash3}
+      DELTA_ROOT: /data/delta
+      QUARANTINE_PATH: /data/delta/silver2_quarantine
+      DEAD_LETTER_PATH: /data/delta/silver2_dead_letter
+      REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
+      FUZZY_AUDIT_PATH: /data/delta/silver2_fuzzy_audit
+      REMEDIATION_AUDIT_PATH: /data/delta/remediation_audit
+      FAULT_INJECTIONS_PATH: /data/delta/fault_injections
+      SILVER1_OPTIONAL_COLUMNS: ${SILVER1_OPTIONAL_COLUMNS:-[]}
+      TOOLS_SPARK_DRIVER_MEMORY: ${TOOLS_SPARK_DRIVER_MEMORY:-1g}
+      # A replay is not a pipeline job: keep it out of the lineage graph, where an
+      # extra quarantine -> silver2 edge would change the lookup's blast radius.
+      OPENLINEAGE_ENABLED: "false"
+      QWEN_ENABLED: "false"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # --- Recovery agent (LangGraph loop) -----------------------------------
+  # Consumes recovery.lookup and runs one LangGraph workflow per failure:
+  # deterministic lookup -> diagnose -> policy gate -> remediate -> validate ->
+  # escalate / learn. Diagnose asks the reasoning model (Qwen on Ollama), the policy
+  # gate decides whether its proposal may run, Remediate stages the fix and writes the
+  # audit record, and Validate replays the staged records through Silver 2's own code
+  # (a small local Spark session) and releases the ones that pass into Silver 2.
+  # Escalate hands everything else to an engineer (python -m agent.review), and
+  # Learn stores every outcome as an incident in Neo4j and promotes proven fixes into
+  # ref_canonical_mappings. See agent/README.md.
+  recovery-agent:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    container_name: recovery-agent
+    restart: on-failure
+    volumes:
+      - agent-state:/state
+      - ./delta:/data/delta:ro # the pipeline's tables, read only
+      # The tables the agent writes, mounted writable inside the read-only ./delta:
+      # Remediate's audit record, the healed rows Validate releases (appended to
+      # silver2_<source>, their quarantine rows marked RESOLVED), and the variants Learn
+      # promotes into ref_canonical_mappings. A source added to SOURCES needs its
+      # silver2_<source> line here too, or Validate cannot release its rows (the write
+      # fails and the failure is escalated). agent/tests/test_compose.py checks the list.
+      - ./delta/remediation_audit:/data/delta/remediation_audit
+      - ./delta/silver2_quarantine:/data/delta/silver2_quarantine
+      - ./delta/silver2_crash1:/data/delta/silver2_crash1
+      - ./delta/silver2_crash2:/data/delta/silver2_crash2
+      - ./delta/silver2_crash3:/data/delta/silver2_crash3
+      - ./delta/silver2_crash4:/data/delta/silver2_crash4
+      - ./delta/ref_canonical_mappings:/data/delta/ref_canonical_mappings
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      LOOKUP_OUTPUT_TOPIC: recovery.lookup
+      # Engineers' decisions on escalated failures: python -m agent.review publishes them.
+      AGENT_DECISIONS_TOPIC: recovery.decisions
+      AGENT_CHECKPOINT_PATH: /state/recovery_checkpoints.sqlite
+      DELTA_ROOT: /data/delta
+      REF_MAPPINGS_PATH: /data/delta/ref_canonical_mappings
+      QUARANTINE_PATH: /data/delta/silver2_quarantine
+      REMEDIATION_AUDIT_PATH: /data/delta/remediation_audit
+      # Must match the Silver 2 job: Validate re-reads each source's dates in its own order.
+      DAY_FIRST_SOURCES: ${DAY_FIRST_SOURCES:-crash3}
+      VALIDATE_SPARK_DRIVER_MEMORY: ${VALIDATE_SPARK_DRIVER_MEMORY:-512m}
+      DIAGNOSE_MODEL: ${DIAGNOSE_MODEL:-qwen3:8b}
+      DIAGNOSE_BASE_URL: ${DIAGNOSE_BASE_URL:-http://host.docker.internal:11434}
+      DIAGNOSE_THINK: ${DIAGNOSE_THINK:-false}
+      POLICY_CONFIDENCE_THRESHOLD: ${POLICY_CONFIDENCE_THRESHOLD:-0.85}
+      POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD: ${POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD:-}
+      POLICY_SAFE_ACTIONS: ${POLICY_SAFE_ACTIONS:-}
+      # A fix borrowed from a similar (not exact) past incident waits for an engineer on these tiers.
+      APPROVE_BORROWED_FIX_TIERS: ${APPROVE_BORROWED_FIX_TIERS:-P1}
+      # Learn: incidents go to Neo4j, embedded with the same model as the lookup's.
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-selfhealing}
+      LOOKUP_EMBED_MODEL: ${LOOKUP_EMBED_MODEL:-}
+      LOOKUP_EMBED_BASE_URL: ${LOOKUP_EMBED_BASE_URL:-http://host.docker.internal:11434}
+      # An automatic fix joins ref_canonical_mappings once it healed this many rows in this
+      # many micro-batches (an engineer's fix at once). NEVER = engineers' fixes only.
+      PROMOTE_MIN_OCCURRENCES: ${PROMOTE_MIN_OCCURRENCES:-5}
+      PROMOTE_MIN_BATCHES: ${PROMOTE_MIN_BATCHES:-3}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      neo4j-init:
+        condition: service_completed_successfully
+
 volumes:
   ivy-cache:
   neo4j-data:
   neo4j-logs:
   lookup-state:
+  agent-state:

@@ -31,6 +31,12 @@ CHECKPOINT_ROOT = os.environ.get("CHECKPOINT_ROOT", "/data/checkpoints").rstrip(
 KAFKA_TOPIC_PREFIX = os.environ.get("KAFKA_TOPIC_PREFIX", "crashes")
 DEFAULT_SOURCES = "crash1,crash2,crash3,crash4"
 
+# Sources whose slash dates are day first (dd/MM/yyyy). Everything else reads them
+# month first (MM/dd/yyyy, the US convention of the original dataset). Crash3 writes
+# 24/02/2021, so 01/03/2021 there is 1 March, not 3 January: read month first it
+# would silently land in the wrong month (~141k of its 391k rows). Set to "" for none.
+DEFAULT_DAY_FIRST_SOURCES = "crash3"
+
 # Layers that have one table per source. Gold is a single table over all of them.
 PER_SOURCE_LAYERS = ("bronze", "silver1", "silver2")
 
@@ -55,6 +61,64 @@ def source_names(raw: Optional[str] = None) -> List[str]:
     if not names:
         raise ValueError("SOURCES is empty: list at least one source, e.g. crash1,crash2")
     return names
+
+
+def day_first_sources(raw: Optional[str] = None) -> List[str]:
+    """Sources from DAY_FIRST_SOURCES (comma separated, may be empty), lower-cased."""
+    if raw is None:
+        raw = os.environ.get("DAY_FIRST_SOURCES", DEFAULT_DAY_FIRST_SOURCES)
+    names: List[str] = []
+    for part in raw.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if not _SOURCE_NAME.match(name):
+            raise ValueError(
+                f"Invalid DAY_FIRST_SOURCES entry {part!r}: use source names from SOURCES, e.g. crash3"
+            )
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def check_day_first_sources(raw: Optional[str] = None, sources_raw: Optional[str] = None) -> None:
+    """Fail fast when DAY_FIRST_SOURCES names a source that is not in SOURCES.
+
+    A typo (crash03) or a renamed folder would otherwise switch the day-first
+    reading off without any error, and that source's dates would silently be read
+    month first again.
+
+    The built-in default (crash3) is exempt: it is allowed to name a folder that is
+    not running, so a subset run such as SOURCES=crash4 works without also setting
+    DAY_FIRST_SOURCES. docker-compose passes the same default, so it is exempt too.
+    """
+    if raw is None:
+        raw = os.environ.get("DAY_FIRST_SOURCES", DEFAULT_DAY_FIRST_SOURCES)
+    names = day_first_sources(raw)
+    if names == day_first_sources(DEFAULT_DAY_FIRST_SOURCES):
+        return
+    known = source_names(sources_raw)
+    unknown = [name for name in names if name not in known]
+    if unknown:
+        raise ValueError(
+            f"DAY_FIRST_SOURCES lists {unknown}, which are not in SOURCES {known}. "
+            "Fix the name, or remove it if that folder no longer exists."
+        )
+
+
+def is_day_first(source: str, raw: Optional[str] = None) -> bool:
+    """True when `source` writes dd/MM/yyyy dates (see DEFAULT_DAY_FIRST_SOURCES).
+
+    Accepts a source ("crash3") or one of its per-source table names
+    ("silver2_crash3", the `target_table` on quarantine rows), so a replay of a
+    quarantined row can parse it the same way the source query did.
+    """
+    name = source.strip().lower()
+    for layer in PER_SOURCE_LAYERS:
+        if name.startswith(f"{layer}_"):
+            name = name[len(layer) + 1:]
+            break
+    return name in day_first_sources(raw)
 
 
 def kafka_topic(source: str) -> str:

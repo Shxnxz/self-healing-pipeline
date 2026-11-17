@@ -1,0 +1,20 @@
+{
+  "name": "all-kinds",
+  "description": "Two records of every kind in the catalog, in Crash1 (month-first dates) and Crash3 (day-first dates). A smoke test of the whole recovery path.",
+  "faults": [
+    {"kind": "typo", "source": "crash1", "column": "weather_condition", "count": 2},
+    {"kind": "typo", "source": "crash3", "column": "crash_month", "count": 2},
+    {"kind": "ambiguous", "source": "crash1", "column": "crash_month", "count": 2},
+    {"kind": "ambiguous", "source": "crash3", "column": "crash_day_of_week", "count": 2},
+    {"kind": "unseen_variant", "source": "crash1", "column": "weather_condition", "count": 2},
+    {"kind": "unseen_variant", "source": "crash3", "column": "crash_month", "count": 2},
+    {"kind": "unseen_format", "source": "crash1", "column": "crash_date", "count": 2},
+    {"kind": "unseen_format", "source": "crash3", "column": "crash_hour", "count": 2},
+    {"kind": "unknown_value", "source": "crash1", "column": "weather_condition", "count": 2},
+    {"kind": "missing_mandatory", "source": "crash3", "column": "crash_date", "count": 2},
+    {"kind": "schema_rename", "source": "crash1", "column": "crash_date", "count": 2},
+    {"kind": "schema_missing", "source": "crash3", "column": "lane_cnt", "count": 2},
+    {"kind": "schema_extra", "source": "crash1", "column": "vehicle_color", "value": "RED", "count": 2},
+    {"kind": "corrupt_record", "source": "crash3", "count": 2}
+  ]
+}

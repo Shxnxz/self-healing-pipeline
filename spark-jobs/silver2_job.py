@@ -32,7 +32,7 @@ it is promoted) and just check that `columns_to_remediate` comes back empty.
 import os
 import traceback
 from itertools import chain
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -45,7 +45,15 @@ from pyspark.sql.types import (
 )
 
 from common import build_spark, idempotent_append, wait_for_delta_table
-from sources import checkpoint_path, shared_path, source_names, table_name, table_path
+from sources import (
+    check_day_first_sources,
+    checkpoint_path,
+    is_day_first,
+    shared_path,
+    source_names,
+    table_name,
+    table_path,
+)
 from ref_mappings import (
     ANCHOR_TO_CANONICAL,
     CANONICAL_ANCHORS,
@@ -85,37 +93,38 @@ MIN_SPARK_VERSION = (3, 4)
 MAX_ERROR_CHARS = 4000
 MAX_TRACE_CHARS = 8000
 
-# Supported additive date format strings.
-# Slash dates are read US-style (month first) because that is the source
-# convention; "d/M/yyyy" is only a fallback for values that cannot be month-first
-# (e.g. 25/12/2021). Ambiguous values like 03/04/2021 therefore parse as March 4.
-DATE_FORMATS = [
+# Supported additive date format strings, tried in order (first match wins).
+# Slash and dash dates are ambiguous: 01/03/2021 is 3 January month first and
+# 1 March day first. Each source declares its order (sources.DAY_FIRST_SOURCES,
+# default crash3).
+#   - Day-first sources are strict: a value that is not a valid day-first date
+#     (e.g. 02/24/2021) is NOT re-read month first; it goes to quarantine, so a
+#     source that switches format gets noticed instead of half mis-parsed.
+#   - Month-first sources keep the day-first fallback they always had, for values
+#     that cannot be month first (e.g. 25/12/2021).
+_ISO_DATE_FORMATS = [
     "yyyy-MM-dd'T'HH:mm:ss.SSS",
     "yyyy-MM-dd'T'HH:mm:ss",
     "yyyy-MM-dd HH:mm:ss",
     "yyyy-MM-dd",
     "yyyy/MM/dd HH:mm:ss",
     "yyyy/MM/dd",
-    "M/d/yyyy h:mm:ss a",
-    "M/d/yyyy H:mm:ss",
-    "M/d/yyyy",
-    "d/M/yyyy H:mm:ss",
-    "d/M/yyyy",
-    "dd-MM-yyyy",
-    "yyyyMMdd",
 ]
+_MONTH_FIRST_FORMATS = ["M/d/yyyy h:mm:ss a", "M/d/yyyy H:mm:ss", "M/d/yyyy", "MM-dd-yyyy"]
+_DAY_FIRST_FORMATS = ["d/M/yyyy h:mm:ss a", "d/M/yyyy H:mm:ss", "d/M/yyyy", "dd-MM-yyyy"]
+_OTHER_DATE_FORMATS = ["yyyyMMdd"]
 
-# Supported additive timestamp format strings (same month-first convention)
-TIMESTAMP_FORMATS = [
-    "yyyy-MM-dd'T'HH:mm:ss.SSS",
-    "yyyy-MM-dd'T'HH:mm:ss",
-    "yyyy-MM-dd HH:mm:ss",
-    "yyyy-MM-dd",
-    "yyyy/MM/dd HH:mm:ss",
-    "M/d/yyyy h:mm:ss a",
-    "M/d/yyyy H:mm:ss",
-    "M/d/yyyy",
-]
+
+def date_formats(day_first: bool) -> List[str]:
+    """crash_date formats: ISO first, then slash/dash dates in the source's order."""
+    ordered = _DAY_FIRST_FORMATS if day_first else _MONTH_FIRST_FORMATS + _DAY_FIRST_FORMATS
+    return _ISO_DATE_FORMATS + ordered + _OTHER_DATE_FORMATS
+
+
+def timestamp_formats(day_first: bool) -> List[str]:
+    """date_police_notified formats: no fallback order, an unreadable value is flagged."""
+    iso = [f for f in _ISO_DATE_FORMATS if f != "yyyy/MM/dd"]
+    return iso + (_DAY_FIRST_FORMATS if day_first else _MONTH_FIRST_FORMATS)
 
 
 def _try_ts(col_name: str, fmt: str) -> Column:
@@ -160,13 +169,24 @@ def _fuzzy_audit_struct(
     ).otherwise(None)
 
 
-def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) -> DataFrame:
+def standardize_silver2(
+    df: DataFrame,
+    mapping_dict: Dict[str, Dict[str, str]],
+    *,
+    day_first: bool,
+) -> DataFrame:
     """
     Apply native PySpark parsing chains and canonical reference lookups.
     Tracks all mapping and parsing failures in `columns_to_remediate`.
 
-    Pure function of (Silver 1 row, mapping_dict): it is also what the healing
-    loop replays quarantined rows through.
+    `day_first` (required, keyword only) reads slash dates as dd/MM/yyyy; get it
+    from sources.is_day_first(source).
+
+    Pure function of (Silver 1 row, mapping_dict, day_first): it is also what the
+    healing loop replays quarantined rows through. Replay one target_table at a
+    time with `day_first=is_day_first(target_table)`, or a day-first source's rows
+    would be re-read month first. There is no default on purpose, so a caller
+    cannot forget it silently.
     """
     # Explicit bindings to input DataFrame columns to avoid projection alias shadowing
     record_id = df["record_id"]
@@ -188,13 +208,13 @@ def standardize_silver2(df: DataFrame, mapping_dict: Dict[str, Dict[str, str]]) 
 
     # 1. Native Date Parsing Chain
     parsed_crash_date = F.coalesce(
-        *[F.to_date(_try_ts("crash_date", fmt)) for fmt in DATE_FORMATS]
+        *[F.to_date(_try_ts("crash_date", fmt)) for fmt in date_formats(day_first)]
     )
     std_crash_date = F.date_format(parsed_crash_date, "yyyy-MM-dd")
 
     # 2. Native Timestamp Parsing Chain for date_police_notified
     parsed_police_ts = F.coalesce(
-        *[_try_ts("date_police_notified", fmt) for fmt in TIMESTAMP_FORMATS]
+        *[_try_ts("date_police_notified", fmt) for fmt in timestamp_formats(day_first)]
     )
     std_date_police_notified = F.date_format(parsed_police_ts, "yyyy-MM-dd HH:mm:ss")
 
@@ -455,11 +475,123 @@ def _dead_letter_batch(
     )
 
 
+def standardize_and_count(batch_df: DataFrame, mapping_dict, *, day_first: bool):
+    """TRANSFORM stage: standardize, persist and materialize the batch.
+
+    Returns (transformed, stats) with stats = (total, quarantined, fuzzy). Anything
+    that raises here is a data/schema problem of the batch (the caller dead-letters
+    it); `transformed` is unpersisted again when it does.
+    """
+    transformed = standardize_silver2(batch_df, mapping_dict, day_first=day_first).persist()
+    try:
+        row = transformed.agg(
+            F.count(F.lit(1)).alias("total"),
+            F.sum(F.when(F.size("columns_to_remediate") > 0, 1).otherwise(0)).alias("quarantined"),
+            F.sum(F.when(F.size("_fuzzy_audit_entries") > 0, 1).otherwise(0)).alias("fuzzy"),
+        ).first()
+    except Exception:
+        transformed.unpersist()
+        raise
+    stats = (int(row["total"] or 0), int(row["quarantined"] or 0), int(row["fuzzy"] or 0))
+    return transformed, stats
+
+
+def write_standardized(
+    transformed: DataFrame,
+    stats,
+    *,
+    silver2_path: str,
+    txn_app_id: Optional[str],
+    txn_version: int,
+    target_table: Optional[str],
+    batch_label: Optional[str] = None,
+) -> None:
+    """
+    WRITE stage: valid rows -> Silver 2, failed rows -> quarantine, fuzzy fixes -> audit.
+
+    Each write is idempotent per (txn_app_id:<table tag>, txn_version). The quarantine
+    and fuzzy-audit rows carry `batch_label` as their batch id (default: txn_version),
+    so a replay (tools/replay.py) can write under its own transaction id and still
+    label the rows with the micro-batch they came from. Errors propagate.
+    """
+    total, n_quarantined, n_fuzzy = stats
+    if total == 0:
+        return
+    label = str(txn_version if batch_label is None else batch_label)
+    failed = F.size(F.col("columns_to_remediate")) > 0
+
+    # Clean rows: drop lineage/audit/replay columns before writing to Silver 2
+    # Adds zero extra columns to Silver 2
+    if total - n_quarantined > 0:
+        valid_df = transformed.filter(~failed).drop(
+            "columns_to_remediate", "_fuzzy_audit_entries", "raw_record"
+        )
+        _txn_write(valid_df, silver2_path, "valid", txn_version, txn_app_id=txn_app_id)
+
+    # Quarantined rows keep columns_to_remediate and the original raw_record
+    if n_quarantined > 0:
+        quarantine_out = (
+            transformed.filter(failed)
+            .drop("_fuzzy_audit_entries")
+            .withColumn("quarantined_at", F.current_timestamp())
+            .withColumn("silver2_batch_id", F.lit(label))
+            .withColumn("healing_status", F.lit("PENDING"))
+            .withColumn("target_table", F.lit(target_table).cast(StringType()))
+        )
+        _txn_write(quarantine_out, QUARANTINE_PATH, "quarantine", txn_version,
+                   merge_schema=True, txn_app_id=txn_app_id)
+        print(
+            f"[{target_table or 'silver2'}] Batch {label}: quarantined {n_quarantined} of {total} records "
+            f"at {QUARANTINE_PATH}"
+        )
+
+    # Log fuzzy corrections: (field, record_id, raw, matched, distance)
+    if n_fuzzy > 0:
+        write_fuzzy_audit(transformed, txn_app_id=txn_app_id, txn_version=txn_version,
+                          batch_label=label, target_table=target_table)
+
+
+def write_fuzzy_audit(
+    transformed: DataFrame,
+    *,
+    txn_app_id: Optional[str],
+    txn_version: int,
+    batch_label: str,
+    target_table: Optional[str],
+) -> None:
+    """Append the fuzzy corrections of `transformed` (its _fuzzy_audit_entries) to the
+    fuzzy audit table, idempotently per (txn_app_id:fuzzy_audit, txn_version)."""
+    audit_df = (
+        transformed.filter(F.size(F.col("_fuzzy_audit_entries")) > 0)
+        .select(
+            F.explode("_fuzzy_audit_entries").alias("entry"),
+            F.lit(str(batch_label)).alias("batch_id"),
+            F.current_timestamp().alias("corrected_at"),
+        )
+        .select(
+            F.col("entry.field").alias("field"),
+            F.col("entry.record_id").alias("record_id"),
+            F.col("entry.raw").alias("raw"),
+            F.col("entry.matched").alias("matched"),
+            F.col("entry.distance").cast(IntegerType()).alias("distance"),
+            F.col("corrected_at"),
+            F.col("batch_id"),
+        )
+    )
+    _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", txn_version,
+               merge_schema=True, txn_app_id=txn_app_id)
+    print(
+        f"[{target_table or 'silver2'}] Batch {batch_label}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
+    )
+
+
 def make_batch_processor(
     spark: SparkSession,
     silver2_path: str,
     txn_app_id: Optional[str] = None,
     target_table: Optional[str] = None,
+    *,
+    day_first: bool,
 ):
     """
     Returns the foreachBatch function for one source.
@@ -467,7 +599,8 @@ def make_batch_processor(
     Valid rows go to `silver2_path` (that source's own Silver 2 table); failures go
     to the shared quarantine / dead letter tables tagged with `target_table`, the
     Silver 2 table a healed row is replayed into. `txn_app_id` must be unique per
-    source (see TXN_APP_ID).
+    source (see TXN_APP_ID). `day_first` is that source's slash-date order
+    (sources.is_day_first).
     """
 
     def process_micro_batch(batch_df: DataFrame, batch_id: int):
@@ -476,17 +609,9 @@ def make_batch_processor(
 
         # 2. TRANSFORM stage: build, persist and materialize in one go.
         #    Anything that blows up here is a data/schema problem -> dead letter.
-        transformed = None
         try:
-            transformed = standardize_silver2(batch_df, mapping_dict).persist()
-            stats = transformed.agg(
-                F.count(F.lit(1)).alias("total"),
-                F.sum(F.when(F.size("columns_to_remediate") > 0, 1).otherwise(0)).alias("quarantined"),
-                F.sum(F.when(F.size("_fuzzy_audit_entries") > 0, 1).otherwise(0)).alias("fuzzy"),
-            ).first()
+            transformed, stats = standardize_and_count(batch_df, mapping_dict, day_first=day_first)
         except Exception as exc:
-            if transformed is not None:
-                transformed.unpersist()
             _dead_letter_batch(batch_df, batch_id, exc, txn_app_id, target_table)
             # Classify only after the raw batch is durably preserved (IC2/IC4).
             from qwen_classifier.integration import capture_exception
@@ -496,63 +621,9 @@ def make_batch_processor(
 
         # 3. WRITE stage: idempotent writes; errors propagate so Spark replays the batch
         try:
-            total = int(stats["total"] or 0)
-            n_quarantined = int(stats["quarantined"] or 0)
-            n_fuzzy = int(stats["fuzzy"] or 0)
-            if total == 0:
-                return
-
-            failed = F.size(F.col("columns_to_remediate")) > 0
-
-            # Clean rows: drop lineage/audit/replay columns before writing to Silver 2
-            # Adds zero extra columns to Silver 2
-            if total - n_quarantined > 0:
-                valid_df = transformed.filter(~failed).drop(
-                    "columns_to_remediate", "_fuzzy_audit_entries", "raw_record"
-                )
-                _txn_write(valid_df, silver2_path, "valid", batch_id, txn_app_id=txn_app_id)
-
-            # Quarantined rows keep columns_to_remediate and the original raw_record
-            if n_quarantined > 0:
-                quarantine_out = (
-                    transformed.filter(failed)
-                    .drop("_fuzzy_audit_entries")
-                    .withColumn("quarantined_at", F.current_timestamp())
-                    .withColumn("silver2_batch_id", F.lit(str(batch_id)))
-                    .withColumn("healing_status", F.lit("PENDING"))
-                    .withColumn("target_table", F.lit(target_table).cast(StringType()))
-                )
-                _txn_write(quarantine_out, QUARANTINE_PATH, "quarantine", batch_id,
-                           merge_schema=True, txn_app_id=txn_app_id)
-                print(
-                    f"[{target_table or 'silver2'}] Batch {batch_id}: quarantined {n_quarantined} of {total} records "
-                    f"at {QUARANTINE_PATH}"
-                )
-
-            # Log fuzzy corrections: (field, record_id, raw, matched, distance)
-            if n_fuzzy > 0:
-                audit_df = (
-                    transformed.filter(F.size(F.col("_fuzzy_audit_entries")) > 0)
-                    .select(
-                        F.explode("_fuzzy_audit_entries").alias("entry"),
-                        F.lit(str(batch_id)).alias("batch_id"),
-                        F.current_timestamp().alias("corrected_at"),
-                    )
-                    .select(
-                        F.col("entry.field").alias("field"),
-                        F.col("entry.record_id").alias("record_id"),
-                        F.col("entry.raw").alias("raw"),
-                        F.col("entry.matched").alias("matched"),
-                        F.col("entry.distance").cast(IntegerType()).alias("distance"),
-                        F.col("corrected_at"),
-                        F.col("batch_id"),
-                    )
-                )
-                _txn_write(audit_df, FUZZY_AUDIT_PATH, "fuzzy_audit", batch_id,
-                           merge_schema=True, txn_app_id=txn_app_id)
-                print(
-                    f"[{target_table or 'silver2'}] Batch {batch_id}: logged fuzzy corrections to {FUZZY_AUDIT_PATH}"
-                )
+            write_standardized(transformed, stats, silver2_path=silver2_path,
+                               txn_app_id=txn_app_id, txn_version=batch_id,
+                               target_table=target_table)
         finally:
             transformed.unpersist()
 
@@ -571,6 +642,7 @@ def _require_spark_version(spark: SparkSession) -> None:
 def init_shared_tables(spark: SparkSession) -> None:
     """Create the shared reference and audit tables once, before any source query starts."""
     _require_spark_version(spark)
+    check_day_first_sources()
     init_ref_mappings(spark, REF_MAPPINGS_PATH)
     init_fuzzy_audit(spark, FUZZY_AUDIT_PATH)
 
@@ -594,8 +666,13 @@ def start(
         reader = reader.option("skipChangeCommits", "true")
     silver1_stream = reader.load(silver1_path)
 
+    day_first = is_day_first(source)
     batch_processor = make_batch_processor(
-        spark, silver2_path, txn_app_id=f"{TXN_APP_ID}_{source}", target_table=target_table
+        spark,
+        silver2_path,
+        txn_app_id=f"{TXN_APP_ID}_{source}",
+        target_table=target_table,
+        day_first=day_first,
     )
 
     # foreachBatch owns all writes, so no sink format is set on the writeStream
@@ -610,7 +687,8 @@ def start(
     print(
         f"[{target_table}] Streaming {silver1_path} -> {silver2_path} "
         f"(Quarantine: {QUARANTINE_PATH}, Audit: {FUZZY_AUDIT_PATH}, "
-        f"Dead letter: {DEAD_LETTER_PATH})"
+        f"Dead letter: {DEAD_LETTER_PATH}, "
+        f"slash dates: {'dd/MM/yyyy' if day_first else 'MM/dd/yyyy'})"
     )
     return query
 
