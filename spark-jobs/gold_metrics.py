@@ -29,6 +29,10 @@ rows, recomputes every table and overwrites it. A Delta overwrite is one commit,
 dashboard reads the old version or the new one, never half. Gold is small enough for
 this (about 1M rows); incremental aggregation would need watermarks that late healed
 rows would miss.
+At the full dataset's scale that is a full read of Gold plus five overwrites per refresh;
+recomputing only the days and beats a batch touched is the next step if it gets slow.
+A failed refresh is logged and retried on the next trigger: it never stops the
+Silver 2 / Gold queries that share its driver (refresh_logged).
 
 One-off refresh (e.g. after a reset), with the jobs' environment:
     python gold_metrics.py
@@ -217,6 +221,32 @@ def refresh(spark: SparkSession, gold_path: str = GOLD_PATH) -> Dict[str, int]:
         cached.unpersist()
 
 
+# Consecutive failed refreshes, for the log.
+_failures = {"count": 0}
+
+
+def refresh_logged(spark: SparkSession, gold_path: str, batch_id: int, refresh_fn=None) -> bool:
+    """One refresh from the streaming query. An error is logged and swallowed: the query
+    runs in the silver2-gold-job driver, where an exception escaping foreachBatch would
+    stop the query, `awaitAnyTermination()` would end the driver, and a persistent error
+    (a full disk, an unreadable table) would crash-loop Silver 2 and Gold ingestion over
+    a reporting table. The next trigger with new Gold rows simply tries again, and
+    the stale tables still carry the gold_version and refreshed_at they were built from."""
+    try:
+        written = (refresh_fn or refresh)(spark, gold_path)
+    except Exception as exc:  # noqa: BLE001 - reporting must never stop ingestion
+        _failures["count"] += 1
+        print(f"[gold_metrics] batch {batch_id}: refresh FAILED ({_failures['count']} in a row), "
+              f"metric tables left as they were: {type(exc).__name__}: {exc}", flush=True)
+        return False
+    if _failures["count"]:
+        print(f"[gold_metrics] recovered after {_failures['count']} failed refreshes", flush=True)
+    _failures["count"] = 0
+    print(f"[gold_metrics] batch {batch_id}: refreshed "
+          + ", ".join(f"{k}={v}" for k, v in written.items()), flush=True)
+    return True
+
+
 def start(spark: SparkSession, gold_path: str = GOLD_PATH,
           upstream: Optional[StreamingQuery] = None) -> StreamingQuery:
     """Refresh the metric tables whenever Gold received rows, at most every INTERVAL."""
@@ -225,9 +255,7 @@ def start(spark: SparkSession, gold_path: str = GOLD_PATH,
     def _on_batch(batch_df: DataFrame, batch_id: int) -> None:
         if batch_df.isEmpty():
             return
-        written = refresh(batch_df.sparkSession, gold_path)
-        print(f"[gold_metrics] batch {batch_id}: refreshed "
-              + ", ".join(f"{k}={v}" for k, v in written.items()), flush=True)
+        refresh_logged(batch_df.sparkSession, gold_path, batch_id)
 
     query = (
         spark.readStream.format("delta").load(gold_path)

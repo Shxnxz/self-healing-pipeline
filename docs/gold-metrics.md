@@ -46,6 +46,18 @@ all five tables and overwrites each in one Delta commit, so a dashboard reads ei
 previous version or the new one. About 1M rows take a few seconds per refresh.
 `GOLD_METRICS_ENABLED=false` turns it off.
 
+A failed refresh never stops ingestion. The query runs in the `silver2-gold-job`
+driver, so an error escaping it would end that driver and restart Silver 2 and Gold
+with it. Instead the error is logged (`[gold_metrics] batch N: refresh FAILED (k in a
+row)`), the metric tables stay as they were (their `gold_version` and `refreshed_at`
+show how old they are), and the next trigger with new Gold rows tries again.
+
+Known limit, scale: every refresh reads the whole Gold table and overwrites five tables
+in the same driver as Silver 2. That is cheap for the evaluation stack (2000 rows per
+source) and acceptable at about 1M rows once a minute, but it grows with Gold. If it
+gets slow, recompute only the days and beats the new rows touched, or raise
+`GOLD_METRICS_INTERVAL`.
+
 A one-off refresh, for example after a reset:
 
 ```bash

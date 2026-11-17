@@ -46,7 +46,7 @@ not change what it measures:
    (`docker-compose.eval.yml`: own Kafka, `./eval` Delta folder, Neo4j), loaded with a
    clean sample of 2000 rows each of Crash1 and Crash3. Nothing it learns reaches the
    real pipeline.
-2. **A fixed scenario.** `data/faults/evaluation.json`: 46 records, 10 faults, one fixed
+2. **A fixed scenario.** `data/faults/evaluation.json`: 50 records, 11 faults, one fixed
    value each so each becomes one recovery case, spread over 3 micro-batches where the
    promotion rule (5 rows in 3 batches) should be reachable:
 
@@ -56,11 +56,19 @@ not change what it measures:
    | `crash_day_of_week` "S" in Sunday records (Crash3, day-first dates) | 6 | quarantine, then SUNDAY |
    | `weather_condition` "RAINING" (Crash1) | 6 | quarantine, then RAIN |
    | `crash_month` "Abr." in April records (Crash3) | 6 | quarantine, then APRIL |
+   | `lighting_condition` "LIGHT" in daylight records (Crash1): a fuzzy trap | 4 | quarantine, then DAYLIGHT |
    | typos in weather (Crash1) and month (Crash3) | 6 | fixed by Silver 2's fuzzy match |
    | `weather_condition` "MISTY DARK" | 4 | quarantine, no right value: escalate |
    | `crash_date` in words ("11th of April 2021") | 2 | quarantine, escalate (no parser for it) |
    | `crash_date` empty | 2 | quarantine, escalate |
    | `crash_date` column renamed | 2 | Silver 1 dead letter |
+
+   The other fixable values were chosen out of fuzzy matching's reach, so on their own
+   they cannot show the one silent error fuzzy matching can make: mapping a value to the
+   wrong canonical value on entry. "LIGHT" is there for that. It is one edit from NIGHT,
+   an accepted spelling of DARKNESS, and far from every daylight spelling, so a fuzzy
+   match that trusts short accepted spellings turns daylight crashes into DARKNESS with
+   no quarantine. If that happens, the report counts the records as silent errors.
 
 3. **An oracle engineer.** An escalated case waits for a person. The harness answers each
    case of the run the way a careful engineer would, from the ground truth
@@ -171,7 +179,12 @@ else matches `cloud-1`.
 - **Schema changes.** The renamed column was detected (dead letter) but not recovered:
   that path needs Qwen's classification (`QWEN_ENABLED=true`, `QWEN_KAFKA_ENABLED=true`)
   and an engineer's `tools.replay` with `--rename` (docs/demo.md).
-- **Scale.** 2000 rows per source and 46 faults. The main stack's full data has not been
+- **The fuzzy trap.** `cloud-1` and `combined-1` ran before "LIGHT" joined the
+  scenario (46 records, 10 faults), so their "silent errors: 0" only covers values
+  outside fuzzy matching's reach. With Task 109's accepted spellings as of PR #37,
+  "LIGHT" scores 1 edit to DARKNESS (via NIGHT) and 3 to the runner-up, so the next run
+  should show 4 silent errors until the matcher stops trusting that short spelling.
+- **Scale.** 2000 rows per source and 46 to 50 faulty records. The main stack's full data has not been
   measured.
 
 ## Reproduce

@@ -183,6 +183,20 @@ def test_gold_metrics():
         shutil.rmtree(ROOT, ignore_errors=True)
 
 
+def test_failed_refresh_does_not_stop_the_query():
+    """An error in a refresh is logged and swallowed, so it cannot end the
+    silver2-gold-job driver; the failure count resets after a good refresh."""
+    def broken(spark, path):
+        raise OSError("No space left on device")
+
+    assert gold_metrics.refresh_logged(None, "/nowhere", 7, refresh_fn=broken) is False
+    assert gold_metrics.refresh_logged(None, "/nowhere", 8, refresh_fn=broken) is False
+    assert gold_metrics._failures["count"] == 2
+    assert gold_metrics.refresh_logged(None, "/nowhere", 9, refresh_fn=lambda s, p: {"gold_daily_summary": 1})
+    assert gold_metrics._failures["count"] == 0
+
+
 if __name__ == "__main__":
+    test_failed_refresh_does_not_stop_the_query()
     test_gold_metrics()
     print("All Gold metrics checks passed.")
