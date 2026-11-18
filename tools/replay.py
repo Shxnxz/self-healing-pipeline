@@ -58,7 +58,27 @@ def _paths() -> Dict[str, str]:
     return {"silver1_dead_letter": silver1_job.DEAD_LETTER_PATH,
             "silver2_dead_letter": silver2_job.DEAD_LETTER_PATH,
             "quarantine": silver2_job.QUARANTINE_PATH,
-            "ref": silver2_job.REF_MAPPINGS_PATH}
+            "ref": silver2_job.REF_MAPPINGS_PATH,
+            "fuzzy_audit": silver2_job.FUZZY_AUDIT_PATH}
+
+
+def _unlogged_fuzzy(spark, rows, fuzzy_audit_path: str):
+    """`rows` with each _fuzzy_audit_entries array cut to the (record_id, field) pairs
+    that silver2_fuzzy_audit does not hold yet."""
+    from pyspark.sql import functions as F
+
+    if not session.is_delta(fuzzy_audit_path):
+        return rows
+    ids = [r["record_id"] for r in rows.select("record_id").collect()]
+    logged = {f"{r['record_id']}|{r['field']}" for r in
+              spark.read.format("delta").load(fuzzy_audit_path)
+              .filter(F.col("record_id").isin(*ids)).select("record_id", "field").distinct().collect()}
+    if not logged:
+        return rows
+    known = F.array(*[F.lit(k) for k in sorted(logged)])
+    return rows.withColumn("_fuzzy_audit_entries", F.filter(
+        "_fuzzy_audit_entries",
+        lambda e: ~F.array_contains(known, F.concat_ws("|", e["record_id"], e["field"]))))
 
 
 def _source(name: str) -> str:
@@ -406,8 +426,11 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
             rows = replayed.filter(F.col("record_id").isin(*to_append)).drop(*_NOT_IN_SILVER2)
             # Idempotent: Delta skips the append if this replay id already wrote it.
             idempotent_append(rows, silver2_path, f"{replay_id}:release", 0)
-            # Another column fixed by the fuzzy match on the way: logged like the stream does.
-            fuzzy = replayed.filter(F.col("record_id").isin(*to_append))
+            # Another column fixed by the fuzzy match on the way. The Silver 2 job logged
+            # that correction when it quarantined the row, so only a correction not in the
+            # fuzzy audit yet is written (counted once, like the agent's Validate).
+            fuzzy = _unlogged_fuzzy(spark, replayed.filter(F.col("record_id").isin(*to_append)),
+                                    paths["fuzzy_audit"])
             if fuzzy.filter(F.size("_fuzzy_audit_entries") > 0).limit(1).count():
                 write_fuzzy_audit(fuzzy, txn_app_id=replay_id, txn_version=0, batch_label=replay_id,
                                   target_table=target_table)
