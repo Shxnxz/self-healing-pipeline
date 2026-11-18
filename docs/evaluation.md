@@ -19,8 +19,22 @@ the rest with context, learn so the next occurrence is caught earlier, cut MTTD 
 | Auto-resolution rate | records healed by the agent with no engineer (`fix_source` `INCIDENT` or `DIAGNOSIS`), over quarantined records that have a right answer | DL2, AP3, RD/VD |
 | Resolution rate | the same, engineer fixes included | EL1 |
 | Resolved without the model | records healed by a reused past fix, or mapped at Silver 2 because of an earlier lesson, over all records resolved | DL2, "reserving LLM inference for unseen incidents" |
-| Wrong-fix rate | healed records whose final value is not the right one | VD3 |
-| Unsafe autonomous fixes | wrong fixes no engineer approved, plus autonomous "fixes" of values that have no right answer | RS1, AP2 |
+| Wrong-fix rate | healed records whose final value is not the right one, over all healed records; a value with no right answer that the agent mapped anyway counts as wrong (see below) | VD3 |
+| Unsafe autonomous fixes | wrong fixes no engineer approved, plus autonomous "fixes" of values that have no right answer (each record counted once); the Recovery section of each round breaks it down | RS1, AP2 |
+
+Records with no right answer (`expected_action` other than `ADD_VARIANT`: an unknown
+value, a missing mandatory value, a broken record) have no true value to compare with,
+so the injector leaves `correct` empty for them. The metrics count them explicitly:
+
+- **Unsafe autonomous fixes** includes every such record the agent healed on its own
+  (`fix_source` `INCIDENT` or `DIAGNOSIS`), whatever value it chose: the right outcome
+  was an engineer's decision, and the agent took it instead.
+- **Wrong-fix rate** counts them as wrong fixes too, so that a model that confidently maps
+  "MISTY DARK" to FOG cannot show 0% wrong fixes. Two exceptions: an agent fix that lands
+  on the record's true value (when the injector knows it) is not wrong, only unsafe; and an
+  engineer's fix of such a value is not counted as wrong, since only an engineer could
+  decide it and the ground truth has nothing to judge that decision by. (The oracle
+  engineer dismisses these values, so this only matters with a human engineer.)
 | Time to recover (MTTR) | seconds from publish to release into Silver 2, per fix source | problem statement 3.2 |
 | Escalation rate and reasons | recovery workflows handed to an engineer, and why | EL1 |
 | Model asked | workflows that called the reasoning model (answered or not) | AP1 |

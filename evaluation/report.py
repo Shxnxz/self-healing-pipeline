@@ -64,7 +64,8 @@ def round_section(m: dict) -> List[str]:
             f"- Resolved without the model (reused fix or learned earlier): {recov['resolved_without_model']} "
             f"({fmt(recov['resolved_without_model_rate'], 'pct')}).",
             f"- Wrong fixes: {wrong['healed_wrong']} of {recov['healed']} healed ({fmt(wrong['wrong_fix_rate'], 'pct')}); "
-            f"unsafe (autonomous and wrong): {wrong['unsafe_autonomous']}; autonomous fixes of values with no "
+            f"unsafe (no engineer approved): {wrong['unsafe_autonomous']}, of which autonomous fixes to a wrong "
+            f"value: {wrong.get('autonomous_wrong_value', '-')}; autonomous fixes of values with no "
             f"right answer: {wrong['autonomous_fix_without_right_answer']}.",
             ""]
     ttr = rec["time_to_recover_seconds"]

@@ -82,6 +82,38 @@ def test_record_metrics():
     assert m["time_to_recover_seconds"]["ENGINEER"]["median"] == 300.0
 
 
+def test_autonomous_fix_of_a_value_with_no_right_answer_is_unsafe_and_wrong():
+    # The model mapped "MISTY DARK" (no right answer) to FOG and the gate let it through:
+    # 4 records released into Silver 2 with no engineer. `correct` stays None (no true value).
+    misty = [rec(10 + i, kind="unknown_value", column="weather_condition", raw="MISTY DARK", expected=None,
+                 action="ESCALATE", outcome="HEALED", fix_source="DIAGNOSIS", failure_id="f-misty")
+             for i in range(4)]
+    for r in misty:
+        r["value_in_silver2"], r["correct"] = "FOG", None
+    # Also one that is autonomous, wrong and without a right answer: counted once.
+    both = rec(14, kind="unknown_value", column="crash_month", raw="Jule", expected="JUNE",
+               action="ESCALATE", outcome="HEALED", fix_source="INCIDENT", correct=False)
+    # And an engineer's fix of a value with no right answer: neither wrong nor unsafe.
+    engineer = rec(15, kind="unknown_value", column="weather_condition", raw="MISTY DARK", expected=None,
+                   action="ESCALATE", outcome="HEALED", fix_source="ENGINEER", failure_id="f-misty-e")
+    engineer["correct"] = None
+    m = metrics.record_metrics(RECORDS + misty + [both, engineer])
+    w = m["wrong_fixes"]
+    assert w["autonomous_fix_without_right_answer"] == 5
+    assert w["autonomous_wrong_value"] == 1
+    assert w["unsafe_autonomous"] == 5  # 4 misty + the one that is both
+    assert m["recovery"]["healed"] == 10
+    assert w["healed_wrong"] == 5 and w["wrong_fix_rate"] == 0.5
+    # The headline row shows it, not 0.
+    row = next(path for label, path, _ in metrics.HEADLINE if label == "Unsafe autonomous fixes")
+    assert metrics.pick({"records": m}, row) == 5
+    # A lucky autonomous guess on a value with no right answer: unsafe, but not a wrong value.
+    lucky = rec(16, kind="unknown_value", column="crash_month", raw="Jule", expected="JUNE",
+                action="ESCALATE", outcome="HEALED", fix_source="DIAGNOSIS", correct=True)
+    w = metrics.record_metrics([lucky])["wrong_fixes"]
+    assert (w["unsafe_autonomous"], w["healed_wrong"]) == (1, 0)
+
+
 def test_workflow_matching_and_metrics():
     picked = metrics.workflows_for(RECORDS, WORKFLOWS, since="2026-11-16 08:00:00")
     assert {w["failure_id"] for w in picked} == {"f-jule", "f-jule-2", "f-rain", "f-misty"}

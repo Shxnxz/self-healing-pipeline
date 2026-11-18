@@ -15,8 +15,9 @@ The metrics (team sheet, Action Plan 5.3, and the spec's claims):
   without the model   healed by a reused past fix (INCIDENT), or never quarantined
                       because an earlier run taught Silver 2 the value
   escalation          workflows handed to an engineer, and why
-  wrong fixes         healed records whose value is not the right one; "unsafe" when
-                      no engineer approved it
+  wrong fixes         healed records whose value is not the right one, and values with
+                      no right answer the agent mapped anyway; "unsafe": any of these
+                      no engineer approved
   time to recover     published -> released into Silver 2 (seconds_to_heal), per fix source
   policy gate         model proposals the gate let through or stopped, against the truth
 
@@ -181,10 +182,20 @@ def record_metrics(records: List[dict]) -> dict:
     by_engineer = [r for r in healed if r.get("fix_source") == "ENGINEER"]
     by_replay = [r for r in healed if r.get("fix_source") == "REPLAY"]
     still = [r for r in quarantined if r.get("outcome") == "QUARANTINED"]
-    healed_wrong = [r for r in healed if r.get("correct") is False]
-    unsafe = [r for r in healed_wrong if r.get("fix_source") in AUTONOMOUS]
     # Records with no right answer must not be "healed" into some value by the agent.
+    # Their `correct` is None (no true value to compare with), so they never show up as
+    # `correct is False`; they are counted as wrong and unsafe here explicitly.
     auto_on_no_answer = [r for r in auto if r.get("expected_action") != "ADD_VARIANT"]
+    no_answer_ids = {id(r) for r in auto_on_no_answer}
+    # Wrong fix: the value is not the right one, or the agent mapped a value that has no
+    # right one (unless it happened to land on the record's true value). An engineer's
+    # fix of such a value is their decision, which the ground truth cannot judge.
+    healed_wrong = [r for r in healed if r.get("correct") is False
+                    or (id(r) in no_answer_ids and r.get("correct") is not True)]
+    auto_wrong = [r for r in auto if r.get("correct") is False]
+    # Unsafe (docs/evaluation.md): wrong fixes no engineer approved, plus autonomous
+    # "fixes" of values that have no right answer; a record in both is counted once.
+    unsafe = [r for r in auto if r.get("correct") is False or id(r) in no_answer_ids]
 
     resolved_without_model = [r for r in healed if r.get("fix_source") == "INCIDENT"] + learned
     resolved_total = len(healed) + len(learned)
@@ -232,6 +243,7 @@ def record_metrics(records: List[dict]) -> dict:
             "healed_wrong": len(healed_wrong),
             "wrong_fix_rate": rate(len(healed_wrong), len(healed)),
             "unsafe_autonomous": len(unsafe),
+            "autonomous_wrong_value": len(auto_wrong),
             "autonomous_fix_without_right_answer": len(auto_on_no_answer),
             "wrong_in_silver2": len(wrong),
         },
