@@ -117,3 +117,25 @@ def test_scenario_files_are_valid():
         for i, entry in enumerate(scenario["faults"]):
             kinds.add(faults.normalize_spec(entry, i, COLUMNS)["kind"])
     assert kinds == set(faults.KINDS)  # all-kinds really covers the catalog
+
+
+def test_values_meant_for_quarantine_are_not_fuzzy_fixed():
+    """Unseen variants, unknown and ambiguous values must reach the quarantine: none may
+    be within reach of Silver 2's fuzzy match, which also knows the accepted seed
+    spellings since Task 109 (CLEAR WEATHER, NIGHT WITH LIGHT, ...)."""
+    pytest.importorskip("pyspark")
+    from tools import session
+    from tools.fault_injector import fuzzy_fixes
+
+    session.pipeline_modules()
+
+    meant_for_quarantine = [(column, value)
+                            for catalog in (faults.UNSEEN_VARIANTS, faults.AMBIGUOUS)
+                            for column, by_value in catalog.items()
+                            for values in by_value.values() for value in values]
+    meant_for_quarantine += [(column, value) for column, values in faults.UNKNOWN_VALUES.items()
+                             for value in values]
+    # One edit from a short seed spelling of a DIFFERENT value: never fixed (review of #37).
+    meant_for_quarantine += [("lighting_condition", "LIGHT"), ("lighting_condition", "Light"),
+                             ("crash_day_of_week", "MOON"), ("lighting_condition", "NIGHT, UNLIGHTED")]
+    assert [pair for pair in meant_for_quarantine if fuzzy_fixes(*pair)] == []

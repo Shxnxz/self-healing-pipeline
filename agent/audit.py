@@ -68,10 +68,16 @@ def _schema():
     ])
 
 
-def execution_id(failure_id: Optional[str], action: Optional[str], params) -> str:
-    """The idempotency key: the same fix for the same failure always gets the same id."""
-    identity = json.dumps({"failure": failure_id, "action": action, "params": params or {}},
-                          sort_keys=True, ensure_ascii=False, default=str)
+def execution_id(failure_id: Optional[str], action: Optional[str], params, batches=None) -> str:
+    """The idempotency key: the same fix for the same failure always gets the same id.
+
+    `batches` is given only once later batches attached to the workflow (agent/attach.py):
+    the group then has more records, so the fix is a new execution that stages all of
+    them, not a replay of the earlier, smaller one."""
+    identity = {"failure": failure_id, "action": action, "params": params or {}}
+    if batches:
+        identity["batches"] = sorted(str(b) for b in batches)
+    identity = json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(identity.encode()).hexdigest()[:32]
 
 
@@ -79,6 +85,7 @@ def _rows(path: str, column: Optional[str] = None, value: Optional[str] = None,
           columns: Optional[List[str]] = None) -> List[dict]:
     """Rows of the audit table, [] when it does not exist yet. Other errors are raised:
     a table that cannot be read is not the same as a table without the record."""
+    import pyarrow as pa
     import pyarrow.dataset as ds
     from deltalake import DeltaTable
     from deltalake.exceptions import TableNotFoundError
@@ -89,7 +96,9 @@ def _rows(path: str, column: Optional[str] = None, value: Optional[str] = None,
         return []
     # Single-threaded for the same reason as agent/reference.py.
     return table.to_pyarrow_dataset().to_table(
-        columns=columns, filter=None if column is None else ds.field(column) == value, use_threads=False,
+        # Cast: robust to files written with Arrow string_view (see reference.text_field).
+        columns=columns, filter=None if column is None else ds.field(column).cast(pa.string()) == value,
+        use_threads=False,
     ).to_pylist()
 
 

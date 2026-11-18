@@ -22,12 +22,18 @@ failure = QwenClassifier().classify(error_text, job_name='Silver2', batch_id=17)
 Output: schema_version, source, failure_type, table, column, error_class,
 job_name, batch_id, needs_review, classification_status, model, input_truncated.
 Types: MISSING_COLUMN, TYPE_MISMATCH, PARSE_ERROR, CORRUPT_RECORD,
-SCHEMA_MISMATCH, UNKNOWN. Missing identifiers are null.
+SCHEMA_DRIFT, UNKNOWN: the same names as the lookup and the Neo4j incidents
+(`lineage/schema.cypher`). `SCHEMA_MISMATCH` is only the error class the Silver 1
+schema guard raises; the lookup reads it as `SCHEMA_DRIFT`. Missing identifiers are null.
 OK means output passed structural/evidence checks, not proven semantic correctness.
 UNAVAILABLE and INVALID_OUTPUT require review. No output authorizes a repair.
 Long input is bounded to the first/last 8,000 characters and requires review.
-An identifier appearing in input is necessary but not sufficient evidence that it
-is the correct affected field; measure extraction accuracy separately.
+An identifier must appear in the input as a whole name (`crash` is not grounded by
+`crash_month`) outside Spark's "Did you mean ..." suggestion lists, and when Spark
+names the column it could not resolve, the column must be that one. This is
+necessary but not sufficient evidence that it is the correct affected field;
+measure extraction accuracy separately. `QWEN_TIMEOUT_SECONDS` (default 60) bounds
+the model call.
 
 ## Pipeline integration
 
@@ -42,7 +48,8 @@ Silver2 calls Qwen after its existing dead-letter write succeeds. The raw batch
 remains in the existing Delta dead-letter table. The classification and traceback
 are stored in incidents/ with the dead-letter path and batch ID for handoff.
 The combined run_layers entry point also classifies uncaught job exceptions and
-re-raises the original error. Direct layer scripts have no general entry wrapper.
+re-raises the original error. The Spark jobs import the package only when
+`QWEN_ENABLED=true`, so they run without the bind mount when Qwen is off. Direct layer scripts have no general entry wrapper.
 Classification failure does not change the existing batch/retry behavior.
 Incident files are a handoff artifact; no recovery consumer or lookup is added.
 
@@ -85,10 +92,24 @@ than one model call per record. `dead_letter_ref` gives the path and filters
 needed to select the original rows. The consumer must have access to the same
 Delta storage; a Docker path alone is not a portable storage URI.
 
-Delivery is **at least once**. A batch fails if persistence or broker delivery
-fails, so its checkpoint does not advance. The local JSON remains after a broker
-failure. Batch retry can resend the same incident: consumers must deduplicate
-using `incident_id` (also the Kafka key). This is not exactly-once recovery.
+**The batch does not wait for the model** (Task 109). Inside foreachBatch,
+`capture_exception` only writes the exception to an outbox file,
+`$QWEN_INCIDENT_DIR/outbox/<incident_id>.json`, and returns. A background worker in
+the same driver classifies it, saves `$QWEN_INCIDENT_DIR/<incident_id>.json`,
+publishes it and then deletes the outbox file. If the model or the broker fails, the
+file stays and the worker tries again with backoff (up to
+`QWEN_OUTBOX_MAX_BACKOFF_SECONDS`, default 300); an incident already saved is
+published as it is, not classified again. When the driver stops, `run_job` drains
+the leftover files at the next start. `QWEN_ASYNC=false` restores the old
+synchronous behaviour.
+
+Delivery is **at least once**. A batch fails only if the outbox file cannot be
+written (storage), so its checkpoint does not advance. A broker failure no longer
+fails the batch: the outbox keeps the incident until Kafka acknowledges it. Retries
+can resend the same incident: consumers must deduplicate using `incident_id` (also
+the Kafka key, the same in both modes). This is not exactly-once recovery.
+A crash of the whole driver is still recorded synchronously, since the process is
+ending.
 Standalone job wrappers preserve the original exception if incident recording
 also fails. When Qwen is disabled, invalid rows are still parked but no incident
 is generated or published.

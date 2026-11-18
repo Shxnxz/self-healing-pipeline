@@ -224,8 +224,10 @@ def test_replay_silver2_dead_letter(spark):
 
 
 def test_replay_quarantine_logs_fuzzy_fixes_of_released_rows(spark):
-    """HAILSTORM becomes known; its row also had DAYLIHGT, which the fuzzy match fixes
-    on the way: the release logs that correction like the stream does."""
+    """HAILSTORM becomes known; its row also had DAYLIHGT, which the fuzzy match fixes.
+    The Silver 2 replay logged that correction when it quarantined the row, so the
+    release must not log it a second time (fuzzy recurrence counts rows); a correction
+    missing from the audit is logged by the release."""
     from datetime import datetime, timezone
 
     from pyspark.sql import functions as F
@@ -236,11 +238,26 @@ def test_replay_quarantine_logs_fuzzy_fixes_of_released_rows(spark):
 
     spark.createDataFrame([("weather_condition", "HAILSTORM", "RAIN", "test", datetime.now(timezone.utc), 1.0, None)],
                           REF_MAPPINGS_SCHEMA).write.format("delta").mode("append").save(REF_MAPPINGS_PATH)
+    audit = lambda: spark.read.format("delta").load(FUZZY_AUDIT_PATH).filter(
+        F.col("record_id") == STATE["hailstorm"]).collect()
+    assert [(r["field"], r["matched"]) for r in audit()] == [("lighting_condition", "DAYLIGHT")]
+    # Lose that row, as if it had never been logged: the release must log it.
+    from delta.tables import DeltaTable
+    DeltaTable.forPath(spark, FUZZY_AUDIT_PATH).delete(F.col("record_id") == STATE["hailstorm"])
+
     done = replay.replay_quarantine(spark, "crash3", column="weather_condition", value="hailstorm", apply=True)
     assert done["appended"] == 1
-    logged = spark.read.format("delta").load(FUZZY_AUDIT_PATH).filter(
-        (F.col("record_id") == STATE["hailstorm"]) & (F.col("batch_id") == done["replay_id"])).collect()
-    assert [(r["field"], r["matched"]) for r in logged] == [("lighting_condition", "DAYLIGHT")]
+    logged = audit()
+    assert [(r["field"], r["matched"], r["batch_id"]) for r in logged] == [
+        ("lighting_condition", "DAYLIGHT", done["replay_id"])]
+
+    # A correction already in the audit is cut from the entries, so it is not logged twice.
+    entry = F.struct(F.lit("lighting_condition").alias("field"), F.lit(STATE["hailstorm"]).alias("record_id"),
+                     F.lit("DAYLIHGT").alias("raw"), F.lit("DAYLIGHT").alias("matched"), F.lit(1).alias("distance"))
+    rows = spark.range(1).select(F.lit(STATE["hailstorm"]).alias("record_id"),
+                                 F.array(entry).alias("_fuzzy_audit_entries"))
+    (left,) = replay._unlogged_fuzzy(spark, rows, FUZZY_AUDIT_PATH).collect()
+    assert left["_fuzzy_audit_entries"] == []
 
 
 def test_list_and_runs(spark):

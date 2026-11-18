@@ -139,19 +139,31 @@ def idempotent_append(
             time.sleep(0.5 * attempt)
 
 
+def has_delta_commit(path: str) -> bool:
+    """True when the Delta table at `path` has at least one commit (it can be read)."""
+    try:
+        names = os.listdir(os.path.join(path, "_delta_log"))
+    except OSError:
+        return False
+    return any(n == "_last_checkpoint" or (n.endswith(".json") and n.split(".")[0].isdigit()) for n in names)
+
+
 def wait_for_delta_table(
     path: str, poll_seconds: int = 5, upstream: Optional[StreamingQuery] = None
 ) -> None:
     """
-    Block until `path` looks like an initialized Delta table.
+    Block until `path` is a Delta table with at least one commit.
 
     `upstream` is the query that will create the table when it runs in this
     same driver (see run_layers.py). If that query dies first, raise instead
     of waiting forever, so the container exits and gets restarted.
+
+    The `_delta_log` folder alone is not enough: Delta creates it (with an empty
+    `_commits` folder) as soon as a streaming sink starts, before the first micro-batch
+    commits, and reading the table then fails with DELTA_SCHEMA_NOT_SET.
     """
-    log_marker = os.path.join(path, "_delta_log")
     waited = 0
-    while not os.path.isdir(log_marker):
+    while not has_delta_commit(path):
         if upstream is not None and not upstream.isActive:
             raise RuntimeError(
                 f"Upstream query '{upstream.name or upstream.id}' stopped before "

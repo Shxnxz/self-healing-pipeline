@@ -50,7 +50,7 @@ except ImportError:  # repo checkout: lookup/../agent
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from agent.memory import incidents
 from blast_radius import layer_of
-from failures import SCHEMA_TYPES, RECORD_TYPES, VALUE_TYPES, StructuredFailure, family
+from failures import SCHEMA_TYPES, RECORD_TYPES, VALUE_TYPES, StructuredFailure, canonical_type, family
 
 FAMILY_TYPES = {"SCHEMA": SCHEMA_TYPES, "VALUE": VALUE_TYPES, "RECORD": RECORD_TYPES}
 
@@ -112,7 +112,7 @@ def parse_schema_value(value: Optional[str]) -> Tuple[Tuple[str, ...], Tuple[str
 
 
 def _type_similarity(a: Optional[str], b: Optional[str]) -> float:
-    if (a or "").upper() == (b or "").upper():
+    if canonical_type(a or "") == canonical_type(b or ""):
         return 1.0
     fa, fb = family(a), family(b)
     return 0.5 if fa == fb and fa != "UNKNOWN" else 0.0
