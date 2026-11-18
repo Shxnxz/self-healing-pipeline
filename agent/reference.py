@@ -83,7 +83,7 @@ def sample_records(failure: dict, limit: Optional[int] = None, path: Optional[st
         from deltalake import DeltaTable
 
         rows = _scan(DeltaTable(path or config.QUARANTINE_PATH),
-                     ["record_id", "raw_record", "columns_to_remediate"], filter=ds.field("record_id").isin(ids))
+                     ["record_id", "raw_record", "columns_to_remediate"], filter=text_field("record_id").isin(ids))
     except Exception as exc:
         print(f"[agent] sample records not readable: {exc}", flush=True)
         return []
@@ -99,6 +99,20 @@ def sample_records(failure: dict, limit: Optional[int] = None, path: Optional[st
         raw = row.get("raw_record") or {}
         samples.append({name: raw[name] for name in EVIDENCE_COLUMNS if raw.get(name) is not None})
     return samples[:limit]
+
+
+def text_field(name: str):
+    """A string column for a pyarrow dataset filter, cast to string first.
+
+    The quarantine trigger claims rows with deltalake's UPDATE (lookup/scanner.py), and
+    the files that rewrites store their strings as Arrow `string_view`. A plain
+    `ds.field(name) == value` then fails on a table that mixes both kinds of files
+    ("no kernel matching input types (string, string_view)"); the cast works on both.
+    """
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+
+    return ds.field(name).cast(pa.string())
 
 
 # healing_status values of a quarantined row that is still waiting for a fix. The
@@ -154,7 +168,7 @@ def failure_records(failure: dict, path: Optional[str] = None) -> dict:
     # raw_record is left out on purpose: it is the wide part of the table.
     scanned = table.to_pyarrow_dataset().to_table(
         columns=[c for c in wanted if c in available],
-        filter=ds.field("silver2_batch_id").isin(batches) if batches and "silver2_batch_id" in available else None,
+        filter=text_field("silver2_batch_id").isin(batches) if batches and "silver2_batch_id" in available else None,
         use_threads=False,
     ).to_pylist()
 

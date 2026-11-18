@@ -73,5 +73,8 @@ def main(layers):
 
 
 if __name__ == "__main__":
-    from qwen_classifier.integration import run_job
-    run_job(lambda: main(sys.argv[1:]), job_name="Pipeline-" + "-".join(sys.argv[1:]))
+    if os.getenv("QWEN_ENABLED", "false").lower() == "true":
+        from qwen_classifier.integration import run_job
+        run_job(lambda: main(sys.argv[1:]), job_name="Pipeline-" + "-".join(sys.argv[1:]))
+    else:   # the qwen_classifier package is not needed (nor always mounted) when Qwen is off
+        main(sys.argv[1:])

@@ -331,7 +331,10 @@ docker compose exec recovery-agent python -m agent.audit <failure_id>
 - **Escalate (106)** gets `execution.reasons` for a failed execution. An engineer's
   fix is executed here like any other, with `action_source = ENGINEER`.
 - **Pipeline cleanups (109)**: Remediate does not change `healing_status`. It accepts
-  rows the trigger has marked `IN_PROGRESS` and never stages a `RESOLVED` row.
+  rows the trigger has marked `IN_PROGRESS` and never stages a `RESOLVED` row. When later
+  batches attached to the workflow (below, "How state is kept"), the execution id also
+  covers the failure's batches, so a fix decided after an attach stages the whole,
+  larger group instead of replaying the smaller one.
 
 ## Validate (`nodes/validate.py`, spec VD1 to VD4)
 
@@ -603,6 +606,29 @@ RETURN i.signature_key, i.outcome, i.action, i.action_params, i.resolved_by, i.b
 
 and what was promoted: `added_by` starting with `recovery_agent:` in `ref_canonical_mappings`.
 
+## Upkeep: checkpoints and the audit table (`upkeep.py`)
+
+Two stores grow with every failure, so the agent trims them (Task 109):
+
+- **Checkpoints.** LangGraph saves the state after every node. A **finished** workflow
+  keeps only its last checkpoint, which holds the whole final state, so `agent.show`,
+  `agent.review` and the duplicate check read what they read before. Workflows that
+  wait for an engineer, stopped part-way, or still need Learn (relearn replays Learn
+  from the checkpoint before it) are never pruned. The agent prunes each workflow as it
+  finishes, and at start every finished one saved before (`AGENT_PRUNE_CHECKPOINTS=false`
+  turns it off).
+- **`remediation_audit`.** One small file per execution, and Remediate reads the table
+  on every execution. Every `AGENT_AUDIT_COMPACT_INTERVAL_SECONDS` (3600) the table is
+  compacted once it has more than `AGENT_AUDIT_COMPACT_MIN_FILES` (50) files, its log is
+  checkpointed, and the files compaction replaced are vacuumed after
+  `AGENT_AUDIT_VACUUM_RETENTION_HOURS` (168). Compaction rewrites the same rows, so
+  `audit.find` and Validate read exactly the same records.
+
+```bash
+docker compose exec recovery-agent python -m agent.upkeep --dry-run   # what would go
+docker compose exec recovery-agent python -m agent.upkeep             # prune and compact now
+```
+
 ## How state is kept (`consumer.py`)
 
 LangGraph saves the state after every node in SQLite, under
@@ -610,7 +636,22 @@ LangGraph saves the state after every node in SQLite, under
 
 - **waiting**: the workflow is paused for an engineer: leave it. Only the
   engineer's decision continues it, not a new publish of the failure.
-- **new**: no saved state, start the workflow.
+- **attached**: no saved state, but a workflow of the **same problem** is still open:
+  same source, folder, column and value, from a later micro-batch (the trigger claims
+  each batch's rows and publishes them as their own failure, see
+  [lookup/README.md](../lookup/README.md)). Open means waiting for an engineer, or
+  stopped part-way before Validate. The failure joins that workflow instead of starting
+  a new workflow, model call and engineer case (`agent/attach.py`): its batches, rows
+  and sample records are added to the workflow's `failure` (`attached_failure_ids`), and
+  the open case shows them, so the engineer's fix, or a retry, stages every waiting row
+  and Learn records every batch. The attached failure keeps a finished workflow of its
+  own with status `ATTACHED` and `attached_to`, so `agent.show` says where it went and a
+  redelivery is a duplicate. A workflow that reached Validate or ended is not open: a
+  later batch then starts its own workflow, which usually reuses the verified fix and
+  counts towards promotion by recurrence. A problem an engineer dismissed is closed too,
+  so its next batch opens a new case. The agent rebuilds the index of open workflows
+  from the checkpoints when it starts.
+- **new**: no saved state and nothing open for the problem: start the workflow.
 - **resumed**: the workflow stopped part-way (the agent was killed): continue from
   the last finished node. Nodes that already ran are not run again.
 - **duplicate**: the workflow ended and every step it went through was real: skip

@@ -6,14 +6,22 @@ import uuid
 from pathlib import Path
 
 
+def incident_id_for(*, job_name, batch_id, error_text, dead_letter_path=None, context=None):
+    """The incident's id: the same exception of the same batch always gets the same one,
+    so it is known before classification (the outbox file is named by it)."""
+    identity = {
+        'job': job_name, 'batch': batch_id,
+        'dead_letter': dead_letter_path, 'error': error_text, 'context': dict(context or {}),
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
 def build_incident(classification, *, error_text, dead_letter_path=None, context=None):
     """Keep source evidence separate from model predictions and graph identifiers."""
     context = dict(context or {})
-    identity = {
-        'job': classification.get('job_name'), 'batch': classification.get('batch_id'),
-        'dead_letter': dead_letter_path, 'error': error_text, 'context': context,
-    }
-    incident_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    incident_id = incident_id_for(job_name=classification.get('job_name'),
+                                  batch_id=classification.get('batch_id'), error_text=error_text,
+                                  dead_letter_path=dead_letter_path, context=context)
     needs_review = classification.get('needs_review', True) or not dead_letter_path
     status = classification.get('classification_status', 'UNAVAILABLE')
     return {

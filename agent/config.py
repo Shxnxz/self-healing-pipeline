@@ -133,3 +133,14 @@ PROMOTE_MIN_BATCHES = _count("PROMOTE_MIN_BATCHES", 3)
 # A workflow whose Learn kept failing (Neo4j or the reference table down) is relearned
 # this often (agent/consumer.py: LearnRetry). 0 = only when the failure is delivered again.
 RELEARN_INTERVAL_SECONDS = float(os.environ.get("AGENT_RELEARN_INTERVAL_SECONDS", 300))
+
+# --- Upkeep of the agent's own storage (agent/upkeep.py, Task 109) ----------------
+# A finished workflow keeps only its last checkpoint (the whole final state). Workflows
+# that wait, stopped part-way, or still need Learn are never pruned.
+PRUNE_CHECKPOINTS = os.environ.get("AGENT_PRUNE_CHECKPOINTS", "true").strip().lower() != "false"
+# The remediation audit table gets one small file per execution; it is compacted this
+# often (0 = never) once it has more than AUDIT_COMPACT_MIN_FILES files, and files the
+# compaction replaced are vacuumed after AUDIT_VACUUM_RETENTION_HOURS.
+AUDIT_COMPACT_INTERVAL_SECONDS = float(os.environ.get("AGENT_AUDIT_COMPACT_INTERVAL_SECONDS", 3600))
+AUDIT_COMPACT_MIN_FILES = int(os.environ.get("AGENT_AUDIT_COMPACT_MIN_FILES", 50))
+AUDIT_VACUUM_RETENTION_HOURS = float(os.environ.get("AGENT_AUDIT_VACUUM_RETENTION_HOURS", 168))

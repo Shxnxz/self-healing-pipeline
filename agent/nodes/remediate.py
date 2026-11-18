@@ -39,7 +39,7 @@ is `agent.audit.find(execution_id)["record_ids"]` (the state keeps only a sample
 from datetime import datetime, timezone
 from typing import Optional
 
-from agent import audit, config
+from agent import audit, config, reference
 from agent.executors import EXECUTORS, RemediationError
 from agent.state import EXECUTION_FAILED, EXECUTION_SUCCESS, RecoveryState, step
 
@@ -87,7 +87,9 @@ def make_remediate(audit_path: Optional[str] = None):
         path = audit_path or config.REMEDIATION_AUDIT_PATH
         started = datetime.now(timezone.utc)
         record = {
-            "execution_id": audit.execution_id(failure.get("failure_id"), name, params),
+            "execution_id": audit.execution_id(
+                failure.get("failure_id"), name, params,
+                reference.failure_batches(failure) if failure.get("attached_failure_ids") else None),
             "failure_id": failure.get("failure_id"), "lookup_id": state.get("lookup_id"),
             "action": name, "action_params": params, "action_source": action.get("source"),
             "incident_id": action.get("incident_id"),

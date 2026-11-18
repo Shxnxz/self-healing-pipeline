@@ -58,7 +58,7 @@ def test_unreviewed_qwen_output_is_not_trusted_but_keeps_deterministic_class():
     f = from_qwen_incident(qwen_schema_msg(failure_type="UNKNOWN", classification_status="UNAVAILABLE",
                                            needs_review=True, detected_error_class="SCHEMA_MISMATCH"))
     assert not f.trusted
-    assert f.failure_type == "SCHEMA_MISMATCH"
+    assert f.failure_type == "SCHEMA_DRIFT"     # the guard's class, in the shared vocabulary
 
 
 def test_pipeline_crash_marks_origin_itself_affected():
@@ -299,3 +299,24 @@ def test_an_exact_value_with_disagreeing_past_fixes_is_not_reused():
     assert "past fixes of this exact value disagree" in ctx["reason"]
     one = evaluate(f, "silver2_crash1", {**exact, "distinct_fixes": exact["distinct_fixes"][:1]}, [], [])
     assert one["reusable"]
+
+
+def test_one_failure_type_vocabulary():
+    """Task 109: what the classifier may answer is what lookup and the incidents know,
+    and the schema guard's SCHEMA_MISMATCH is the same type as SCHEMA_DRIFT."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from qwen_classifier.classifier import TYPES
+
+    import config
+    from failures import RECORD_TYPES, SCHEMA_TYPES, VALUE_TYPES, canonical_type
+    from patterns import _type_similarity
+
+    known = SCHEMA_TYPES | RECORD_TYPES | VALUE_TYPES | {"UNKNOWN"}
+    assert set(TYPES) <= known and "SCHEMA_MISMATCH" not in TYPES
+    assert {canonical_type(t) for t in known} - set(TYPES) == {"UNRESOLVED_VALUE", "AMBIGUOUS_VALUE"}
+    assert set(config.SEVERITY) >= known
+    assert _type_similarity("SCHEMA_MISMATCH", "SCHEMA_DRIFT") == 1.0     # older incidents still match
+    assert from_qwen_incident(qwen_schema_msg(failure_type="SCHEMA_MISMATCH")).failure_type == "SCHEMA_DRIFT"
