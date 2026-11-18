@@ -11,7 +11,7 @@ import time
 
 from confluent_kafka import Consumer, KafkaError
 from neo4j import GraphDatabase
-from neo4j.exceptions import Neo4jError, ServiceUnavailable, TransientError
+from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired, TransientError
 
 from graph import write_update
 from normalize import DEFAULT_DELTA_ROOT, normalize
@@ -28,6 +28,20 @@ NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "selfhealing")
 MAX_BACKOFF_SECONDS = 30
 
 
+def _neo4j_unavailable(exc: Exception) -> bool:
+    """True when the problem is Neo4j or the connection to it, not the event.
+
+    Down, restarting or busy (ServiceUnavailable, SessionExpired, TransientError),
+    and also refusing our credentials (Neo.ClientError.Security.*: a wrong
+    NEO4J_PASSWORD, or too many failed logins). Those are ClientErrors, so without
+    this they would be treated as a bad event and every event would be skipped.
+    """
+    if isinstance(exc, (ServiceUnavailable, SessionExpired, TransientError)):
+        return True
+    code = getattr(exc, "code", None) or ""
+    return isinstance(exc, Neo4jError) and code.startswith("Neo.ClientError.Security.")
+
+
 def _write_with_retry(driver, update) -> None:
     """Neo4j being down or busy must not lose lineage: wait and retry the same event."""
     delay = 1
@@ -35,7 +49,9 @@ def _write_with_retry(driver, update) -> None:
         try:
             write_update(driver, update)
             return
-        except (ServiceUnavailable, TransientError) as exc:
+        except Exception as exc:
+            if not _neo4j_unavailable(exc):
+                raise
             print(f"[lineage] Neo4j unavailable ({type(exc).__name__}); retrying in {delay}s")
             time.sleep(delay)
             delay = min(delay * 2, MAX_BACKOFF_SECONDS)

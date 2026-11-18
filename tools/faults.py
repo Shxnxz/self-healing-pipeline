@@ -81,9 +81,10 @@ UNSEEN_VARIANTS: Dict[str, Dict[str, List[str]]] = {
         "DAWN": ["SUNRISE", "DAYBREAK"],
     },
     "crash_month": {
+        # Not "Noviembre": two edits from NOVEMBER itself, so Silver 2's fuzzy match fixes it.
         "JANUARY": ["Enero"], "FEBRUARY": ["Febrero"], "MARCH": ["Marzo"], "APRIL": ["Apr."],
         "MAY": ["Mayo"], "JUNE": ["Junio"], "JULY": ["Julio"], "AUGUST": ["Agosto"],
-        "SEPTEMBER": ["Sept"], "OCTOBER": ["Octubre"], "NOVEMBER": ["Noviembre"], "DECEMBER": ["Diciembre"],
+        "SEPTEMBER": ["Sept"], "OCTOBER": ["Octubre"], "NOVEMBER": ["Novbre"], "DECEMBER": ["Diciembre"],
     },
     "crash_day_of_week": {
         "MONDAY": ["Lunes"], "TUESDAY": ["Tues"], "WEDNESDAY": ["Weds"], "THURSDAY": ["Thurs"],

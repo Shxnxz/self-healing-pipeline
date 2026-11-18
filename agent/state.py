@@ -8,7 +8,9 @@ resumed after a crash, and is not started twice when Kafka redelivers a message.
 Who writes what. Each node returns only its own keys:
 
   consumer              lookup_id, failure_id, failure, lineage_context,
-                        incident_context, priority, lookup_route, route_reason
+                        incident_context, priority, lookup_route, route_reason;
+                        when a later batch of the same problem attaches (agent/attach.py):
+                        failure (more batches and rows), priority, escalation.case.failure
   deterministic_lookup  route, action (when a verified past fix is reused)
   diagnose              diagnosis   {status, hypothesis, confidence, proposed_action, ...}
   policy_gate           policy      {passed, outcome, reasons, checks, ...}, action (when it passes)
@@ -50,6 +52,9 @@ STATUS_ESCALATED = "ESCALATED"  # handed to an engineer, waiting for the decisio
 STATUS_RESOLVED_BY_ENGINEER = "RESOLVED_BY_ENGINEER"  # an engineer's fix that validated, or fixed by hand
 STATUS_DISMISSED = "DISMISSED"  # the engineer decided it is not to be fixed; records stay quarantined
 STATUS_FAILED = "FAILED"        # escalate, engineer_review or learn kept raising: nobody has the case
+# The failure is a later batch of a problem whose workflow was still open; it was added
+# to that workflow (`attached_to`) instead of starting its own (agent/attach.py).
+STATUS_ATTACHED = "ATTACHED"
 
 # Marker a stub node leaves so nobody mistakes its output for a real result.
 NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
@@ -65,6 +70,7 @@ class RecoveryState(TypedDict, total=False):
     priority: dict           # {"rank", "score", "tier"}
     lookup_route: str        # route as published: remediate | diagnose
     route_reason: str
+    attached_to: str         # STATUS_ATTACHED only: the open workflow it joined
 
     # --- written by the nodes ---
     route: str               # route the graph takes after deterministic_lookup

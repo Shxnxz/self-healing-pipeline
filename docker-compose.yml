@@ -85,6 +85,8 @@ services:
       QWEN_ENABLED: ${QWEN_ENABLED:-false}
       QWEN_BASE_URL: ${QWEN_BASE_URL:-http://host.docker.internal:11434}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3:4b-instruct}
+      QWEN_ASYNC: ${QWEN_ASYNC:-true}
+      QWEN_TIMEOUT_SECONDS: ${QWEN_TIMEOUT_SECONDS:-60}
       QWEN_INCIDENT_DIR: /data/incidents
       QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
@@ -125,6 +127,8 @@ services:
       QWEN_ENABLED: ${QWEN_ENABLED:-false}
       QWEN_BASE_URL: ${QWEN_BASE_URL:-http://host.docker.internal:11434}
       QWEN_MODEL: ${QWEN_MODEL:-qwen3:4b-instruct}
+      QWEN_ASYNC: ${QWEN_ASYNC:-true}
+      QWEN_TIMEOUT_SECONDS: ${QWEN_TIMEOUT_SECONDS:-60}
       QWEN_INCIDENT_DIR: /data/incidents
       QWEN_KAFKA_ENABLED: ${QWEN_KAFKA_ENABLED:-false}
       QWEN_INCIDENT_TOPIC: ${QWEN_INCIDENT_TOPIC:-recovery.incidents}
@@ -205,7 +209,8 @@ services:
         condition: service_completed_successfully
 
   # --- Deterministic Lookup ---------------------------------------------
-  # Groups new silver2_quarantine rows and publishes them to recovery.failures.
+  # Groups PENDING silver2_quarantine rows, publishes them to recovery.failures and
+  # claims them IN_PROGRESS (the one table it writes, so the only writable mount).
   lookup-scanner:
     build:
       context: .
@@ -215,6 +220,7 @@ services:
     restart: on-failure
     volumes:
       - ./delta:/data/delta:ro
+      - ./delta/silver2_quarantine:/data/delta/silver2_quarantine
       - lookup-state:/state
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092

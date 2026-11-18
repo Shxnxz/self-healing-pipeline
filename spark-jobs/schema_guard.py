@@ -19,6 +19,15 @@ def schema_error(table, expected_only, source_only):
     )
 
 
+def record_incident(exc, **kwargs):
+    """Hand the exception to the Qwen classifier. The package is imported only when
+    QWEN_ENABLED=true, so Silver 1 runs without it (e.g. without the Compose bind mount)."""
+    if os.getenv('QWEN_ENABLED', 'false').lower() != 'true':
+        return None
+    from qwen_classifier.integration import capture_exception
+    return capture_exception(exc, **kwargs)
+
+
 def process_source_batch(batch, batch_id, expected_columns, write_valid, dead_letter_path,
                          txn_app_id=None, affected_dataset='bronze'):
     """Park schema-invalid raw records, classify each signature, then clean valid rows.
@@ -30,7 +39,6 @@ def process_source_batch(batch, batch_id, expected_columns, write_valid, dead_le
     """
     from pyspark.sql import functions as F
     from pyspark.sql.types import MapType, StringType
-    from qwen_classifier.integration import capture_exception
 
     metadata = ['record_id', 'batch_id', 'table_name', 'ingestion_ts', 'payload']
     payload = F.get_json_object('raw_value', '$.payload')
@@ -85,7 +93,7 @@ def process_source_batch(batch, batch_id, expected_columns, write_valid, dead_le
                 try:
                     raise exc
                 except ValueError as failure:
-                    capture_exception(failure, job_name='Silver1SchemaValidation', batch_id=batch_id,
+                    record_incident(failure, job_name='Silver1SchemaValidation', batch_id=batch_id,
                                       table=issue._table_name, dead_letter_path=dead_letter_path,
                                       context={
                                           'source_topic': issue.topic,

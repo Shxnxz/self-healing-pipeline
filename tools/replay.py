@@ -58,7 +58,27 @@ def _paths() -> Dict[str, str]:
     return {"silver1_dead_letter": silver1_job.DEAD_LETTER_PATH,
             "silver2_dead_letter": silver2_job.DEAD_LETTER_PATH,
             "quarantine": silver2_job.QUARANTINE_PATH,
-            "ref": silver2_job.REF_MAPPINGS_PATH}
+            "ref": silver2_job.REF_MAPPINGS_PATH,
+            "fuzzy_audit": silver2_job.FUZZY_AUDIT_PATH}
+
+
+def _unlogged_fuzzy(spark, rows, fuzzy_audit_path: str):
+    """`rows` with each _fuzzy_audit_entries array cut to the (record_id, field) pairs
+    that silver2_fuzzy_audit does not hold yet."""
+    from pyspark.sql import functions as F
+
+    if not session.is_delta(fuzzy_audit_path):
+        return rows
+    ids = [r["record_id"] for r in rows.select("record_id").collect()]
+    logged = {f"{r['record_id']}|{r['field']}" for r in
+              spark.read.format("delta").load(fuzzy_audit_path)
+              .filter(F.col("record_id").isin(*ids)).select("record_id", "field").distinct().collect()}
+    if not logged:
+        return rows
+    known = F.array(*[F.lit(k) for k in sorted(logged)])
+    return rows.withColumn("_fuzzy_audit_entries", F.filter(
+        "_fuzzy_audit_entries",
+        lambda e: ~F.array_contains(known, F.concat_ws("|", e["record_id"], e["field"]))))
 
 
 def _source(name: str) -> str:
@@ -317,7 +337,7 @@ def agent_held(spark, target_table: str) -> Dict[str, str]:
 
 def replay_quarantine(spark, source: str, column: Optional[str] = None, value: Optional[str] = None,
                       batch: Optional[str] = None, record_ids: Optional[List[str]] = None,
-                      include_in_progress: bool = False, apply: bool = False, force: bool = False) -> dict:
+                      include_in_progress: bool = True, apply: bool = False, force: bool = False) -> dict:
     """Re-run waiting quarantine rows with the current reference table and release the
     ones that now pass.
 
@@ -325,7 +345,7 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
     ref_canonical_mappings (rows that failed two columns stay quarantined until both
     are known), canonical values an engineer added, or a code fix. No overlay is used
     and nothing is promoted: the replay trusts ref_canonical_mappings as the Silver 2
-    job does. Rows that still fail stay PENDING, untouched.
+    job does. Rows that still fail keep their status, untouched.
 
     Records the agent is working on are left out: a row that Remediate staged (a
     SUCCESS execution in remediation_audit lists it) and that is still waiting belongs
@@ -348,6 +368,8 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
     if value is not None and not column:
         raise ReplayRefused("--value needs --column")
     target_table = table_name("silver2", source)
+    # The recovery trigger claims every group it publishes (lookup/scanner.py), so
+    # waiting rows are IN_PROGRESS as a rule; the agent's own rows are protected below.
     statuses = list(WAITING) if include_in_progress else ["PENDING"]
     q = spark.read.format("delta").load(paths["quarantine"])
     selected = q.filter((F.col("target_table") == target_table) & F.col("healing_status").isin(*statuses))
@@ -404,8 +426,11 @@ def replay_quarantine(spark, source: str, column: Optional[str] = None, value: O
             rows = replayed.filter(F.col("record_id").isin(*to_append)).drop(*_NOT_IN_SILVER2)
             # Idempotent: Delta skips the append if this replay id already wrote it.
             idempotent_append(rows, silver2_path, f"{replay_id}:release", 0)
-            # Another column fixed by the fuzzy match on the way: logged like the stream does.
-            fuzzy = replayed.filter(F.col("record_id").isin(*to_append))
+            # Another column fixed by the fuzzy match on the way. The Silver 2 job logged
+            # that correction when it quarantined the row, so only a correction not in the
+            # fuzzy audit yet is written (counted once, like the agent's Validate).
+            fuzzy = _unlogged_fuzzy(spark, replayed.filter(F.col("record_id").isin(*to_append)),
+                                    paths["fuzzy_audit"])
             if fuzzy.filter(F.size("_fuzzy_audit_entries") > 0).limit(1).count():
                 write_fuzzy_audit(fuzzy, txn_app_id=replay_id, txn_version=0, batch_label=replay_id,
                                   target_table=target_table)
@@ -458,8 +483,10 @@ def main(argv=None) -> int:
     p_q.add_argument("--value", help="only rows whose failing value is this (needs --column)")
     p_q.add_argument("--batch", help="only this silver2_batch_id")
     p_q.add_argument("--record-id", action="append", dest="record_ids", help="only these records (repeatable)")
-    p_q.add_argument("--include-in-progress", action="store_true",
-                     help="also rows the recovery trigger marked IN_PROGRESS")
+    p_q.add_argument("--pending-only", dest="include_in_progress", action="store_false",
+                     help="only rows the recovery trigger has not claimed yet (PENDING)")
+    p_q.add_argument("--include-in-progress", dest="include_in_progress", action="store_true",
+                     help="the default: PENDING and IN_PROGRESS rows (kept for old scripts)")
     p_q.add_argument("--force", action="store_true",
                      help="also records the agent staged and is still working on (see agent.audit)")
     p_q.add_argument("--apply", action="store_true", help="write (default: dry run)")

@@ -57,8 +57,8 @@ from sources import (
 from ref_mappings import (
     ANCHOR_TO_CANONICAL,
     CANONICAL_ANCHORS,
-    damerau_levenshtein_udf,
     fuzzy_canonical,
+    fuzzy_distance,
     init_fuzzy_audit,
     init_ref_mappings,
     load_mappings_dict,
@@ -164,7 +164,8 @@ def _fuzzy_audit_struct(
             record_id.alias("record_id"),
             raw_col.alias("raw"),
             effective_fuzzy.alias("matched"),
-            damerau_levenshtein_udf(F.upper(F.trim(raw_col)), effective_fuzzy).alias("distance"),
+            # Distance to the accepted spelling it matched (CLEAR WEAGHER -> CLEAR WEATHER: 1)
+            fuzzy_distance(raw_col, effective_fuzzy, CANONICAL_ANCHORS[field]).alias("distance"),
         ),
     ).otherwise(None)
 
@@ -614,8 +615,8 @@ def make_batch_processor(
         except Exception as exc:
             _dead_letter_batch(batch_df, batch_id, exc, txn_app_id, target_table)
             # Classify only after the raw batch is durably preserved (IC2/IC4).
-            from qwen_classifier.integration import capture_exception
-            capture_exception(exc, job_name="Silver2", batch_id=batch_id,
+            from schema_guard import record_incident
+            record_incident(exc, job_name="Silver2", batch_id=batch_id,
                               table=target_table, dead_letter_path=DEAD_LETTER_PATH)
             return
 

@@ -31,6 +31,10 @@ from typing import List, Optional, Tuple
 QUARANTINE = "QUARANTINE"
 QWEN = "QWEN"
 
+# One failure-type vocabulary (Task 109): the Qwen classifier, the schema guard and the
+# incidents all say SCHEMA_DRIFT. SCHEMA_MISMATCH is the schema guard's error class and
+# the type older incidents were stored with, so it is read as SCHEMA_DRIFT.
+TYPE_ALIASES = {"SCHEMA_MISMATCH": "SCHEMA_DRIFT"}
 SCHEMA_TYPES = {"SCHEMA_MISMATCH", "SCHEMA_DRIFT", "MISSING_COLUMN"}
 RECORD_TYPES = {"CORRUPT_RECORD"}
 VALUE_TYPES = {"UNRESOLVED_VALUE", "AMBIGUOUS_VALUE", "TYPE_MISMATCH", "PARSE_ERROR"}
@@ -61,6 +65,14 @@ def split_table(name: Optional[str]):
     if sep and layer in PER_SOURCE_LAYERS and rest and "_" not in rest and rest not in _SHARED_SUFFIXES:
         return layer, rest
     return None, None
+
+
+def canonical_type(failure_type: Optional[str]) -> Optional[str]:
+    """The failure type in the shared vocabulary (TYPE_ALIASES)."""
+    if failure_type is None:
+        return None
+    ft = failure_type.strip().upper()
+    return TYPE_ALIASES.get(ft, ft)
 
 
 def family(failure_type: Optional[str]) -> str:
@@ -168,6 +180,7 @@ def from_qwen_incident(msg: dict) -> Optional[StructuredFailure]:
     detected_class = msg.get("detected_error_class") or ref.get("error_class")
     if failure_type == "UNKNOWN" and detected_class in SCHEMA_TYPES | RECORD_TYPES:
         failure_type = detected_class
+    failure_type = canonical_type(failure_type)
     trusted = msg.get("classification_status") == "OK" and not msg.get("needs_review", True)
     batch = msg.get("batch_id")
     # Folder: producer name ("Crash3"), or taken from a per-folder table name
