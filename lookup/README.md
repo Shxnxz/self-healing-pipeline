@@ -144,6 +144,6 @@ precision near 1.0. A wrong auto-fix costs more than an extra diagnosis.
 ## Tests
 
 ```bash
-pip install pytest neo4j
+pip install -r lookup/requirements.txt pytest
 python -m pytest lookup/tests
 ```

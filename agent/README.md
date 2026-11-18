@@ -677,19 +677,70 @@ so a long stack does not get it dropped from the consumer group.
 
 ### Failures seen while steps were still stubs
 
-A failure that went through a stub ended without its outcome being stored. It is not
-lost for good: the next time it is published it is handled properly. A workflow that
-only missed Learn (every workflow finished between Task 106 and Task 107, including
-cases an engineer already closed) is **relearned**: only Learn runs, nobody is asked
-again, and the agent does this on its own at start. A workflow an engineer decided is
-never rerun from the start. One that went through an earlier stub is **rerun**. To
-publish the failures again, reset the scanner:
+A failure that went through a stub ended without its outcome being stored. Two kinds:
+
+- A workflow that **only missed Learn** (every workflow finished between Task 106 and
+  Task 107, including cases an engineer already closed) is **relearned**: only Learn
+  runs, nobody is asked again. The agent does this on its own at start, nothing to do.
+- A workflow that ended on an **earlier stub** (Diagnose, the gate, Remediate, Validate
+  or Escalate, before Tasks 103 to 106) is only run again, from the start, when its
+  `recovery.lookup` message is **delivered to the agent again**. The agent read and
+  committed that message long ago, and the scanner never publishes the same group twice,
+  so nothing does that on its own.
+
+To deliver them again, move the agent's consumer group (`recovery-agent`) back on the
+topic `recovery.lookup`. The agent then re-reads every lookup message from that point
+and handles each item as described above: a finished workflow is a duplicate and is
+skipped, a waiting one is left alone, one an engineer decided is never rerun, one that
+ended on a stub is **rerun** with the same `failure_id`. Kafka refuses to move the
+offsets while the agent is connected, so stop it first:
 
 ```bash
-docker compose rm -sf lookup-scanner
-docker volume rm self-healing-pipeline_lookup-state
-docker compose up -d lookup-scanner
+docker compose stop recovery-agent
+
+# see what would change, then do it. To replay only recent messages, use
+# --to-datetime 2026-11-10T00:00:00.000 (UTC) instead of --to-earliest.
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group recovery-agent --topic recovery.lookup --reset-offsets --to-earliest --dry-run
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group recovery-agent --topic recovery.lookup --reset-offsets --to-earliest --execute
+
+docker compose start recovery-agent
+docker compose logs -f recovery-agent      # each line says rerun, duplicate, waiting or relearn
 ```
+
+If Kafka answers `Assignments can only be reset if the group 'recovery-agent' is
+inactive`, the stopped agent has not left the group yet: wait a minute (the session
+timeout) and run the command again. Only `recovery.lookup` is named, so engineers'
+decisions on `recovery.decisions` are not read again.
+
+Things to know before doing it:
+
+- **Kafka keeps messages 7 days** (the broker default; Compose sets nothing else).
+  Older lookup messages are gone and cannot be delivered again. Resetting the scanner
+  does not publish them again either: the scanner claims the rows it publishes
+  (`IN_PROGRESS`), and the first scan after an upgrade claims the rows the old scanner
+  had already published ([lookup/README.md](../lookup/README.md)). Rows that the current
+  reference table fixes are released with `python -m tools.replay quarantine` (it
+  includes `IN_PROGRESS` rows by default); for the agent to see the others again, set
+  their `healing_status` back to `PENDING`. They are then published as **new** failures
+  (the id includes the batches) and run as new workflows; the old stub-ended workflows
+  stay as they are.
+- A rerun failure goes through the whole graph again, so without a reusable past fix it
+  costs one model call.
+- If its records were healed in the meantime by another workflow, Remediate finds
+  nothing waiting and the failure becomes a case (`REMEDIATION_FAILED`, "no quarantined
+  record of this failure is waiting for a fix"). Close it with `agent.review dismiss`.
+- Do not delete the `agent-state` volume for this: without the saved workflows every
+  message is a **new** failure, closed cases can come back to an engineer, and only the
+  audit table keeps a staged fix from being executed twice.
+
+Tried on Kafka (apache/kafka, the broker Compose runs) on 2026-11-16: the reset is
+refused while a consumer of the group is connected, and after it the messages are read
+again by the same group. What the agent does with each redelivered item is covered by
+the tests (`test_consumer.py`: rerun and duplicate, `test_escalate.py`: waiting and
+decided, `test_learn.py`: relearn); the whole procedure has not been run against a real
+agent with stub-era workflows.
 
 ## Run it
 
@@ -772,9 +823,13 @@ No Kafka, Neo4j or model needed: the model is a fake, and the Delta reader and t
 audit table run on small tables written to a temp folder. From the repo root:
 
 ```bash
-pip install -r agent/requirements.txt pytest
+pip install -r agent/requirements.txt pytest pyyaml
 python -m pytest agent
 ```
+
+GitHub Actions runs this on every pull request with Java and a Neo4j service, so the
+Spark and Neo4j tests below run there instead of being skipped (`.github/workflows/tests.yml`,
+job "Recovery agent").
 
 Validate's replay is a fake in every test except `test_validate_spark.py`, which
 builds real tables with the pipeline's own Bronze, Silver 1 and Silver 2 jobs from
