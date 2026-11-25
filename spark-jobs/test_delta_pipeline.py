@@ -185,8 +185,9 @@ def run_tests():
     assert rec1.crash_date == "2021-03-04", f"Expected 2021-03-04, got {rec1.crash_date}"
     assert rec1.date_police_notified == "2023-09-05 19:42:00", f"Expected 2023-09-05 19:42:00, got {rec1.date_police_notified}"
     assert rec1.posted_speed_limit == 30, f"Expected 30, got {rec1.posted_speed_limit}"
-    assert rec1.crash_hour == "14.00", f"Expected 14.00, got {rec1.crash_hour}"
-    print("  -> Slash date & PM timestamp & trimmed speed limit & crash_hour (hh.00) validated in Silver 2: PASSED")
+    assert rec1.crash_hour == 14, f"Expected 14, got {rec1.crash_hour}"
+    assert rec1.num_units == 2, f"Expected 2, got {rec1.num_units}"
+    print("  -> Slash date & PM timestamp & trimmed speed limit & crash_hour/num_units (INT) validated in Silver 2: PASSED")
 
     # Verify Quarantine table
     assert _is_delta_table(spark, TEST_QUARANTINE), "Quarantine table was not created"

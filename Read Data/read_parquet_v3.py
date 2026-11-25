@@ -189,6 +189,25 @@ def _fetch_one(query: str):
     return rows[0] if rows else None
 
 
+def _ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def sql_df(query: str) -> pd.DataFrame:
+    """Run a query and return pandas, with DATE columns kept as 'YYYY-MM-DD' text.
+
+    DuckDB hands a DATE column to pandas as datetime64, which prints as
+    '2024-09-19 00:00:00' and makes Gold's crash_date look like a timestamp."""
+    rel = duckdb.sql(query)
+    date_cols = {c for c, t in zip(rel.columns, rel.types) if str(t).upper() == "DATE"}
+    if date_cols:
+        cols = ", ".join(
+            f'CAST({_ident(c)} AS VARCHAR) AS {_ident(c)}' if c in date_cols else _ident(c) for c in rel.columns
+        )
+        rel = rel.project(cols)
+    return rel.df()
+
+
 def _sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -256,12 +275,12 @@ def find_bronze_row(src: str, rec_id: str) -> pd.DataFrame:
     the raw JSON, e.g. a crash_record_id) scans every raw_value string, so it only
     runs when the exact match finds nothing.
     """
-    df = duckdb.sql(f"SELECT * FROM {src} WHERE kafka_key = '{rec_id}' LIMIT 1").df()
+    df = sql_df(f"SELECT * FROM {src} WHERE kafka_key = '{rec_id}' LIMIT 1")
     if len(df) == 0:
-        df = duckdb.sql(
+        df = sql_df(
             f"SELECT * FROM {src} "
             f"WHERE kafka_key LIKE '{rec_id}%' OR raw_value LIKE '%{rec_id}%' LIMIT 1"
-        ).df()
+        )
     return df
 
 TRACE_ALIASES = {"trace", "pipeline", "all", "compare", "lineage", "journey"}
@@ -563,10 +582,10 @@ def fetch_record_across_pipeline(rec_id: str, unpack_bronze: bool = True) -> Dic
 
     # Silver 1 first: it is small next to Bronze and tells us the branch
     try:
-        s1_df = duckdb.sql(
+        s1_df = sql_df(
             f"SELECT * FROM {src_of('silver1')} "
             f"WHERE record_id = '{rec_id}' OR record_id LIKE '{rec_id}%' OR crash_record_id = '{rec_id}' OR crash_record_id LIKE '{rec_id}%' LIMIT 1"
-        ).df()
+        )
         results['silver1'] = s1_df if len(s1_df) > 0 else None
     except Exception:
         results['silver1'] = None
@@ -586,46 +605,55 @@ def fetch_record_across_pipeline(rec_id: str, unpack_bronze: bool = True) -> Dic
 
     # Silver 2
     try:
-        s2_df = duckdb.sql(
+        s2_df = sql_df(
             f"SELECT * FROM {src_of('silver2')} "
             f"WHERE record_id = '{rec_id}' OR record_id LIKE '{rec_id}%' OR crash_record_id = '{rec_id}' OR crash_record_id LIKE '{rec_id}%' LIMIT 1"
-        ).df()
+        )
         results['silver2'] = s2_df if len(s2_df) > 0 else None
     except Exception:
         results['silver2'] = None
 
     # Silver 2 Quarantine
     try:
-        q_df = duckdb.sql(
+        q_df = sql_df(
             f"SELECT * FROM {src_of('quarantine')} "
             f"WHERE record_id = '{rec_id}' OR record_id LIKE '{rec_id}%' OR crash_record_id = '{rec_id}' OR crash_record_id LIKE '{rec_id}%' LIMIT 1"
-        ).df()
+        )
         results['quarantine'] = q_df if len(q_df) > 0 else None
     except Exception:
         results['quarantine'] = None
 
     # Gold
     try:
-        g_df = duckdb.sql(
+        g_df = sql_df(
             f"SELECT * FROM {src_of('gold')} "
             f"WHERE record_id = '{rec_id}' OR record_id LIKE '{rec_id}%' OR crash_record_id = '{rec_id}' OR crash_record_id LIKE '{rec_id}%' LIMIT 1"
-        ).df()
+        )
         results['gold'] = g_df if len(g_df) > 0 else None
     except Exception:
         results['gold'] = None
 
     # Fuzzy Audit
     try:
-        a_df = duckdb.sql(
+        a_df = sql_df(
             f"SELECT * FROM {src_of('audit')} "
             f"WHERE record_id = '{rec_id}' OR record_id LIKE '{rec_id}%' LIMIT 10"
-        ).df()
+        )
         results['audit'] = a_df if len(a_df) > 0 else None
     except Exception:
         results['audit'] = None
 
     SOURCE_FILTER = original_filter
     return results
+
+def _layer_value(row: Dict[str, Any], key: str, layer: str) -> str:
+    """A field's value in one layer, or '(not in <layer>)' when that layer leaves the
+    column out on purpose (Gold drops date_police_notified, street_no, ...), so the
+    trace does not show an empty cell that looks like lost data."""
+    if row and key not in row:
+        return f"(not in {layer})"
+    return str(row.get(key, "")).strip()
+
 
 def compute_layer_diffs(records: Dict[str, Optional[pd.DataFrame]]) -> List[Tuple[str, str, str, str, str]]:
     """Calculates fields that evolved or changed values across Bronze -> Silver1 -> Silver2 -> Gold."""
@@ -644,11 +672,11 @@ def compute_layer_diffs(records: Dict[str, Optional[pd.DataFrame]]) -> List[Tupl
             continue
         bv = str(b_row.get(k, "")).strip()
         s1v = str(s1_row.get(k, "")).strip()
-        s2v = str(s2_row.get(k, "")).strip()
-        gv = str(g_row.get(k, "")).strip()
+        s2v = _layer_value(s2_row, k, "Silver 2")
+        gv = _layer_value(g_row, k, "Gold")
 
-        # Compare valid distinct values
-        vals = [v for v in [bv, s1v, s2v, gv] if v not in ("", "None", "nan", "<NA>")]
+        # Compare valid distinct values (a column a layer leaves out is not a change)
+        vals = [v for v in [bv, s1v, s2v, gv] if v not in ("", "None", "nan", "<NA>") and not v.startswith("(not in ")]
         if len(set(vals)) > 1:
             diffs.append((k, bv, s1v, s2v, gv))
     return diffs
@@ -1365,7 +1393,7 @@ def main():
                     df = unpack_bronze_record(b_df) if not raw_bronze else b_df
             elif id_cols:
                 match = " OR ".join(f"{c} = '{active_id}' OR {c} LIKE '{active_id}%'" for c in id_cols)
-                res_df = duckdb.sql(f"SELECT * FROM {src} WHERE {match} LIMIT 1").df()
+                res_df = sql_df(f"SELECT * FROM {src} WHERE {match} LIMIT 1")
                 if len(res_df) > 0:
                     df = res_df
                 elif layer in ("silver2", "gold"):
@@ -1382,7 +1410,7 @@ def main():
                             f"WHERE record_id = '{active_id}' OR record_id LIKE '{active_id}%' "
                             f"OR crash_record_id = '{active_id}' OR crash_record_id LIKE '{active_id}%' LIMIT 1"
                         )
-                    quar_df = duckdb.sql(q_check).df() if q_check else pd.DataFrame()
+                    quar_df = sql_df(q_check) if q_check else pd.DataFrame()
                     if len(quar_df) > 0:
                         df = quar_df
                         quarantine_alert = True
@@ -1402,16 +1430,16 @@ def main():
             base_query = f"SELECT * FROM {src} {order_clause}"
 
             if mode == "schema":
-                df = duckdb.sql(f"SELECT * FROM {src} LIMIT 500").df()
+                df = sql_df(f"SELECT * FROM {src} LIMIT 500")
             elif show_all:
-                df = duckdb.sql(base_query).df()
+                df = sql_df(base_query)
             elif explicit_limit:
-                df = duckdb.sql(f"{base_query} LIMIT {limit}").df()
+                df = sql_df(f"{base_query} LIMIT {limit}")
             elif mode == "table":
-                df = duckdb.sql(f"{base_query} LIMIT 10").df()
+                df = sql_df(f"{base_query} LIMIT 10")
             else:
                 # Default preview 1 row
-                df = duckdb.sql(f"{base_query} LIMIT 1").df()
+                df = sql_df(f"{base_query} LIMIT 1")
                 if is_bronze and not raw_bronze:
                     df = unpack_bronze_record(df)
 
@@ -1466,7 +1494,7 @@ def main():
             if explicit_limit:
                 df_html = df
             elif not show_all:
-                df_html = duckdb.sql(f"SELECT * FROM {src} LIMIT 100").df()
+                df_html = sql_df(f"SELECT * FROM {src} LIMIT 100")
             else:
                 df_html = df
             html_path = generate_html_viewer(df_html, target_name, count, active_id=active_id if use_active_id else None)
