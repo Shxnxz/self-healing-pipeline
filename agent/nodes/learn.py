@@ -299,7 +299,7 @@ def learn(state: RecoveryState) -> dict:
                                                   added_by=f"recovery_agent:engineer:{promoted_by}",
                                                   source=f"recovery_agent:{incident_id}")
         memory.mark_promotion(driver, incident_id, promotion["status"], "; ".join(promotion["reasons"]),
-                              promoted_by=promoted_by)
+                              promoted_by=promoted_by, target=target)
 
     learned = {"status": STORED, "written": True, "incident_id": incident_id, "outcome": record["outcome"],
                "resolved_by": record["resolved_by"], "verified": record["verified"],

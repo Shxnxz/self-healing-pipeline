@@ -181,17 +181,24 @@ def write_incident(
 
 
 def mark_promotion(driver, incident_id: str, promotion: str, reason: str,
-                   promoted_by: Optional[str] = None) -> None:
+                   promoted_by: Optional[str] = None, target: Optional[dict] = None) -> None:
     """Record what promotion decided for an incident (agent/promotion.py): Learn's
-    decision, or an engineer's `agent.review promote` (promoted_by = their name)."""
+    decision, or an engineer's `agent.review promote` (promoted_by = their name).
+    `target` is the variant Validate checked ({column_name, raw_key, canonical_value},
+    Learn's overlay), kept so a later approval promotes exactly that mapping."""
+    target = target or {}
     driver.execute_query(
         """
         MATCH (i:Incident {incident_id: $incident_id})
         SET i.promotion = $promotion, i.promotion_reason = $reason, i.promotion_at = datetime(),
             i.promoted = ($promotion = 'PROMOTED' OR coalesce(i.promoted, false)),
-            i.promoted_by = coalesce($promoted_by, i.promoted_by)
+            i.promoted_by = coalesce($promoted_by, i.promoted_by),
+            i.promotion_column = coalesce($column, i.promotion_column),
+            i.promotion_raw = coalesce($raw, i.promotion_raw),
+            i.promotion_canonical = coalesce($canonical, i.promotion_canonical)
         """,
-        incident_id=incident_id, promotion=promotion, reason=reason, promoted_by=promoted_by)
+        incident_id=incident_id, promotion=promotion, reason=reason, promoted_by=promoted_by,
+        column=target.get("column_name"), raw=target.get("raw_key"), canonical=target.get("canonical_value"))
 
 
 def get_incident(driver, incident_id: str) -> Optional[dict]:
@@ -202,7 +209,9 @@ def get_incident(driver, incident_id: str) -> Optional[dict]:
         RETURN """ + _RETURN_FIELDS + """,
                i.verified AS verified, i.rows_affected AS rows_affected, i.batch_ids AS batch_ids,
                i.promotion AS promotion, i.promotion_reason AS promotion_reason,
-               i.promoted_by AS promoted_by, toString(i.resolved_at) AS resolved_at
+               i.promoted_by AS promoted_by, toString(i.resolved_at) AS resolved_at,
+               i.promotion_column AS promotion_column, i.promotion_raw AS promotion_raw,
+               i.promotion_canonical AS promotion_canonical
         """,
         incident_id=incident_id)
     if not records:
@@ -220,7 +229,9 @@ def awaiting_promotion(driver, statuses, limit: int = 200) -> list:
           AND i.action = 'ADD_VARIANT'
         RETURN """ + _RETURN_FIELDS + """,
                i.verified AS verified, i.rows_affected AS rows_affected, i.batch_ids AS batch_ids,
-               i.promotion AS promotion, toString(i.resolved_at) AS resolved_at
+               i.promotion AS promotion, toString(i.resolved_at) AS resolved_at,
+               i.promotion_column AS promotion_column, i.promotion_raw AS promotion_raw,
+               i.promotion_canonical AS promotion_canonical
         ORDER BY i.resolved_at DESC LIMIT $limit
         """,
         statuses=list(statuses), limit=limit)

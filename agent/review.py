@@ -214,19 +214,34 @@ def publish(message: dict) -> None:
 # Promotion of the agent's own fixes (EL2)
 # ----------------------------------------------------------------------------
 def _target(incident: dict) -> dict:
-    """(column, RAW, canonical) of an incident's validated ADD_VARIANT, as Learn
-    would have promoted it (agent/nodes/learn.py: _promotion_target)."""
+    """(column, RAW, canonical) of an incident's validated ADD_VARIANT: the variant
+    Validate checked, as Learn recorded it with its decision (promotion_column/_raw/
+    _canonical, from Remediate's overlay). Incidents Learn stored before it recorded
+    that fall back to the incident's own column, raw value and fix, which is the same
+    mapping for a value failure (the overlay key is the failure's raw value)."""
     params = incident.get("action_params") or {}
-    return {"column_name": incident.get("column_name"), "raw_key": promo.raw_key(incident.get("raw_value")),
-            "canonical_value": params.get("canonical_value") if isinstance(params, dict) else None}
+    return {"column_name": incident.get("promotion_column") or incident.get("column_name"),
+            "raw_key": incident.get("promotion_raw") or promo.raw_key(incident.get("raw_value")),
+            "canonical_value": incident.get("promotion_canonical")
+            or (params.get("canonical_value") if isinstance(params, dict) else None)}
 
 
-def _decide(driver, incident: dict) -> dict:
+def _variant(target: dict) -> tuple:
+    return target["column_name"], target["raw_key"], target["canonical_value"]
+
+
+def _decide(driver, incident: dict, mappings: Optional[dict] = None) -> dict:
+    """The promotion decision with an engineer's approval. `mappings` caches what the
+    reference table maps each (column, RAW) to, so one command reads each key once."""
     target = _target(incident)
     history = memory.signature_history(driver, incident.get("signature_key")
                                        or memory.signature_key(incident.get("table_name"), incident.get("column_name"),
                                                                incident.get("raw_value")))
-    existing = promo.current_mapping(target["column_name"], target["raw_key"]) if target["raw_key"] else None
+    key = (target["column_name"], target["raw_key"])
+    mappings = {} if mappings is None else mappings
+    if target["raw_key"] and key not in mappings:
+        mappings[key] = promo.current_mapping(*key)
+    existing = mappings.get(key)
     return promo.decide(
         incident={**target, "incident_id": incident.get("incident_id"), "action": incident.get("action"),
                   "action_params": incident.get("action_params"), "outcome": incident.get("outcome"),
@@ -239,14 +254,14 @@ def promotion_candidates(driver=None) -> List[dict]:
     value, canonical value) with every incident that made it and what an approval
     would do now."""
     driver = driver or memory.shared_driver()
-    variants = {}
+    variants, mappings = {}, {}
     for incident in memory.awaiting_promotion(driver, promo.PROMOTABLE):
         target = _target(incident)
-        key = (target["column_name"], target["raw_key"], target["canonical_value"])
+        key = _variant(target)
         if key not in variants:   # newest incident first: it stands for the variant
             variants[key] = {**target, "incident_id": incident.get("incident_id"),
                              "table_name": incident.get("table_name"), "incidents": [],
-                             "decision": _decide(driver, incident)}
+                             "decision": _decide(driver, incident, mappings)}
         variants[key]["incidents"].append(incident.get("incident_id"))
     return list(variants.values())
 
@@ -276,14 +291,24 @@ def promote_incident(incident_id: str, engineer: str, note: Optional[str] = None
     if decision["status"] == promo.NOT_APPLICABLE:
         sys.exit(f"Incident {incident_id} has nothing to promote: {'; '.join(decision['reasons'])}")
     reasons = list(decision["reasons"]) + [f"engineer {engineer}: {note}" if note else f"engineer {engineer}"]
+    target = _target(incident)
     if decision["status"] == promo.PROMOTED:
-        target = _target(incident)
         decision["inserted"] = promo.promote(target["column_name"], target["raw_key"], target["canonical_value"],
                                              added_by=f"recovery_agent:engineer:{engineer}",
                                              source=f"recovery_agent:{incident_id}")
-        memory.mark_promotion(driver, incident_id, promo.PROMOTED, "; ".join(reasons), promoted_by=engineer)
+        memory.mark_promotion(driver, incident_id, promo.PROMOTED, "; ".join(reasons), promoted_by=engineer,
+                              target=target)
     else:   # ALREADY_IN_TABLE or BLOCKED: recorded, so it leaves the list
-        memory.mark_promotion(driver, incident_id, decision["status"], "; ".join(reasons))
+        memory.mark_promotion(driver, incident_id, decision["status"], "; ".join(reasons), target=target)
+    # Every other incident that made the same variant is decided with it, so the
+    # variant leaves `promotions` at once instead of resurfacing under the next one.
+    sibling_status = promo.ALREADY_IN_TABLE if decision["status"] == promo.PROMOTED else decision["status"]
+    siblings = [i["incident_id"] for i in memory.awaiting_promotion(driver, promo.PROMOTABLE)
+                if i.get("incident_id") != incident_id and _variant(_target(i)) == _variant(target)]
+    for other in siblings:
+        memory.mark_promotion(driver, other, sibling_status,
+                              f"decided with incident {incident_id}: " + "; ".join(reasons))
+    decision["siblings"] = siblings
     return decision
 
 
@@ -317,7 +342,10 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "promotions":
-        candidates = promotion_candidates()
+        try:
+            candidates = promotion_candidates()
+        except Exception as exc:   # Neo4j or the reference table unreachable
+            sys.exit(f"Could not read the promotions: {type(exc).__name__}: {exc}")
         print(f"{len(candidates)} variant(s) waiting for an engineer to approve their promotion")
         for candidate in candidates:
             print(promotion_line(candidate))
@@ -327,7 +355,10 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
     if args.command == "promote":
         if not (args.by or "").strip():
             sys.exit("Say who approves: --by NAME (or set ENGINEER_NAME)")
-        decision = promote_incident(args.incident_id, args.by.strip(), args.note)
+        try:
+            decision = promote_incident(args.incident_id, args.by.strip(), args.note)
+        except Exception as exc:   # Neo4j or the reference table unreachable: running it again is safe
+            sys.exit(f"Not promoted: {type(exc).__name__}: {exc}")
         if decision["status"] == promo.PROMOTED:
             print(f"Promoted {decision['column']}: {decision['raw_value']!r} -> {decision['canonical_value']} "
                   f"into ref_canonical_mappings" + ("" if decision.get("inserted") else " (the row was there already)")

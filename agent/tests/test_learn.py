@@ -467,11 +467,9 @@ def test_an_engineer_promotes_a_fix_the_agent_made(memory, capsys):
     assert stored["promotion"] == "PROMOTED" and stored["promoted"] is True and stored["promoted_by"] == "thay"
     assert "engineer thay: every crash_date is in July" in stored["promotion_reason"]
 
-    # f7 made the same variant: it is in the table now, so it leaves the list
-    review.main(["promotions"])
-    assert "1 variant(s)" in capsys.readouterr().out   # f7 still marked AWAITING_APPROVAL...
-    review.main(["promote", "f7", "--by", "thay"])
-    assert "Not promoted (ALREADY_IN_TABLE)" in capsys.readouterr().out
+    # f7 made the same variant: it was decided with f8, so the list is empty at once
+    assert memory.incidents["f7"]["promotion"] == "ALREADY_IN_TABLE"
+    assert "decided with incident f8" in memory.incidents["f7"]["promotion_reason"]
     review.main(["promotions"])
     assert "0 variant(s)" in capsys.readouterr().out
     with pytest.raises(SystemExit, match="promoted already"):
@@ -495,6 +493,34 @@ def test_an_ambiguous_value_cannot_be_promoted_even_by_an_engineer(memory, capsy
     review.main(["promote", "f7", "--by", "thay"])
     assert "Not promoted (BLOCKED)" in capsys.readouterr().out
     assert memory.mappings == {} and memory.incidents["f7"]["promotion"] == "BLOCKED"
+
+
+def test_promote_writes_the_variant_validate_checked(memory):
+    """Learn records the overlay it promoted from; `promote` uses that, not the raw value."""
+    from agent import review
+
+    graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
+    stored = memory.incidents["f7"]
+    assert (stored["promotion_column"], stored["promotion_raw"], stored["promotion_canonical"]) == \
+        ("crash_month", "JULE", "JULY")
+    stored.update(raw_value="jule (as the failure named it)")   # differs from the overlay key
+    review.main(["promote", "f7", "--by", "thay"])
+    assert memory.mappings == {("crash_month", "JULE"): "JULY"}
+
+
+def test_promote_reports_an_unreadable_table_without_a_traceback(memory, monkeypatch):
+    from agent import review
+
+    graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
+
+    def unreadable(column, raw, path=None):
+        raise OSError("ref_canonical_mappings: no such table")
+
+    monkeypatch.setattr(promotion, "current_mapping", unreadable)
+    with pytest.raises(SystemExit, match="Could not read the promotions: OSError"):
+        review.main(["promotions"])
+    with pytest.raises(SystemExit, match="Not promoted: OSError"):
+        review.main(["promote", "f7", "--by", "thay"])
 
 
 def test_promote_needs_a_name_and_a_known_fix(memory, monkeypatch):

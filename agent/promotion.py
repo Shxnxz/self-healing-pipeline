@@ -95,9 +95,10 @@ def counts(history: Iterable[dict], canonical: str) -> dict:
 
 
 def _ambiguity(history: Iterable[dict], canonical: str, incident_id: str) -> Tuple[List[str], List[str]]:
-    """(conflicts, doubts). A conflict blocks every promotion: the value has been fixed
-    to something else. A doubt blocks only the automatic one; an engineer who approves
-    this very fix after it failed once, or was declined once, overrides it (EL2)."""
+    """(conflicts, doubts). A conflict blocks every promotion, approved or not: the value
+    has been fixed to something else. A doubt (this fix failed Validate once, or an
+    engineer declined promoting it) is only listed for the engineer, whose approval
+    overrides it (EL2)."""
     conflicts, doubts = [], []
     for inc in history:
         if inc.get("incident_id") == incident_id or inc.get("action") != actions.ADD_VARIANT:

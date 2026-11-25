@@ -124,9 +124,12 @@ def test_fixes_awaiting_promotion_and_the_engineers_approval(driver):
     assert old["action_params"] == {"canonical_value": "JULY"} and old["borrowed"] is True
     assert old["verified"] is True and old["signature_key"] == "silver2|crash_month|JULE"
 
-    incidents.mark_promotion(driver, PREFIX + "wait", "PROMOTED", "approved", promoted_by="thay")
+    incidents.mark_promotion(driver, PREFIX + "wait", "PROMOTED", "approved", promoted_by="thay",
+                             target={"column_name": "crash_month", "raw_key": "JULE", "canonical_value": "JULY"})
     got = incidents.get_incident(driver, PREFIX + "wait")
     assert got["promotion"] == "PROMOTED" and got["promoted_by"] == "thay" and got["outcome"] == "SUCCESS"
+    assert (got["promotion_column"], got["promotion_raw"], got["promotion_canonical"]) == \
+        ("crash_month", "JULE", "JULY")
     assert got["raw_value"] == "Jule" and got["rows_affected"] == 4 and got["batch_ids"] == ["silver2_crash1:7"]
     incidents.mark_promotion(driver, PREFIX + "wait", "ALREADY_IN_TABLE", "again")   # keeps who promoted it
     assert incidents.get_incident(driver, PREFIX + "wait")["promoted_by"] == "thay"

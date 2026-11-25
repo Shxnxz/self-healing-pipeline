@@ -588,7 +588,9 @@ reaches quarantine. The decision is in `learned.promotion` = `{status: PROMOTED 
 ALREADY_IN_TABLE | AWAITING_APPROVAL | BLOCKED | DECLINED | NOT_APPLICABLE, route:
 ENGINEER_APPROVED or null, reasons, occurrences, batches, inserted}` (`occurrences` and
 `batches` are the rows and micro-batches the same fix healed so far, shown as evidence)
-and on the incident (`promotion`, `promotion_reason`, `promoted`, `promoted_by`).
+and on the incident (`promotion`, `promotion_reason`, `promoted`, `promoted_by`, and the
+variant Validate checked: `promotion_column`, `promotion_raw`, `promotion_canonical`,
+which is what a later `promote` writes).
 
 **Approving the promotion of an agent fix** (`agent/review.py`):
 
@@ -603,8 +605,9 @@ canonical value, the rows and batches the fix healed, the incidents that made it
 what `promote` would do now (promote, already in the table, or why it cannot). `promote`
 runs the same decision with the engineer's approval, writes the variant with the same
 MERGE as Learn (`added_by = recovery_agent:engineer:<name>`) and marks the incident
-`PROMOTED` with `promoted_by` and the note. A conflict still refuses it (`BLOCKED` is
-recorded, so it leaves the list). It works on finished workflows, directly against Neo4j
+`PROMOTED` with `promoted_by` and the note. Every other waiting incident of the same
+variant is marked with it (`ALREADY_IN_TABLE`), so the variant leaves the list at once.
+A conflict still refuses it (`BLOCKED` is recorded on all of them, so it leaves the list). It works on finished workflows, directly against Neo4j
 and the reference table (no Kafka), so the agent container's writable mount of
 `ref_canonical_mappings` is what it uses.
 
