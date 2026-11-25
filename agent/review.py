@@ -8,10 +8,20 @@
   docker compose exec recovery-agent python -m agent.review resolved <failure_id> --by NAME --note "what you did"
   docker compose exec recovery-agent python -m agent.review dismiss  <failure_id> --by NAME --note "why"
 
+  docker compose exec recovery-agent python -m agent.review promotions                       # fixes awaiting promotion
+  docker compose exec recovery-agent python -m agent.review promote <incident_id> --by NAME [--note ...]
+
 `--by` can be left out when ENGINEER_NAME is set. The decision is checked here
 against the saved case, then published to Kafka `recovery.decisions`; the agent
 checks it again and resumes the workflow (see its log). This tool only reads the
 checkpoints, it never runs a workflow itself, so only the agent writes them.
+
+`promotions` and `promote` are about finished workflows, not open cases. A variant
+joins ref_canonical_mappings only when an engineer approves it (spec EL2): an
+engineer's own fix (`approve`, `fix`) is promoted by Learn at once, and a fix the
+agent made on its own waits in Neo4j (promotion AWAITING_APPROVAL) until an engineer
+promotes it here. `promote` writes the variant itself (the same insert-only Delta
+MERGE as Learn) and records the approval on the incident.
 """
 import argparse
 import json
@@ -22,7 +32,9 @@ from typing import List, Optional
 
 from agent import config
 from agent import escalation as esc
+from agent import promotion as promo
 from agent.consumer import is_waiting, pending_refusal
+from agent.memory import incidents as memory
 
 
 def thread(failure_id: str) -> dict:
@@ -198,6 +210,83 @@ def publish(message: dict) -> None:
         sys.exit(f"Could not send the decision to {config.DECISIONS_TOPIC}: {errors or 'timed out'}")
 
 
+# ----------------------------------------------------------------------------
+# Promotion of the agent's own fixes (EL2)
+# ----------------------------------------------------------------------------
+def _target(incident: dict) -> dict:
+    """(column, RAW, canonical) of an incident's validated ADD_VARIANT, as Learn
+    would have promoted it (agent/nodes/learn.py: _promotion_target)."""
+    params = incident.get("action_params") or {}
+    return {"column_name": incident.get("column_name"), "raw_key": promo.raw_key(incident.get("raw_value")),
+            "canonical_value": params.get("canonical_value") if isinstance(params, dict) else None}
+
+
+def _decide(driver, incident: dict) -> dict:
+    target = _target(incident)
+    history = memory.signature_history(driver, incident.get("signature_key")
+                                       or memory.signature_key(incident.get("table_name"), incident.get("column_name"),
+                                                               incident.get("raw_value")))
+    existing = promo.current_mapping(target["column_name"], target["raw_key"]) if target["raw_key"] else None
+    return promo.decide(
+        incident={**target, "incident_id": incident.get("incident_id"), "action": incident.get("action"),
+                  "action_params": incident.get("action_params"), "outcome": incident.get("outcome"),
+                  "verified": incident.get("verified"), "borrowed": incident.get("borrowed")},
+        history=history, existing=existing, engineer_approved=True)
+
+
+def promotion_candidates(driver=None) -> List[dict]:
+    """Validated agent fixes waiting for an engineer, one line per variant (column, raw
+    value, canonical value) with every incident that made it and what an approval
+    would do now."""
+    driver = driver or memory.shared_driver()
+    variants = {}
+    for incident in memory.awaiting_promotion(driver, promo.PROMOTABLE):
+        target = _target(incident)
+        key = (target["column_name"], target["raw_key"], target["canonical_value"])
+        if key not in variants:   # newest incident first: it stands for the variant
+            variants[key] = {**target, "incident_id": incident.get("incident_id"),
+                             "table_name": incident.get("table_name"), "incidents": [],
+                             "decision": _decide(driver, incident)}
+        variants[key]["incidents"].append(incident.get("incident_id"))
+    return list(variants.values())
+
+
+def promotion_line(candidate: dict) -> str:
+    decision = candidate["decision"]
+    status = decision["status"]
+    what = ("promote" if status == promo.PROMOTED else
+            "already in the table" if status == promo.ALREADY_IN_TABLE else f"cannot: {'; '.join(decision['reasons'])}")
+    doubts = f" doubts: {'; '.join(decision['overridden'])}" if decision.get("overridden") else ""
+    return (f"{candidate['incident_id']:<18} {candidate['column_name']}: {candidate['raw_key']!r} -> "
+            f"{candidate['canonical_value']}  healed {decision.get('occurrences', 0)} row(s) in "
+            f"{decision.get('batches', 0)} batch(es), {len(candidate['incidents'])} incident(s)  [{what}]{doubts}")
+
+
+def promote_incident(incident_id: str, engineer: str, note: Optional[str] = None, driver=None) -> dict:
+    """An engineer approves promoting a validated fix of the agent (EL2). Returns the
+    promotion decision; exits when there is nothing to promote."""
+    driver = driver or memory.shared_driver()
+    incident = memory.get_incident(driver, incident_id)
+    if not incident:
+        sys.exit(f"No incident {incident_id} in Neo4j (see `python -m agent.review promotions`)")
+    if incident.get("promotion") == promo.PROMOTED:
+        sys.exit(f"Incident {incident_id} is promoted already"
+                 + (f" (by {incident['promoted_by']})" if incident.get("promoted_by") else ""))
+    decision = _decide(driver, incident)
+    if decision["status"] == promo.NOT_APPLICABLE:
+        sys.exit(f"Incident {incident_id} has nothing to promote: {'; '.join(decision['reasons'])}")
+    reasons = list(decision["reasons"]) + [f"engineer {engineer}: {note}" if note else f"engineer {engineer}"]
+    if decision["status"] == promo.PROMOTED:
+        target = _target(incident)
+        decision["inserted"] = promo.promote(target["column_name"], target["raw_key"], target["canonical_value"],
+                                             added_by=f"recovery_agent:engineer:{engineer}",
+                                             source=f"recovery_agent:{incident_id}")
+        memory.mark_promotion(driver, incident_id, promo.PROMOTED, "; ".join(reasons), promoted_by=engineer)
+    else:   # ALREADY_IN_TABLE or BLOCKED: recorded, so it leaves the list
+        memory.mark_promotion(driver, incident_id, decision["status"], "; ".join(reasons))
+    return decision
+
+
 def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
     parser = argparse.ArgumentParser(prog="python -m agent.review", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command")
@@ -220,7 +309,34 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
         if name in ("approve", "fix"):
             cmd.add_argument("--no-promote", dest="promote", action="store_false",
                              help="heal these records only; do not add the variant to ref_canonical_mappings")
+    sub.add_parser("promotions", help="validated fixes of the agent waiting for an engineer to promote them")
+    prom = sub.add_parser("promote", help="add the variant of a validated fix to ref_canonical_mappings")
+    prom.add_argument("incident_id", help="from `promotions` (the workflow's failure_id)")
+    prom.add_argument("--by", default=os.environ.get("ENGINEER_NAME"), help="your name (or ENGINEER_NAME)")
+    prom.add_argument("--note", help="why it is right (stored on the incident)")
     args = parser.parse_args(argv)
+
+    if args.command == "promotions":
+        candidates = promotion_candidates()
+        print(f"{len(candidates)} variant(s) waiting for an engineer to approve their promotion")
+        for candidate in candidates:
+            print(promotion_line(candidate))
+        if candidates:
+            print("Promote one with: python -m agent.review promote <incident_id> --by NAME")
+        return
+    if args.command == "promote":
+        if not (args.by or "").strip():
+            sys.exit("Say who approves: --by NAME (or set ENGINEER_NAME)")
+        decision = promote_incident(args.incident_id, args.by.strip(), args.note)
+        if decision["status"] == promo.PROMOTED:
+            print(f"Promoted {decision['column']}: {decision['raw_value']!r} -> {decision['canonical_value']} "
+                  f"into ref_canonical_mappings" + ("" if decision.get("inserted") else " (the row was there already)")
+                  + ". Silver 2 maps it from its next micro-batch; quarantined rows that still wait for it "
+                    "are released with the replay tool (`python -m tools.replay quarantine`, tools/README.md).")
+        else:
+            print(f"Not promoted ({decision['status']}): {'; '.join(decision['reasons'])}")
+        return
+
     graph = graph or open_graph()
 
     if args.command in (None, "list"):

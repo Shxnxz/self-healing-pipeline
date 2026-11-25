@@ -16,7 +16,7 @@ def test_reused_fix_without_the_model():
         "execution": {"status": "SUCCESS", "execution_id": "e1", "executed_at": "t2"},
         "validation": {"status": "PASSED", "rows_released": 4, "validated_at": "t3"},
         "learned": {"status": "STORED", "outcome": "SUCCESS", "resolved_by": "LOOKUP",
-                    "promotion": {"status": "PROMOTED", "route": "RECURRENCE"}, "learned_at": "t4"},
+                    "promotion": {"status": "PROMOTED", "route": "ENGINEER_APPROVED"}, "learned_at": "t4"},
         "trace": _trace("deterministic_lookup", "remediate", "validate", "learn"),
     }
     s = summarize(state, [])

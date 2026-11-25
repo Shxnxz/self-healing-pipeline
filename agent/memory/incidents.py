@@ -180,15 +180,51 @@ def write_incident(
     return incident_id
 
 
-def mark_promotion(driver, incident_id: str, promotion: str, reason: str) -> None:
-    """Record what Learn's promotion decided for an incident (agent/promotion.py)."""
+def mark_promotion(driver, incident_id: str, promotion: str, reason: str,
+                   promoted_by: Optional[str] = None) -> None:
+    """Record what promotion decided for an incident (agent/promotion.py): Learn's
+    decision, or an engineer's `agent.review promote` (promoted_by = their name)."""
     driver.execute_query(
         """
         MATCH (i:Incident {incident_id: $incident_id})
         SET i.promotion = $promotion, i.promotion_reason = $reason, i.promotion_at = datetime(),
-            i.promoted = ($promotion = 'PROMOTED' OR coalesce(i.promoted, false))
+            i.promoted = ($promotion = 'PROMOTED' OR coalesce(i.promoted, false)),
+            i.promoted_by = coalesce($promoted_by, i.promoted_by)
         """,
-        incident_id=incident_id, promotion=promotion, reason=reason)
+        incident_id=incident_id, promotion=promotion, reason=reason, promoted_by=promoted_by)
+
+
+def get_incident(driver, incident_id: str) -> Optional[dict]:
+    """One incident with what promotion needs, or None (agent.review promote)."""
+    records, _, _ = driver.execute_query(
+        """
+        MATCH (i:Incident {incident_id: $incident_id})
+        RETURN """ + _RETURN_FIELDS + """,
+               i.verified AS verified, i.rows_affected AS rows_affected, i.batch_ids AS batch_ids,
+               i.promotion AS promotion, i.promotion_reason AS promotion_reason,
+               i.promoted_by AS promoted_by, toString(i.resolved_at) AS resolved_at
+        """,
+        incident_id=incident_id)
+    if not records:
+        return None
+    return {**records[0].data(), "action_params": _params(records[0]["action_params"])}
+
+
+def awaiting_promotion(driver, statuses, limit: int = 200) -> list:
+    """Validated agent fixes that wait for an engineer to approve their promotion
+    (promotion in `statuses`), newest first (agent.review promotions)."""
+    records, _, _ = driver.execute_query(
+        """
+        MATCH (i:Incident)
+        WHERE i.promotion IN $statuses AND i.outcome = 'SUCCESS' AND i.verified = true
+          AND i.action = 'ADD_VARIANT'
+        RETURN """ + _RETURN_FIELDS + """,
+               i.verified AS verified, i.rows_affected AS rows_affected, i.batch_ids AS batch_ids,
+               i.promotion AS promotion, toString(i.resolved_at) AS resolved_at
+        ORDER BY i.resolved_at DESC LIMIT $limit
+        """,
+        statuses=list(statuses), limit=limit)
+    return [{**r.data(), "action_params": _params(r["action_params"])} for r in records]
 
 
 def signature_history(driver, key: str) -> list:

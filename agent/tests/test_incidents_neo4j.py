@@ -109,6 +109,30 @@ def test_history_and_promotion_marks(driver):
     assert records[0]["p"] is True and records[0]["s"] == "PROMOTED"
 
 
+def test_fixes_awaiting_promotion_and_the_engineers_approval(driver):
+    """agent.review promotions / promote read and mark incidents with these."""
+    write(driver, "wait")
+    write(driver, "old", borrowed=True)
+    write(driver, "failed", outcome="FAILED_VALIDATION")
+    incidents.mark_promotion(driver, PREFIX + "wait", "AWAITING_APPROVAL", "an engineer must approve")
+    incidents.mark_promotion(driver, PREFIX + "old", "BELOW_THRESHOLD", "old recurrence rule")
+    incidents.mark_promotion(driver, PREFIX + "failed", "AWAITING_APPROVAL", "never listed: not verified")
+    listed = [i for i in incidents.awaiting_promotion(driver, ("AWAITING_APPROVAL", "BELOW_THRESHOLD"))
+              if i["incident_id"].startswith(PREFIX)]
+    assert sorted(i["incident_id"] for i in listed) == [PREFIX + "old", PREFIX + "wait"]
+    old = next(i for i in listed if i["incident_id"] == PREFIX + "old")
+    assert old["action_params"] == {"canonical_value": "JULY"} and old["borrowed"] is True
+    assert old["verified"] is True and old["signature_key"] == "silver2|crash_month|JULE"
+
+    incidents.mark_promotion(driver, PREFIX + "wait", "PROMOTED", "approved", promoted_by="thay")
+    got = incidents.get_incident(driver, PREFIX + "wait")
+    assert got["promotion"] == "PROMOTED" and got["promoted_by"] == "thay" and got["outcome"] == "SUCCESS"
+    assert got["raw_value"] == "Jule" and got["rows_affected"] == 4 and got["batch_ids"] == ["silver2_crash1:7"]
+    incidents.mark_promotion(driver, PREFIX + "wait", "ALREADY_IN_TABLE", "again")   # keeps who promoted it
+    assert incidents.get_incident(driver, PREFIX + "wait")["promoted_by"] == "thay"
+    assert incidents.get_incident(driver, PREFIX + "missing") is None
+
+
 def test_the_lookup_reads_what_learn_wrote(driver):
     """lookup/patterns.py on the incidents Learn stores: exact, with `borrowed` carried."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lookup"))
@@ -137,5 +161,5 @@ def test_a_workflow_stores_its_incident_in_neo4j(driver, monkeypatch):
     records, _, _ = driver.execute_query(
         "MATCH (i:Incident {incident_id: $id}) RETURN i.outcome AS o, i.resolved_by AS r, i.promotion AS p, "
         "i.fix_source AS s, i.borrowed AS b", id=PREFIX + "wf")
-    assert dict(records[0]) == {"o": "SUCCESS", "r": "LLM", "p": "BELOW_THRESHOLD", "s": "DIAGNOSIS", "b": False}
+    assert dict(records[0]) == {"o": "SUCCESS", "r": "LLM", "p": "AWAITING_APPROVAL", "s": "DIAGNOSIS", "b": False}
     assert hit is not None

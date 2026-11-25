@@ -112,7 +112,7 @@ def test_approved_fix_stages_every_attached_batch(monkeypatch):
     assert sorted(staged) == sorted([f"7-r{n}" for n in range(3)] + [f"8-r{n}" for n in range(4)])
     assert out["validation"]["rows_released"] == 7
     # A new batch after the workflow ended starts its own workflow (it reuses the fix
-    # from memory then, and counts towards promotion by recurrence).
+    # from memory then).
     index.note("f1")
     (late,) = process_lookup(g, lookup_message(batch_item("f3", "9", 2)), open_workflows=index)
     assert late["delivery"] == "new"
