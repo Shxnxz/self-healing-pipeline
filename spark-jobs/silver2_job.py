@@ -91,6 +91,9 @@ SILVER1_SKIP_CHANGE_COMMITS = (
 # try_to_timestamp / array_compact need Spark 3.4+
 MIN_SPARK_VERSION = (3, 4)
 
+# crash_date before this year fails (and quarantines the record).
+MIN_CRASH_YEAR = int(os.environ.get("MIN_CRASH_YEAR", "1900"))
+
 # Injury counts, typed INT in Silver 2 (see standardize_silver2).
 INJURY_COLUMNS = (
     "injuries_total",
@@ -228,7 +231,12 @@ def standardize_silver2(
     parsed_crash_date = F.coalesce(
         *[F.to_date(_try_ts("crash_date", fmt)) for fmt in date_formats(day_first)]
     )
-    std_crash_date = F.date_format(parsed_crash_date, "yyyy-MM-dd")
+    # A year before MIN_CRASH_YEAR is a typo (1017 for 2017): quarantined, since Gold
+    # cannot write a date before 1582 to Parquet (WRITE_ANCIENT_DATETIME).
+    std_crash_date = F.when(
+        F.year(parsed_crash_date) >= MIN_CRASH_YEAR,
+        F.date_format(parsed_crash_date, "yyyy-MM-dd"),
+    )
 
     # 2. Native Timestamp Parsing Chain for date_police_notified
     parsed_police_ts = F.coalesce(

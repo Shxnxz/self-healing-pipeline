@@ -89,7 +89,9 @@ SELECT
     source_table,
 
     -- When
-    CAST(crash_date AS DATE) AS crash_date,
+    -- NULL for a year before 1900 that reached Silver 2 before Silver 2 quarantined
+    -- those (1017 for 2017): Parquet cannot take a date before 1582.
+    CASE WHEN CAST(crash_date AS DATE) >= DATE '1900-01-01' THEN CAST(crash_date AS DATE) END AS crash_date,
     CAST(CAST(crash_hour AS DOUBLE) AS INT) AS crash_hour,
     crash_day_of_week,
     crash_month,

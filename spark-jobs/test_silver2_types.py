@@ -91,6 +91,12 @@ def run():
         assert fig.columns_to_remediate == {}, fig.columns_to_remediate
         print("  Figure 8 record: crash_hour 9, num_units 2, injuries 0/1 as INT: OK")
 
+        # A 1017 typo for 2017 is quarantined (Gold could not write it to Parquet)
+        typo = _silver1_rows(spark, 1).limit(1).withColumn("crash_date", F.lit("1017-06-24"))
+        typo = silver2_job.standardize_silver2(typo, mappings, day_first=False).first()
+        assert typo.crash_date is None and typo.columns_to_remediate.get("crash_date") == "1017-06-24", typo
+        print("  crash_date 1017-06-24 quarantined: OK")
+
         # 2. Old tables, Gold streaming from them, then the upgrade
         valid = std.filter(F.size("columns_to_remediate") == 0)
         failed = std.filter(F.size("columns_to_remediate") > 0)
@@ -114,8 +120,9 @@ def run():
         n_first = first.count()
         assert spark.read.format("delta").load(gold_job.GOLD_PATH).count() == n_first
 
-        # One row reached Silver 2 after Gold stopped: the upgrade adds it to Gold
-        straggler = later.filter(F.col("record_id") == ids[-1])
+        # One row reached Silver 2 after Gold stopped: the upgrade adds it to Gold. It
+        # has a 1017 crash_date, as one old Crash4 row on a real laptop does.
+        straggler = later.filter(F.col("record_id") == ids[-1]).withColumn("crash_date", F.lit("1017-06-24"))
         _old_types(straggler.select(*s2_cols)).write.format("delta").mode("append").save(silver2_path)
         later = later.filter(F.col("record_id") != ids[-1])
         n_first += 1
@@ -131,6 +138,8 @@ def run():
         assert set(plan["silver2_crash4"]) == set(silver2_job.INT_COLUMNS), plan
         assert set(plan["silver2_quarantine"]) == set(silver2_job.INT_COLUMNS), plan
         assert upgrade_silver2_types.upgrade(spark, ["crash4"]) == {}  # once only
+        assert spark.read.format("delta").load(gold_job.GOLD_PATH).filter(
+            F.col("record_id") == ids[-1]).first().crash_date is None  # 1017: no date in Gold
         assert spark.read.format("delta").load(gold_job.GOLD_PATH).count() == n_first
         s2 = spark.read.format("delta").load(silver2_path)
         assert s2.count() == n_first
