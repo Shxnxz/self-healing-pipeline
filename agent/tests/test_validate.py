@@ -251,3 +251,13 @@ def test_spark_failing_raises_so_the_graph_retries_the_step(audited):
 def test_the_replay_only_runs_on_a_silver2_table_and_a_standardized_column(table, column, overlay, message):
     with pytest.raises(ReplayError, match=message):
         replay_group(table, ["r1"], column, overlay)   # the real one: it refuses before starting Spark
+
+
+def test_same_compares_numbers_as_numbers():
+    # Silver 2 stores num_units as INT 2; the reference table writes the canonical 2.0
+    assert validation._same("2", "2.0")
+    assert validation._same(2, "2.0")
+    assert not validation._same("3", "2.0")
+    assert validation._same(True, "TRUE")
+    assert validation._same("june", "JUNE")
+    assert not validation._same(None, "2.0")

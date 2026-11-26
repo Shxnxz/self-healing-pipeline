@@ -102,6 +102,10 @@ jobs:
       - name: Per-source pipeline (Bronze to Gold on real Delta tables)
         working-directory: spark-jobs
         run: python -m pytest -rs test_per_source_pipeline.py
+      # Its own process: it sets DELTA_ROOT and SOURCES before importing the jobs.
+      - name: Silver 2 INT columns and the one-off upgrade of old tables
+        working-directory: spark-jobs
+        run: python -m pytest -rs test_silver2_types.py
       # Task 111 (PR #38). Its own process: it sets DELTA_ROOT and SOURCES before importing
       # the jobs. Skipped until the file is in the branch.
       - name: Gold derived fields and business metrics

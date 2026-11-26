@@ -33,6 +33,13 @@ is exempt, so a run with `SOURCES=crash4` needs no change). Day-first sources ar
 strict (a value like `02/24/2021` goes to quarantine); month-first sources still fall
 back to day first for values like `25/12/2021`.
 
+Silver 2 stores `crash_hour` (0-23), `num_units` and the injury counts as whole
+numbers (INT); the sources write them as `09 AM`, `2 units`, `0.0`. Tables written
+before that (with `09.00`, `2.0`, `0.0`) are converted once, in place, with no
+reprocessing: stop the stack, run
+`docker compose run --rm silver2-gold-job python upgrade_silver2_types.py`, and start
+it again (Silver 2 refuses to start on an old table and prints that command).
+
 Records that Silver 2 cannot standardize wait in `silver2_quarantine` instead of
 reaching Gold. The self-healing half picks them up from there:
 
@@ -153,7 +160,8 @@ To stop: `docker compose down`. To wipe all state and start clean:
 - **`spark-jobs/silver1_job.py`** — Bronze → Silver 1. Unpacks JSON envelope and
   provides `SILVER1_TRANSFORM_SQL` for formatting and cleaning.
 - **`spark-jobs/silver2_job.py`** — Silver 1 → Silver 2. Provides
-  `SILVER2_TRANSFORM_SQL` for data standardization.
+  `SILVER2_TRANSFORM_SQL` for data standardization. `upgrade_silver2_types.py` converts
+  tables written before the INT columns.
 - **`spark-jobs/gold_job.py`** — Silver 2 → Gold. Provides
   `GOLD_TRANSFORM_SQL` for business-ready fields; `gold_metrics.py` builds the `gold_*`
   aggregate tables on it ([docs/gold-metrics.md](docs/gold-metrics.md)).

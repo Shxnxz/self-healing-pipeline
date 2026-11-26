@@ -58,8 +58,17 @@ def _ids(ids, limit: int = EXAMPLES) -> str:
 
 def _same(value, canonical: str) -> bool:
     """A standardized value against a canonical value. Silver 2 casts some columns
-    (hit_and_run_i to boolean, num_units to decimal), so compare their text."""
-    return value is not None and str(value).strip().upper() == str(canonical).strip().upper()
+    (hit_and_run_i to boolean, num_units to INT), so compare their text, and numbers
+    as numbers: the reference table writes num_units as '2.0', Silver 2 stores 2."""
+    if value is None:
+        return False
+    a, b = str(value).strip().upper(), str(canonical).strip().upper()
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
 
 
 def _parse(text) -> Optional[date]:
