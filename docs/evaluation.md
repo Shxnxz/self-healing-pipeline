@@ -47,8 +47,9 @@ not change what it measures:
    clean sample of 2000 rows each of Crash1 and Crash3. Nothing it learns reaches the
    real pipeline.
 2. **A fixed scenario.** `data/faults/evaluation.json`: 50 records, 11 faults, one fixed
-   value each so each becomes one recovery case, spread over 3 micro-batches where the
-   promotion rule (5 rows in 3 batches) should be reachable:
+   value each so each becomes one recovery case, spread over 3 micro-batches (a value
+   that recurs in later batches is reused from memory; it is promoted into
+   `ref_canonical_mappings` only with an engineer's approval):
 
    | Fault | Records | Right outcome |
    |---|---|---|
@@ -175,7 +176,10 @@ else matches `cloud-1`.
   `qwen3:8b` (`agent.check_model` first). That adds the autonomous diagnosis path: the
   gate's pass rate, how often a passed proposal is right (`policy_gate.passed_right`),
   how often a right proposal is stopped (thresholds 0.85 and 0.95 are still
-  uncalibrated), and MTTR without an engineer.
+  uncalibrated), and MTTR without an engineer. A fix the model made is not promoted
+  (EL2: only with an engineer's approval), so in round 2 its value is quarantined again
+  and reused from memory; the report counts such fixes as "awaiting an engineer's
+  promotion" (`python -m agent.review promotions`).
 - **Schema changes.** The renamed column was detected (dead letter) but not recovered:
   that path needs Qwen's classification (`QWEN_ENABLED=true`, `QWEN_KAFKA_ENABLED=true`)
   and an engineer's `tools.replay` with `--rename` (docs/demo.md).

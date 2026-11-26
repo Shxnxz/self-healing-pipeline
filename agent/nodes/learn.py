@@ -28,14 +28,16 @@ promotes.
    source and how the lookup matched it, approved_by, the engineer's note and
    `borrowed`. A fix the lookup borrowed from a similar incident (or from one whose fix
    was itself borrowed) that no engineer approved is stored with borrowed = true, so a
-   later exact match on it still asks for approval on P1 (deterministic_lookup.py) and
-   it never counts towards promotion. Approved by an engineer, it is not borrowed.
+   later exact match on it still asks for approval when APPROVE_BORROWED_FIX_TIERS
+   lists the tier (deterministic_lookup.py). Approved by an engineer, it is not
+   borrowed.
    The incident is embedded with the lookup's model and text when LOOKUP_EMBED_MODEL is
    set; if the model cannot be reached it is stored without a vector.
-3. Promotion into ref_canonical_mappings (agent/promotion.py, EL2): at once for an
-   engineer's approved fix, otherwise once the same fix has recurred
-   (PROMOTE_MIN_OCCURRENCES rows in PROMOTE_MIN_BATCHES batches), never for an
-   ambiguous value. The decision is written on the incident too.
+3. Promotion into ref_canonical_mappings (agent/promotion.py, EL2): only with an
+   engineer's approval. An engineer's approved fix is promoted at once; a fix the
+   agent made on its own is stored as AWAITING_APPROVAL and promoted only when an
+   engineer runs `python -m agent.review promote <incident_id>`. An ambiguous value
+   is never promoted. The decision is written on the incident too.
 
 Neo4j or the reference table failing raises, so the graph retries Learn and then ends
 the workflow FAILED with `error.node = learn`. Every write is idempotent, and the
@@ -290,13 +292,14 @@ def learn(state: RecoveryState) -> dict:
                       "verified": record["verified"], "borrowed": record["extra"].get("borrowed")},
             history=history, existing=existing, engineer_approved=engineer_approved,
             promote_requested=decision.get("promote") is not False)
-        if promotion["status"] == promo.PROMOTED:
-            who = (f"engineer:{(state.get('action') or {}).get('approved_by') or decision.get('engineer')}"
-                   if promotion["route"] == promo.ENGINEER_APPROVED else "recurrence")
+        promoted_by = None
+        if promotion["status"] == promo.PROMOTED:   # only ever ENGINEER_APPROVED (EL2)
+            promoted_by = (state.get("action") or {}).get("approved_by") or decision.get("engineer")
             promotion["inserted"] = promo.promote(target["column_name"], target["raw_key"], target["canonical_value"],
-                                                  added_by=f"recovery_agent:{who}",
+                                                  added_by=f"recovery_agent:engineer:{promoted_by}",
                                                   source=f"recovery_agent:{incident_id}")
-        memory.mark_promotion(driver, incident_id, promotion["status"], "; ".join(promotion["reasons"]))
+        memory.mark_promotion(driver, incident_id, promotion["status"], "; ".join(promotion["reasons"]),
+                              promoted_by=promoted_by, target=target)
 
     learned = {"status": STORED, "written": True, "incident_id": incident_id, "outcome": record["outcome"],
                "resolved_by": record["resolved_by"], "verified": record["verified"],

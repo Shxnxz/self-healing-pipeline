@@ -256,11 +256,29 @@ class FakeMemory:
         self._check()
         return [dict(i) for i in self.incidents.values() if i["signature_key"] == key]
 
-    def mark_promotion(self, driver, incident_id, promotion, reason):
+    def mark_promotion(self, driver, incident_id, promotion, reason, promoted_by=None, target=None):
         self._check()
         stored = self.incidents[incident_id]
         stored.update(promotion=promotion, promotion_reason=reason,
                       promoted=promotion == "PROMOTED" or stored.get("promoted", False))
+        if promoted_by:
+            stored["promoted_by"] = promoted_by
+        for key, field in (("column_name", "promotion_column"), ("raw_key", "promotion_raw"),
+                           ("canonical_value", "promotion_canonical")):
+            if (target or {}).get(key):
+                stored[field] = target[key]
+
+    def get_incident(self, driver, incident_id):
+        self._check()
+        stored = self.incidents.get(incident_id)
+        return dict(stored) if stored else None
+
+    def awaiting_promotion(self, driver, statuses):
+        self._check()
+        found = [dict(i) for i in self.incidents.values()
+                 if i.get("promotion") in statuses and i.get("outcome") == "SUCCESS" and i.get("verified") is True
+                 and i.get("action") == "ADD_VARIANT"]
+        return list(reversed(found))
 
     # agent.promotion
     def current_mapping(self, column, raw, path=None):

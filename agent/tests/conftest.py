@@ -44,7 +44,8 @@ def memory(monkeypatch, request):
     which a test can take as the `memory` fixture to look at what was stored."""
     fake = helpers.FakeMemory()
     if "neo4j" not in request.keywords:
-        for name in ("shared_driver", "write_incident", "signature_history", "mark_promotion"):
+        for name in ("shared_driver", "write_incident", "signature_history", "mark_promotion",
+                     "get_incident", "awaiting_promotion"):
             monkeypatch.setattr(incidents, name, getattr(fake, name))
     if "real_io" not in request.keywords:
         monkeypatch.setattr(promotion, "current_mapping", fake.current_mapping)

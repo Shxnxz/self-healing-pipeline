@@ -82,7 +82,8 @@ def round_section(m: dict) -> List[str]:
             f"{_counts(wf['escalation_reasons'])}; decisions: {_counts(wf['decisions'])}.",
             f"- Failures with no right answer: {wf['no_right_answer']}, of which escalated "
             f"{wf['no_right_answer_escalated']}.",
-            f"- Promoted into ref_canonical_mappings: {wf['promoted']}.",
+            f"- Promoted into ref_canonical_mappings: {wf['promoted']} "
+            f"(agent fixes awaiting an engineer's approval: {wf.get('awaiting_promotion', 0)}).",
             f"- Policy gate on the model's fix proposals: {gate['proposals']} proposals, passed {gate['passed']} "
             f"(right {gate['passed_right']}, wrong {gate['passed_wrong']}), stopped {gate['stopped']} "
             f"(right {gate['stopped_right']}, wrong {gate['stopped_wrong']}); the model asked for an engineer "

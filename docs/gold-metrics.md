@@ -72,8 +72,8 @@ Neo4j. The Deterministic Lookup's blast radius (lookup/blast_radius.py) counts e
 `gold_*` table as a Gold consumer (weight 5), so a failure that reaches Gold now has a
 larger reach than before these tables existed, and its priority score is higher. That is
 the intended meaning (a bad value now spoils five reports, not one table), but it can move
-a failure from P2 to P1, where a borrowed past fix needs an engineer's approval
-(`APPROVE_BORROWED_FIX_TIERS`).
+a failure from P2 to P1, where a borrowed past fix needs an engineer's approval when
+the optional `APPROVE_BORROWED_FIX_TIERS=P1` is set (off by default).
 
 ## Tests
 

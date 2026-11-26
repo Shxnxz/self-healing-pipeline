@@ -48,8 +48,13 @@
 //     approved_by     STRING   the engineer who approved or decided the fix
 //     engineer, engineer_note, escalation_reasons, priority_tier, execution_id, lookup_id,
 //     workflow_status, promote_declined, dismissed_fix, attempt_round
-//     promotion       STRING   Learn's promotion decision: PROMOTED | ALREADY_IN_TABLE |
-//                              BELOW_THRESHOLD | BLOCKED | DECLINED (+ promotion_reason, promotion_at, promoted)
+//     promotion       STRING   promotion decision (Learn, or `agent.review promote`): PROMOTED |
+//                              ALREADY_IN_TABLE | AWAITING_APPROVAL (the agent's own fix: only an
+//                              engineer promotes it) | BLOCKED | DECLINED; BELOW_THRESHOLD on
+//                              incidents from before 2026-11-25 (+ promotion_reason, promotion_at,
+//                              promoted, promoted_by)
+//     promotion_column, promotion_raw, promotion_canonical
+//                     STRING   the variant Validate checked, which a later promotion writes
 //   })
 //
 //   (:Incident)-[:AFFECTS]->(:Table {name})   table the failure was detected in; lets

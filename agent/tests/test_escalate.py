@@ -398,7 +398,8 @@ def p1(item):
 
 
 @pytest.mark.parametrize("matched_by", ["STRUCTURED", "EMBEDDING"])
-def test_borrowed_fix_on_a_p1_failure_waits_for_approval_then_runs(matched_by):
+def test_borrowed_fix_on_a_p1_failure_waits_for_approval_then_runs(matched_by, monkeypatch):
+    monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset({"P1"}))   # the option on (off by default)
     jule_quarantine(config.QUARANTINE_PATH, rows=10)
     g = graph(learn=learn_ok)
     state = escalated(g, p1(stack_item("f1", route="remediate", match={**BORROWED, "matched_by": matched_by})))
@@ -427,14 +428,18 @@ def test_exact_matches_and_lower_tiers_still_reuse_the_fix_directly(tier, matche
     assert state["status"] == "RESOLVED"
 
 
-def test_the_approval_tiers_can_be_changed(monkeypatch):
+def test_a_borrowed_fix_on_p1_runs_without_approval_when_the_option_is_off(monkeypatch):
+    """Off is the default (Thay, 2026-11-20; final report 3.2.4; the parsed default is
+    tested in test_policy_gate). Set here so an old APPROVE_BORROWED_FIX_TIERS=P1 in the
+    environment cannot change the test."""
     monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset())
     state = graph(remediate=remediate_ok, validate=validate_ok, learn=learn_ok).invoke(
         initial_state("L1", p1(stack_item("f1", route="remediate", match=BORROWED))), thread())
     assert state["status"] == "RESOLVED" and "escalation" not in state
 
 
-def test_a_borrowed_fix_that_no_longer_fits_is_diagnosed_not_sent_for_approval():
+def test_a_borrowed_fix_that_no_longer_fits_is_diagnosed_not_sent_for_approval(monkeypatch):
+    monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset({"P1"}))
     item = p1(stack_item("f1", route="remediate",
                          match={**BORROWED, "action_params": {"canonical_value": "SMARCH"}}))
     state = graph().invoke(initial_state("L1", item), thread())

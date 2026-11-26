@@ -58,8 +58,8 @@ silver2_quarantine --lookup-scanner--> recovery.failures --> deterministic-looku
    Silver 2 code and checked (Validate), and its records are released into Silver 2.
    Anything else waits for an engineer's decision.
 3. **Learn**: every outcome becomes an incident in Neo4j, so the next occurrence is
-   found by the lookup, and a proven variant is promoted into `ref_canonical_mappings`,
-   so Silver 2 maps it by itself from then on.
+   found by the lookup, and a variant an engineer approved is promoted into
+   `ref_canonical_mappings`, so Silver 2 maps it by itself from then on.
 
 Lineage (OpenLineage from every Spark job into Neo4j), a replay tool and a fault
 injector for evaluation complete it. Each has its own section below.
@@ -309,8 +309,9 @@ records; where nothing can, the stricter `POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD
 confirms the model answers.
 
 A past fix the lookup found for the same value is reused without asking the model,
-except that a fix borrowed from a merely similar incident needs an engineer's approval
-on a P1 failure (`APPROVE_BORROWED_FIX_TIERS`).
+also when it is borrowed from a merely similar incident. An optional setting, off by
+default, makes such a borrowed fix on a P1 failure wait for an engineer's approval
+(`APPROVE_BORROWED_FIX_TIERS=P1`; default `NONE`).
 
 Remediate executes an approved fix exactly once: it checks the audit table first,
 stages the failure's quarantined records with the proposed mapping, and writes one
@@ -330,9 +331,11 @@ pauses (it survives restarts) until someone decides with `python -m agent.review
 (`approve`, `fix VALUE`, `retry`, `resolved`, `dismiss`). An engineer's fix is staged and
 validated like any other.
 
-**Learn** stores every outcome as an incident in Neo4j and promotes a variant into
-`ref_canonical_mappings` at once when an engineer's fix held, or when the agent's own
-fix of the same value has healed 5 rows in 3 micro-batches. Records still waiting for a
+**Learn** stores every outcome as an incident in Neo4j. A variant joins
+`ref_canonical_mappings` only when an engineer approves it: at once when an engineer's
+fix held, and for a fix the agent made on its own (reused from memory, never promoted
+by itself) when an engineer runs `python -m agent.review promotions` and
+`python -m agent.review promote <incident_id> --by NAME`. Records still waiting for a
 promoted value are released with `python -m tools.replay quarantine`.
 
 A workflow ends `RESOLVED`, `RESOLVED_BY_ENGINEER`, `DISMISSED` or `FAILED`, and is

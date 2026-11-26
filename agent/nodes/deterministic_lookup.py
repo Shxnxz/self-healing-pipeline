@@ -7,8 +7,8 @@ service before the graph starts. This node reads its verdict and sets the route:
   escalate    the same, but the fix is borrowed from a similar (not exact) incident,
               or from an exact one whose fix was itself borrowed and never approved
               (`borrowed`, written by Learn), and the failure is in a tier of
-              APPROVE_BORROWED_FIX_TIERS (default P1): it becomes `action` and waits
-              for an engineer's approval
+              APPROVE_BORROWED_FIX_TIERS (default NONE = off; P1 turns it on for P1
+              failures): it becomes `action` and waits for an engineer's approval
               (reason APPROVAL_REQUIRED; `python -m agent.review approve` runs it)
   diagnose    everything else
 
