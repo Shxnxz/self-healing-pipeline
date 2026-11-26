@@ -350,18 +350,17 @@ services:
       POLICY_CONFIDENCE_THRESHOLD: ${POLICY_CONFIDENCE_THRESHOLD:-0.85}
       POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD: ${POLICY_UNVERIFIED_CONFIDENCE_THRESHOLD:-}
       POLICY_SAFE_ACTIONS: ${POLICY_SAFE_ACTIONS:-}
-      # A fix borrowed from a similar (not exact) past incident waits for an engineer on these tiers.
-      APPROVE_BORROWED_FIX_TIERS: ${APPROVE_BORROWED_FIX_TIERS:-P1}
+      # A fix borrowed from a similar (not exact) past incident waits for an engineer on these
+      # tiers. NONE (default) = never; P1 = on P1 failures; ALL = every tier.
+      APPROVE_BORROWED_FIX_TIERS: ${APPROVE_BORROWED_FIX_TIERS:-NONE}
       # Learn: incidents go to Neo4j, embedded with the same model as the lookup's.
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-selfhealing}
       LOOKUP_EMBED_MODEL: ${LOOKUP_EMBED_MODEL:-}
       LOOKUP_EMBED_BASE_URL: ${LOOKUP_EMBED_BASE_URL:-http://host.docker.internal:11434}
-      # An automatic fix joins ref_canonical_mappings once it healed this many rows in this
-      # many micro-batches (an engineer's fix at once). NEVER = engineers' fixes only.
-      PROMOTE_MIN_OCCURRENCES: ${PROMOTE_MIN_OCCURRENCES:-5}
-      PROMOTE_MIN_BATCHES: ${PROMOTE_MIN_BATCHES:-3}
+      # Learn promotes into ref_canonical_mappings only what an engineer approved (EL2);
+      # there is no setting for it.
     depends_on:
       kafka:
         condition: service_healthy

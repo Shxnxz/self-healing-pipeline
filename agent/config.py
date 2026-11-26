@@ -75,11 +75,14 @@ POLICY_SAFE_ACTIONS = None if not _safe else ([] if "NONE" in _safe else _safe)
 
 # A past fix the lookup reused from a SIMILAR incident (matched_by STRUCTURED or
 # EMBEDDING, not EXACT) waits for an engineer's approval before it runs when the
-# failure is in one of these priority tiers (Thay, 2026-11-14: P1). After the
+# failure is in one of these priority tiers. Off by default (Thay, 2026-11-20, final
+# report 3.2.4: "An optional setting, off by default, sends such a fix on a P1 failure
+# to Escalate"); a fix only transfers for the same column and normalised value, and
+# Validate checks every record. P1 turns the approval on for P1 failures. After an
 # approval Learn stores the incident, so the next one is EXACT. A borrowed fix that
-# ran without approval (another tier) is stored as `borrowed` and still asks on P1.
-# NONE = never ask; ALL = ask on every tier.
-_tiers = [t.strip().upper() for t in os.environ.get("APPROVE_BORROWED_FIX_TIERS", "P1").split(",") if t.strip()]
+# ran without approval is stored as `borrowed` and still asks on a listed tier.
+# NONE (the default) = never ask; ALL = ask on every tier.
+_tiers = [t.strip().upper() for t in os.environ.get("APPROVE_BORROWED_FIX_TIERS", "NONE").split(",") if t.strip()]
 APPROVE_BORROWED_FIX_TIERS = frozenset() if "NONE" in _tiers else (
     frozenset({"P1", "P2", "P3"}) if "ALL" in _tiers else frozenset(_tiers))
 
@@ -108,27 +111,10 @@ EMBED_BASE_URL = os.environ.get("LOOKUP_EMBED_BASE_URL", "http://host.docker.int
 EMBED_TIMEOUT_SECONDS = float(os.environ.get("LOOKUP_EMBED_TIMEOUT_SECONDS", 30))
 
 
-def _count(name: str, default: int) -> int:
-    """A promotion threshold: a whole number of at least 1, or NEVER."""
-    raw = os.environ.get(name, "").strip()
-    if raw.upper() == "NEVER":
-        return 0
-    try:
-        value = int(raw) if raw else default
-    except ValueError:
-        raise ValueError(f"{name}={raw!r} is not a whole number or NEVER") from None
-    if value < 1:
-        raise ValueError(f"{name}={value} must be at least 1 (or NEVER)")
-    return value
-
-
-# Promotion into ref_canonical_mappings (agent/promotion.py). A fix an engineer
-# approved is promoted at once; a fix the agent made on its own only once the same
-# fix of the same value has healed PROMOTE_MIN_OCCURRENCES rows in
-# PROMOTE_MIN_BATCHES distinct Silver 2 micro-batches, each validated. NEVER in
-# either = only engineers' fixes are promoted. 0 below means NEVER.
-PROMOTE_MIN_OCCURRENCES = _count("PROMOTE_MIN_OCCURRENCES", 5)
-PROMOTE_MIN_BATCHES = _count("PROMOTE_MIN_BATCHES", 3)
+# Promotion into ref_canonical_mappings (agent/promotion.py, EL2) has no setting: a
+# variant is added only when an engineer approves it, at once for an engineer's fix,
+# with `python -m agent.review promote` for a fix the agent made. The old recurrence
+# rule (PROMOTE_MIN_OCCURRENCES, PROMOTE_MIN_BATCHES) is gone; the variables are ignored.
 
 # A workflow whose Learn kept failing (Neo4j or the reference table down) is relearned
 # this often (agent/consumer.py: LearnRetry). 0 = only when the failure is delivered again.

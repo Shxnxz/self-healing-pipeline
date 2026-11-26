@@ -180,15 +180,63 @@ def write_incident(
     return incident_id
 
 
-def mark_promotion(driver, incident_id: str, promotion: str, reason: str) -> None:
-    """Record what Learn's promotion decided for an incident (agent/promotion.py)."""
+def mark_promotion(driver, incident_id: str, promotion: str, reason: str,
+                   promoted_by: Optional[str] = None, target: Optional[dict] = None) -> None:
+    """Record what promotion decided for an incident (agent/promotion.py): Learn's
+    decision, or an engineer's `agent.review promote` (promoted_by = their name).
+    `target` is the variant Validate checked ({column_name, raw_key, canonical_value},
+    Learn's overlay), kept so a later approval promotes exactly that mapping."""
+    target = target or {}
     driver.execute_query(
         """
         MATCH (i:Incident {incident_id: $incident_id})
         SET i.promotion = $promotion, i.promotion_reason = $reason, i.promotion_at = datetime(),
-            i.promoted = ($promotion = 'PROMOTED' OR coalesce(i.promoted, false))
+            i.promoted = ($promotion = 'PROMOTED' OR coalesce(i.promoted, false)),
+            i.promoted_by = coalesce($promoted_by, i.promoted_by),
+            i.promotion_column = coalesce($column, i.promotion_column),
+            i.promotion_raw = coalesce($raw, i.promotion_raw),
+            i.promotion_canonical = coalesce($canonical, i.promotion_canonical)
         """,
-        incident_id=incident_id, promotion=promotion, reason=reason)
+        incident_id=incident_id, promotion=promotion, reason=reason, promoted_by=promoted_by,
+        column=target.get("column_name"), raw=target.get("raw_key"), canonical=target.get("canonical_value"))
+
+
+def get_incident(driver, incident_id: str) -> Optional[dict]:
+    """One incident with what promotion needs, or None (agent.review promote)."""
+    records, _, _ = driver.execute_query(
+        """
+        MATCH (i:Incident {incident_id: $incident_id})
+        RETURN """ + _RETURN_FIELDS + """,
+               i.verified AS verified, i.rows_affected AS rows_affected, i.batch_ids AS batch_ids,
+               i.promotion AS promotion, i.promotion_reason AS promotion_reason,
+               i.promoted_by AS promoted_by, toString(i.resolved_at) AS resolved_at,
+               i.promotion_column AS promotion_column, i.promotion_raw AS promotion_raw,
+               i.promotion_canonical AS promotion_canonical
+        """,
+        incident_id=incident_id)
+    if not records:
+        return None
+    return {**records[0].data(), "action_params": _params(records[0]["action_params"])}
+
+
+def awaiting_promotion(driver, statuses) -> list:
+    """Validated agent fixes whose promotion is still open (promotion in `statuses`),
+    newest first (agent.review promotions / promote). No limit: the promote command
+    must find every incident of a variant, and these are a few hundred at most."""
+    records, _, _ = driver.execute_query(
+        """
+        MATCH (i:Incident)
+        WHERE i.promotion IN $statuses AND i.outcome = 'SUCCESS' AND i.verified = true
+          AND i.action = 'ADD_VARIANT'
+        RETURN """ + _RETURN_FIELDS + """,
+               i.verified AS verified, i.rows_affected AS rows_affected, i.batch_ids AS batch_ids,
+               i.promotion AS promotion, toString(i.resolved_at) AS resolved_at,
+               i.promotion_column AS promotion_column, i.promotion_raw AS promotion_raw,
+               i.promotion_canonical AS promotion_canonical
+        ORDER BY i.resolved_at DESC
+        """,
+        statuses=list(statuses))
+    return [{**r.data(), "action_params": _params(r["action_params"])} for r in records]
 
 
 def signature_history(driver, key: str) -> list:

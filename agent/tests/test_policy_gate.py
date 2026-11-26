@@ -392,7 +392,8 @@ def test_diagnose_think_setting(monkeypatch, value, expected):
 
 
 @pytest.mark.parametrize("value, expected", [
-    (None, {"P1"}), ("p1, p2", {"P1", "P2"}), ("NONE", set()), ("all", {"P1", "P2", "P3"}),
+    (None, set()), ("", set()), ("P1", {"P1"}), ("p1, p2", {"P1", "P2"}), ("NONE", set()),
+    ("all", {"P1", "P2", "P3"}),
 ])
 def test_approval_tiers_for_borrowed_fixes(monkeypatch, value, expected):
     env = {} if value is None else {"APPROVE_BORROWED_FIX_TIERS": value}

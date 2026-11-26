@@ -21,6 +21,7 @@ time pattern, causes, beat-month features) are refreshed by a second query start
 here, after Gold exists. GOLD_METRICS_ENABLED=false leaves them out.
 """
 
+import json
 import os
 
 from functools import reduce
@@ -36,9 +37,11 @@ from sources import CHECKPOINT_ROOT, shared_path, source_names, table_name, tabl
 
 GOLD_PATH = os.environ.get("GOLD_PATH", shared_path("gold"))
 CHECKPOINT_PATH = os.environ.get("GOLD_CHECKPOINT_PATH", f"{CHECKPOINT_ROOT}/gold")
+START_VERSIONS_PATH = f"{CHECKPOINT_PATH}.start_versions.json"
 
 # Business-level transform SQL: the columns an analyst reports on, typed for
-# aggregation (Silver keeps counts/coordinates as strings).
+# aggregation (Silver 2 keeps dates and coordinates as text; its counts and crash_hour
+# are INT, cast again here so rows of a Silver 2 table from before that still read).
 #
 # Deliberately left out (still available in Silver 2):
 #   - pipeline metadata: batch_id, table_name, ingestion_ts, topic, kafka_timestamp
@@ -86,7 +89,9 @@ SELECT
     source_table,
 
     -- When
-    CAST(crash_date AS DATE) AS crash_date,
+    -- NULL for a year before 1900 that reached Silver 2 before Silver 2 quarantined
+    -- those (1017 for 2017): Parquet cannot take a date before 1582.
+    CASE WHEN CAST(crash_date AS DATE) >= DATE '1900-01-01' THEN CAST(crash_date AS DATE) END AS crash_date,
     CAST(CAST(crash_hour AS DOUBLE) AS INT) AS crash_hour,
     crash_day_of_week,
     crash_month,
@@ -162,10 +167,29 @@ def add_derived_columns(spark: SparkSession, path: str = GOLD_PATH) -> list:
     return [name for name, _ in missing]
 
 
+def start_versions() -> Dict[str, int]:
+    """Silver 2 version to start each table at, written by upgrade_silver2_types.py.
+
+    Converting Silver 2 to INT columns rewrites the tables; a stream cannot carry on
+    across that type change, so the upgrade moves Gold's checkpoint aside and Gold
+    starts again at the rewrite (whose rows it already holds). Delta only applies
+    startingVersion to a new checkpoint, so the file is harmless afterwards."""
+    try:
+        with open(START_VERSIONS_PATH, encoding="utf-8") as fh:
+            return {str(k): int(v) for k, v in json.load(fh).items()}
+    except (OSError, ValueError):
+        return {}
+
+
 def _silver2_stream(spark: SparkSession, source: str) -> DataFrame:
+    # skipChangeCommits: Silver 2 is append-only; the one commit that is not is the
+    # INT-column rewrite of upgrade_silver2_types.py, whose rows Gold already holds.
+    reader = spark.readStream.format("delta").option("skipChangeCommits", "true")
+    version = start_versions().get(table_name("silver2", source))
+    if version is not None:
+        reader = reader.option("startingVersion", str(version))
     return (
-        spark.readStream.format("delta")
-        .load(table_path("silver2", source))
+        reader.load(table_path("silver2", source))
         .withColumn("source_table", F.lit(table_name("silver2", source)))
     )
 

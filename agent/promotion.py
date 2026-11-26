@@ -5,31 +5,32 @@ in-memory overlay. Promotion makes it permanent: the raw value becomes a verifie
 variant in `ref_canonical_mappings`, so Silver 2 maps it by exact lookup and the next
 occurrence never reaches quarantine, the lookup or the model.
 
-The spec keeps the table from growing with every misspelling: a variant is promoted
-only
+EL2: a variant is added to the table ONLY when a data engineer approves it (Thay's
+design decision of 2026-11-20, written into the final report):
 
   at once                  when an engineer approved the fix (APPLY_FIX that passed
                            Validate; `--no-promote` on the review command declines it)
-  when it recurs           when the same fix of the same value, made by the agent, has
-                           healed at least PROMOTE_MIN_OCCURRENCES rows in at least
-                           PROMOTE_MIN_BATCHES distinct micro-batches, each validated
+  on approval              a fix the agent made on its own (reused from memory or
+                           passed by the policy gate) is stored as reusable memory and
+                           waits for an engineer: `python -m agent.review promotions`
+                           lists it, `python -m agent.review promote <incident_id>`
+                           promotes it (agent/review.py)
 
-and never when memory says the value is ambiguous:
+A fix the agent made is never promoted by itself, however often it recurs: in the
+real-data evaluation the agent's own repeats of one wrong fix (LIGHTED NIGHT ->
+DAYLIGHT) met the old recurrence rule (5 rows in 3 batches) and reached the table.
+
+A variant is never promoted when memory says the value is ambiguous, not even with an
+engineer's approval:
 
   - another verified fix maps the same signature to a different value ("Ju" fixed to
     JUNE in one batch and to JULY in another: each group was right, the variant is not)
   - the table already maps the raw value to something else
 
-An automatic promotion also waits while there is doubt, which an engineer approving
-this very fix overrides (EL2):
+Doubts are shown to the engineer and overridden by their approval:
 
   - the same fix failed Validate for the same signature before (some records disagreed)
   - an engineer declined promotion of this fix before
-
-A fix borrowed from a similar incident that nobody approved (`borrowed`, see
-agent/nodes/deterministic_lookup.py) never counts towards recurrence: promoting it
-would turn a borrowed fix into a rule for every tier without the approval Thay asked
-for on P1 (decision of 2026-11-14).
 
 Only ADD_VARIANT is promoted; it is the only action with a mapping to add.
 
@@ -46,13 +47,18 @@ from agent.memory import incidents
 # learned["promotion"]["status"]
 PROMOTED = "PROMOTED"                  # the variant was added to ref_canonical_mappings now
 ALREADY_IN_TABLE = "ALREADY_IN_TABLE"  # the table maps the raw value to this value already
-BELOW_THRESHOLD = "BELOW_THRESHOLD"    # an automatic fix that has not recurred enough yet
+AWAITING_APPROVAL = "AWAITING_APPROVAL"  # the agent's own fix: waits for an engineer (EL2)
 BLOCKED = "BLOCKED"                    # memory or the table says the value is ambiguous
 DECLINED = "DECLINED"                  # the engineer approved the fix but not the variant
 NOT_APPLICABLE = "NOT_APPLICABLE"      # nothing to promote (no validated ADD_VARIANT)
 
-ENGINEER_APPROVED = "ENGINEER_APPROVED"
-RECURRENCE = "RECURRENCE"
+ENGINEER_APPROVED = "ENGINEER_APPROVED"   # the only route into the table
+# Statuses whose promotion is still open: `agent.review promotions` re-decides them
+# with an engineer's approval each time it lists them. BELOW_THRESHOLD is what the old
+# recurrence rule wrote before promotion needed an engineer. BLOCKED stays open too:
+# a conflict can be cleared later, and the old rule also wrote BLOCKED for a mere
+# doubt, which an approval now overrides.
+PROMOTABLE = ("AWAITING_APPROVAL", "BELOW_THRESHOLD", "BLOCKED")
 
 
 def batch_key(table: Optional[str], batch: str) -> str:
@@ -75,8 +81,9 @@ def _is_success(incident: dict) -> bool:
 
 
 def counts(history: Iterable[dict], canonical: str) -> dict:
-    """Rows and distinct batches healed by the same automatic or approved fix, from
-    every incident that may count (not borrowed without approval)."""
+    """Rows and distinct batches healed by the same verified fix, from every incident
+    with this signature (a borrowed fix nobody approved is left out). Only shown to the
+    engineer as evidence: recurrence never promotes by itself (EL2)."""
     rows, batches, used = 0, set(), []
     for inc in history:
         if not _is_success(inc) or inc.get("action") != actions.ADD_VARIANT:
@@ -90,9 +97,10 @@ def counts(history: Iterable[dict], canonical: str) -> dict:
 
 
 def _ambiguity(history: Iterable[dict], canonical: str, incident_id: str) -> Tuple[List[str], List[str]]:
-    """(conflicts, doubts). A conflict blocks every promotion: the value has been fixed
-    to something else. A doubt blocks only the automatic one; an engineer who approves
-    this very fix after it failed once, or was declined once, overrides it (EL2)."""
+    """(conflicts, doubts). A conflict blocks every promotion, approved or not: the value
+    has been fixed to something else. A doubt (this fix failed Validate once, or an
+    engineer declined promoting it) is only listed for the engineer, whose approval
+    overrides it (EL2)."""
     conflicts, doubts = [], []
     for inc in history:
         if inc.get("incident_id") == incident_id or inc.get("action") != actions.ADD_VARIANT:
@@ -108,21 +116,18 @@ def _ambiguity(history: Iterable[dict], canonical: str, incident_id: str) -> Tup
 
 
 def decide(*, incident: dict, history: List[dict], existing: Optional[str], engineer_approved: bool,
-           promote_requested: bool = True, min_occurrences: Optional[int] = None,
-           min_batches: Optional[int] = None) -> dict:
-    """What to do with the variant of the incident Learn just wrote.
+           promote_requested: bool = True) -> dict:
+    """What to do with the variant of the incident Learn just wrote, or of the incident
+    an engineer asks to promote (`agent.review promote`, engineer_approved=True).
 
     incident  {incident_id, action, action_params, outcome, verified, borrowed, column_name,
                raw_key, canonical_value}
     history   incidents.signature_history() for the same signature (includes this one)
     existing  the value ref_canonical_mappings maps raw_key to today, or None
     """
-    min_occurrences = config.PROMOTE_MIN_OCCURRENCES if min_occurrences is None else min_occurrences
-    min_batches = config.PROMOTE_MIN_BATCHES if min_batches is None else min_batches
     canonical = incident.get("canonical_value")
     result = {"status": NOT_APPLICABLE, "route": None, "reasons": [], "column": incident.get("column_name"),
-              "raw_value": incident.get("raw_key"), "canonical_value": canonical,
-              "needed": {"occurrences": min_occurrences or "NEVER", "batches": min_batches or "NEVER"}}
+              "raw_value": incident.get("raw_key"), "canonical_value": canonical}
     if incident.get("action") != actions.ADD_VARIANT or not canonical or not incident.get("raw_key"):
         result["reasons"] = ["only a validated ADD_VARIANT adds a variant"]
         return result
@@ -137,37 +142,25 @@ def decide(*, incident: dict, history: List[dict], existing: Optional[str], engi
     conflicts, doubts = _ambiguity(history, canonical, incident.get("incident_id"))
     if existing is not None:
         conflicts.insert(0, f"ref_canonical_mappings maps it to {existing}, not {canonical}")
-    blocked = conflicts if engineer_approved and promote_requested else conflicts + doubts
-    if blocked:
-        result.update(status=BLOCKED, reasons=blocked)
+    if conflicts:
+        result.update(status=BLOCKED, reasons=conflicts)
         return result
-    if doubts:   # overridden by this engineer's approval
-        result["overridden"] = doubts
 
     if engineer_approved:
         if not promote_requested:
             result.update(status=DECLINED, route=ENGINEER_APPROVED,
                           reasons=["the engineer approved the fix for these records only (--no-promote)"])
             return result
+        if doubts:   # overridden by this engineer's approval
+            result["overridden"] = doubts
         result.update(status=PROMOTED, route=ENGINEER_APPROVED, reasons=["approved by an engineer (EL2)"])
         return result
 
-    if incident.get("borrowed"):
-        note = "borrowed from a similar incident without approval, so it does not count; "
-    else:
-        note = ""
-    if not min_occurrences or not min_batches:
-        result.update(status=BELOW_THRESHOLD, route=RECURRENCE,
-                      reasons=[note + "automatic promotion is off (NEVER): only an engineer's fix is promoted"])
-        return result
-    if result["occurrences"] >= min_occurrences and result["batches"] >= min_batches:
-        result.update(status=PROMOTED, route=RECURRENCE,
-                      reasons=[f"healed {result['occurrences']} rows in {result['batches']} batches "
-                               f"(needs {min_occurrences} in {min_batches})"])
-        return result
-    result.update(status=BELOW_THRESHOLD, route=RECURRENCE,
-                  reasons=[note + f"healed {result['occurrences']} rows in {result['batches']} batches so far, "
-                           f"needs {min_occurrences} rows in {min_batches} batches"])
+    note = (" It was borrowed from a similar incident without approval." if incident.get("borrowed") else "")
+    result.update(status=AWAITING_APPROVAL,
+                  reasons=["a fix the agent made is reused from memory but promoted only when an engineer "
+                           f"approves it (EL2): python -m agent.review promote {incident.get('incident_id')}"
+                           + note] + [f"doubt: {d}" for d in doubts])
     return result
 
 

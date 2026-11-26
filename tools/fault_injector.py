@@ -310,7 +310,7 @@ def _producer():
 
 def publish(spark, records: List[dict], interval: float, producer=None) -> None:
     """Send batch 1, wait `interval` seconds, send batch 2, ... so a fault that must
-    recur across micro-batches (promotion: N occurrences in M batches) lands in
+    recur across micro-batches (reuse from memory in a later batch) lands in
     separate Silver 2 micro-batches (they trigger every 10 s)."""
     producer = producer or _producer()
     batches = sorted({r["batch"] for r in records})

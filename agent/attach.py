@@ -13,8 +13,7 @@ SAME SIGNATURE that is still open, and if there is one the failure attaches to i
   open        the workflow waits for an engineer, or stopped part-way before Validate
               (the agent was killed). A workflow that reached Validate or ended is
               not open: its group is fixed, so a later batch starts a new workflow
-              (which then usually reuses the verified fix, and counts towards
-              promotion by recurrence).
+              (which then usually reuses the verified fix).
 
 Attaching adds the batch to the open workflow's `failure`: batch ids, rows,
 sample record ids, and `attached_failure_ids`. Remediate stages the failure's records

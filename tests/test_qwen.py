@@ -109,7 +109,10 @@ class Tests(unittest.TestCase):
             with patch.dict(os.environ, QWEN_ENABLED='true', QWEN_INCIDENT_DIR=directory, QWEN_ASYNC='true'):
                 queued = capture_exception(ValueError('x'), job_name='silver2', batch_id=3)
                 waiting, deadline = Path(directory) / 'outbox', time.time() + 5
-                while list(waiting.glob('*.json')) and time.time() < deadline:
+                # '*.json*': the worker claims a file by renaming it to '<name>.json.claimed-...'
+                # and removes it only after publishing, so wait for the claimed copy too (a
+                # wait on '*.json' alone ended while the incident was still being published).
+                while list(waiting.glob('*.json*')) and time.time() < deadline:
                     time.sleep(0.02)
                 self.assertEqual(publish.call_count, 1)
                 self.assertTrue((Path(directory) / (queued['incident_id'] + '.json')).exists())

@@ -16,8 +16,8 @@ replayed and checked by Validate, and its records are released into Silver 2.
 Everything else is handed to an engineer: the workflow pauses with the whole case
 saved, and continues with the engineer's decision. **Learn** stores every outcome as
 an incident in Neo4j, so the next occurrence is found by the Deterministic Lookup,
-and promotes proven fixes into `ref_canonical_mappings`, so Silver 2 maps the value
-itself from then on. Each step was built by its own task:
+and promotes a fix into `ref_canonical_mappings` once an engineer approves it, so
+Silver 2 maps the value itself from then on. Each step was built by its own task:
 
 | Node | File | Built in | Behaviour today |
 |---|---|---|---|
@@ -28,7 +28,7 @@ itself from then on. Each step was built by its own task:
 | `validate` | `nodes/validate.py` | Task 105 | real: replays the staged records through Silver 2, checks them, releases them |
 | `escalate` | `nodes/escalate.py` | Task 106 | real: opens a case for an engineer with the full context |
 | `engineer_review` | `nodes/engineer_review.py` | Task 106 | real: waits for the engineer's decision and acts on it |
-| `learn` | `nodes/learn.py` | Task 107 | real: stores the incident in Neo4j, promotes proven variants |
+| `learn` | `nodes/learn.py` | Task 107 | real: stores the incident in Neo4j, promotes variants an engineer approved |
 
 ## The graph (`graph.py`)
 
@@ -36,7 +36,7 @@ itself from then on. Each step was built by its own task:
 flowchart TD
     S([recovery.lookup stack item]) --> L[deterministic_lookup]
     L -- verified past fix --> R[remediate]
-    L -- borrowed fix on P1 --> E
+    L -- borrowed fix on an approval tier (off by default) --> E
     L -- no reusable fix --> D[diagnose]
     D --> G[policy_gate]
     G -- confident and SAFE --> R
@@ -166,16 +166,17 @@ To make another action safe, change `actions.py` in a reviewed PR. The setting
 engineer); it cannot add to it.
 
 A past fix reused by the Deterministic Lookup does not pass the gate below: it was
-already validated or approved by an engineer. **Except on a P1 failure:** a fix
-borrowed from a similar incident (`matched_by` `STRUCTURED` or `EMBEDDING`, not
-`EXACT`, e.g. `Jule` fixed in Crash1 and now seen in Crash3) waits for an engineer's
-approval before it runs (escalation reason `APPROVAL_REQUIRED`; `approve` runs it
-through Remediate and Validate). Thay chose this on 2026-11-14: P1 has the widest
-impact and Validate cannot tell a wrong value outside month and weekday. The tiers
-are `APPROVE_BORROWED_FIX_TIERS` (default `P1`, `NONE` or `ALL`). Once approved and
-learned, the same value is an exact match and is not asked again. A borrowed fix that
-ran without approval (P2/P3) is learned as `borrowed`, so an exact match on it is still
-asked on P1 (see Learn). It is still checked against the failure
+already validated or approved by an engineer. A fix borrowed from a similar incident
+(`matched_by` `STRUCTURED` or `EMBEDDING`, not `EXACT`, e.g. `Jule` fixed in Crash1 and
+now seen in Crash3) is reused like any other: it only transfers for the same column and
+normalised value, and Validate checks every record. **Optional approval, off by
+default** (Thay, 2026-11-20; final report 3.2.4): `APPROVE_BORROWED_FIX_TIERS=P1` makes
+such a fix on a P1 failure wait for an engineer's approval before it runs (escalation
+reason `APPROVAL_REQUIRED`; `approve` runs it through Remediate and Validate). The
+setting takes `NONE` (the default), a list of tiers (`P1`, `P1,P2`) or `ALL`. Once
+approved and learned, the same value is an exact match and is not asked again. A
+borrowed fix that ran without approval is learned as `borrowed`, so with the option on
+an exact match on it is still asked on a listed tier (see Learn). It is still checked against the failure
 with the gate's own `parameters` check (`actions.check_params`) before it becomes
 `action`, so a fix whose canonical value has since left `ref_canonical_mappings`, or
 that does not fit this failure, is sent to Diagnose instead of to Remediate.
@@ -464,7 +465,7 @@ docker compose exec recovery-agent python -m agent.review dismiss  <failure_id> 
 |---|---|---|
 | `approve` | `APPLY_FIX` with the proposed fix | Remediate stages it, Validate replays, checks and releases it, Learn stores it with status `RESOLVED_BY_ENGINEER` and promotes the variant at once |
 | `fix VALUE` | `APPLY_FIX` `ADD_VARIANT` with the engineer's canonical value | same |
-| `approve` / `fix` with `--no-promote` | same, `promote: false` | the records are healed, the variant is **not** added to `ref_canonical_mappings` (and the agent never promotes it by recurrence either) |
+| `approve` / `fix` with `--no-promote` | same, `promote: false` | the records are healed, the variant is **not** added to `ref_canonical_mappings` |
 | `retry` | `RETRY` | runs the automated path again from `deterministic_lookup` (Ollama or a table was down) |
 | `resolved` | `RESOLVED_MANUALLY` | nothing is executed; Learn gets `RESOLVED_BY_ENGINEER` and the note |
 | `dismiss` | `DISMISS` | nothing is executed, the records stay quarantined; Learn gets `DISMISSED` and the note |
@@ -542,32 +543,37 @@ promotion decision. It is embedded with the lookup's model and text
 only leaves the vector out (`learned.embed_error`), the exact and structured lookups
 still find it.
 
-**Borrowed fixes stay borrowed** (Thay's rule of 2026-11-14 for P1). A fix the lookup
-reused from a similar incident, not an exact one, that no engineer approved (P2/P3 run
-it directly) is stored with `borrowed = true`. When a later failure matches that
-incident exactly, the lookup still reports it as borrowed (`match.borrowed`) and
-`deterministic_lookup` asks for approval on P1 as for any borrowed fix, so reusing a
-borrowed fix never turns it into an exact one. `find_exact` prefers a fix that is not
+**Borrowed fixes stay borrowed.** A fix the lookup reused from a similar incident, not
+an exact one, that no engineer approved is stored with `borrowed = true`. When a later
+failure matches that incident exactly, the lookup still reports it as borrowed
+(`match.borrowed`), and with `APPROVE_BORROWED_FIX_TIERS` on, `deterministic_lookup`
+asks for approval on a listed tier as for any borrowed fix, so reusing a borrowed fix
+never turns it into an exact one. `find_exact` prefers a fix that is not
 borrowed. Once an engineer approves it, the incident is not borrowed.
 
-**2. Promotion into `ref_canonical_mappings`** (`promotion.py`, EL2). The variant
-(column, RAW value, canonical value) is the overlay Validate checked. It is added:
+**2. Promotion into `ref_canonical_mappings`** (`promotion.py`, EL2). A variant
+(column, RAW value, canonical value: the overlay Validate checked) joins the table
+**only when an engineer approves it** (Thay, 2026-11-20; final report 3.2.9):
 
 - **at once** when an engineer's fix passed Validate (`approve`, `fix`, including an
   approved borrowed fix). `--no-promote` heals the records only.
-- **when it recurs**: the same fix of the same value, made by the agent, has healed at
-  least `PROMOTE_MIN_OCCURRENCES` rows (default 5) in at least `PROMOTE_MIN_BATCHES`
-  distinct micro-batches (default 3), each validated (Thay, 2026-11-14). Batches are
-  counted per source table (`silver2_crash1:7` and `silver2_crash3:7` are two).
-  Borrowed fixes nobody approved do not count. `NEVER` in either setting leaves
-  promotion to engineers.
+- **a fix the agent made on its own** (a model proposal that passed the gate, or a fix
+  reused from memory) is stored as reusable memory with promotion
+  `AWAITING_APPROVAL` and is **never promoted by itself**, however often it recurs.
+  An engineer lists these with `python -m agent.review promotions` and promotes one
+  with `python -m agent.review promote <incident_id> --by NAME [--note ...]` (below).
 
-And **never** when the value is ambiguous: another verified incident fixed the same
-signature to a different value (`Ju` was JUNE in one batch and JULY in another), or
-the table already maps the raw value to something else. While there is doubt (the same
-fix failed Validate before, or an engineer declined promoting it) only the automatic
-promotion waits; an engineer approving this very fix overrides it
-(`learned.promotion.overridden`). Only `ADD_VARIANT` is promoted.
+Until 2026-11-25 an agent fix was promoted by recurrence (5 rows in 3 batches). In the
+real-data evaluation the agent's own repeats of one wrong fix (`LIGHTED NIGHT ->
+DAYLIGHT`) met that rule and reached the table, so the rule and its settings
+(`PROMOTE_MIN_OCCURRENCES`, `PROMOTE_MIN_BATCHES`) are gone; the variables are ignored.
+
+And **never** when the value is ambiguous, not even with an approval: another verified
+incident fixed the same signature to a different value (`Ju` was JUNE in one batch and
+JULY in another), or the table already maps the raw value to something else
+(`BLOCKED`). Doubts (the same fix failed Validate before, or an engineer declined
+promoting it) are listed in the reasons for the engineer, and their approval overrides
+them (`learned.promotion.overridden`). Only `ADD_VARIANT` is promoted.
 
 The lookup applies the same rule to reuse: when the verified fixes of one exact value
 disagree (`find_exact` returns them in `distinct_fixes`), neither is reused, and the
@@ -575,13 +581,39 @@ failure goes to Diagnose with both as past incidents.
 
 The write is a Delta MERGE on `(field_name, raw_synonym)` that only inserts (the same
 key as the Silver 2 job's own fuzzy promotion), done with `deltalake`, without Spark:
-`added_by = recovery_agent:engineer:<name>` or `recovery_agent:recurrence`,
-`source_batch_id = recovery_agent:<incident_id>`, `confidence = 1.0`. Silver 2 reloads
-the table every micro-batch, so the next occurrence of the value is standardized there
-and never reaches quarantine. The decision is in `learned.promotion` = `{status:
-PROMOTED | ALREADY_IN_TABLE | BELOW_THRESHOLD | BLOCKED | DECLINED | NOT_APPLICABLE,
-route: ENGINEER_APPROVED | RECURRENCE, reasons, occurrences, batches, needed, inserted}`
-and on the incident (`promotion`, `promotion_reason`, `promoted`).
+`added_by = recovery_agent:engineer:<name>`, `source_batch_id =
+recovery_agent:<incident_id>`, `confidence = 1.0`. Silver 2 reloads the table every
+micro-batch, so the next occurrence of the value is standardized there and never
+reaches quarantine. The decision is in `learned.promotion` = `{status: PROMOTED |
+ALREADY_IN_TABLE | AWAITING_APPROVAL | BLOCKED | DECLINED | NOT_APPLICABLE, route:
+ENGINEER_APPROVED or null, reasons, occurrences, batches, inserted}` (`occurrences` and
+`batches` are the rows and micro-batches the same fix healed so far, shown as evidence)
+and on the incident (`promotion`, `promotion_reason`, `promoted`, `promoted_by`, and the
+variant Validate checked: `promotion_column`, `promotion_raw`, `promotion_canonical`,
+which is what a later `promote` writes).
+
+**Approving the promotion of an agent fix** (`agent/review.py`):
+
+```bash
+docker compose exec recovery-agent python -m agent.review promotions
+docker compose exec recovery-agent python -m agent.review promote <incident_id> --by thay --note "dates agree"
+```
+
+`promotions` re-decides every open incident (promotion `AWAITING_APPROVAL`, `BLOCKED`,
+or `BELOW_THRESHOLD` from before the change) and lists one line per variant an approval
+would promote: column, raw value, canonical value, the rows and batches the fix healed,
+the incidents that made it, and any doubts the approval overrides. `--all` also lists
+the variants that cannot be promoted now (a conflict, which may be cleared later) and
+those already in the table (an engineer's fix, an earlier promotion). `promote`
+runs the same decision with the engineer's approval, writes the variant with the same
+MERGE as Learn (`added_by = recovery_agent:engineer:<name>`) and marks the incident
+`PROMOTED` with `promoted_by` and the note. Every other waiting incident of the same
+variant is marked with it (`ALREADY_IN_TABLE`), so the variant leaves the list at once.
+A conflict still refuses it (`BLOCKED` is recorded on that incident, which stays open
+and is offered again once the conflict is gone). A fix an engineer approved with
+`--no-promote` is promoted only with `--override-decline`. It works on finished workflows, directly against Neo4j
+and the reference table (no Kafka), so the agent container's writable mount of
+`ref_canonical_mappings` is what it uses.
 
 Learn does not release quarantined records. Records that were still waiting for the
 promoted value, e.g. a record that also failed another column and stayed `PENDING`
@@ -601,7 +633,7 @@ Look at what was stored in the Neo4j browser (http://localhost:7474):
 ```cypher
 MATCH (i:Incident)-[:AFFECTS]->(t:Table)
 RETURN i.signature_key, i.outcome, i.action, i.action_params, i.resolved_by, i.borrowed,
-       i.promotion, i.batch_ids, t.name ORDER BY i.resolved_at DESC LIMIT 25
+       i.promotion, i.promoted_by, i.batch_ids, t.name ORDER BY i.resolved_at DESC LIMIT 25
 ```
 
 and what was promoted: `added_by` starting with `recovery_agent:` in `ref_canonical_mappings`.
@@ -647,8 +679,7 @@ LangGraph saves the state after every node in SQLite, under
   and Learn records every batch. The attached failure keeps a finished workflow of its
   own with status `ATTACHED` and `attached_to`, so `agent.show` says where it went and a
   redelivery is a duplicate. A workflow that reached Validate or ended is not open: a
-  later batch then starts its own workflow, which usually reuses the verified fix and
-  counts towards promotion by recurrence. A problem an engineer dismissed is closed too,
+  later batch then starts its own workflow, which usually reuses the verified fix. A problem an engineer dismissed is closed too,
   so its next batch opens a new case. The agent rebuilds the index of open workflows
   from the checkpoints when it starts.
 - **new**: no saved state and nothing open for the problem: start the workflow.
@@ -770,8 +801,8 @@ docker compose exec recovery-agent python -m agent.show fd95d1c4c9991007
 
 Settings (`config.py`): `LOOKUP_OUTPUT_TOPIC`, `AGENT_DECISIONS_TOPIC`, `AGENT_CONSUMER_GROUP`,
 `AGENT_CHECKPOINT_PATH`, `AGENT_MAX_POLL_INTERVAL_MS`, `AGENT_NODE_MAX_ATTEMPTS`,
-`AGENT_NODE_RETRY_SECONDS`, `APPROVE_BORROWED_FIX_TIERS` (`P1`), Learn's (see the Learn
-section: `PROMOTE_MIN_OCCURRENCES`, `PROMOTE_MIN_BATCHES`, `NEO4J_*`, `LOOKUP_EMBED_MODEL`,
+`AGENT_NODE_RETRY_SECONDS`, `APPROVE_BORROWED_FIX_TIERS` (`NONE`), Learn's (see the Learn
+section: `NEO4J_*`, `LOOKUP_EMBED_MODEL`,
 `AGENT_RELEARN_INTERVAL_SECONDS`),
 and for Diagnose and the gate:
 

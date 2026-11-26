@@ -30,6 +30,7 @@ The true value of a record is what Silver 2 made of the clean original, so it is
 never guessed: the injector only corrupts records that reached Silver 2 cleanly.
 """
 import json
+from decimal import Decimal
 import random
 from typing import Dict, List, Optional
 
@@ -132,8 +133,8 @@ def _unseen_format(column: str, truth: str) -> Optional[str]:
         return _words_date(truth)
     if column == "date_police_notified":
         return f"{_words_date(truth)} at {truth[11:16]}"
-    if column == "crash_hour":            # Silver 2 writes "19.00"
-        hour = int(truth.split(".")[0])
+    if column == "crash_hour":            # Silver 2 stores 19 (tables before: "19.00")
+        hour = int(str(truth).split(".")[0])
         return f"{hour % 12 or 12} o'clock {'in the evening' if hour >= 12 else 'in the morning'}"
     if column == "posted_speed_limit":
         return _NUMBER_WORDS.get(int(truth))
@@ -193,11 +194,13 @@ class FaultSpecError(ValueError):
 
 def canonical(column: str, value) -> Optional[str]:
     """Silver 2's value as the reference table writes the canonical value:
-    hit_and_run_i True -> 'TRUE', num_units Decimal('2.0') -> '2.0', crash_month 'JUNE'."""
+    hit_and_run_i True -> 'TRUE', num_units 2 -> '2.0', crash_month 'JUNE'."""
     if value is None:
         return None
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
+    if column == "num_units" and isinstance(value, (int, Decimal)):
+        return f"{Decimal(value):.1f}"
     return str(value)
 
 

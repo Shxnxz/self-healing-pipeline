@@ -40,11 +40,12 @@ from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.types import (
     BooleanType,
     DecimalType,
+    DoubleType,
     IntegerType,
     StringType,
 )
 
-from common import build_spark, idempotent_append, wait_for_delta_table
+from common import build_spark, has_delta_commit, idempotent_append, wait_for_delta_table
 from sources import (
     check_day_first_sources,
     checkpoint_path,
@@ -89,6 +90,20 @@ SILVER1_SKIP_CHANGE_COMMITS = (
 
 # try_to_timestamp / array_compact need Spark 3.4+
 MIN_SPARK_VERSION = (3, 4)
+
+# crash_date before this year fails (and quarantines the record).
+MIN_CRASH_YEAR = int(os.environ.get("MIN_CRASH_YEAR", "1900"))
+
+# Injury counts, typed INT in Silver 2 (see standardize_silver2).
+INJURY_COLUMNS = (
+    "injuries_total",
+    "injuries_fatal",
+    "injuries_incapacitating",
+    "injuries_non_incapacitating",
+    "injuries_reported_not_evident",
+    "injuries_no_indication",
+    "injuries_unknown",
+)
 
 MAX_ERROR_CHARS = 4000
 MAX_TRACE_CHARS = 8000
@@ -153,6 +168,11 @@ def _digits_only(raw_col: Column, max_len: int = 3) -> Column:
     return F.when(t.rlike(rf"^\d{{1,{max_len}}}$"), t.cast(IntegerType())).otherwise(None)
 
 
+def _whole_count(raw_col: Column) -> Column:
+    """'0.0' / '2' / ' 3.0 ' -> INT, the same CAST(CAST(x AS DOUBLE) AS INT) Gold uses."""
+    return F.trim(raw_col).cast(DoubleType()).cast(IntegerType())
+
+
 def _fuzzy_audit_struct(
     field: str, record_id: Column, raw_col: Column, effective_fuzzy: Column
 ) -> Column:
@@ -211,7 +231,12 @@ def standardize_silver2(
     parsed_crash_date = F.coalesce(
         *[F.to_date(_try_ts("crash_date", fmt)) for fmt in date_formats(day_first)]
     )
-    std_crash_date = F.date_format(parsed_crash_date, "yyyy-MM-dd")
+    # A year before MIN_CRASH_YEAR is a typo (1017 for 2017): quarantined, since Gold
+    # cannot write a date before 1582 to Parquet (WRITE_ANCIENT_DATETIME).
+    std_crash_date = F.when(
+        F.year(parsed_crash_date) >= MIN_CRASH_YEAR,
+        F.date_format(parsed_crash_date, "yyyy-MM-dd"),
+    )
 
     # 2. Native Timestamp Parsing Chain for date_police_notified
     parsed_police_ts = F.coalesce(
@@ -258,7 +283,7 @@ def standardize_silver2(
     std_street_direction = F.coalesce(exact_street_direction, fuzzy_dir_canonical)
 
     # 4. Numeric & Time Parsing
-    # crash_hour: ref lookup, 12h/24h timestamp parse, or direct integer/decimal cast -> format as "hh.00"
+    # crash_hour: ref lookup, 12h/24h timestamp parse, or direct integer/decimal cast -> INT 0-23
     hour_from_ref = _build_map_expr("crash_hour", mapping_dict, raw_crash_hour)
     hour_from_ts = F.hour(
         F.coalesce(
@@ -279,10 +304,7 @@ def standardize_silver2(
     candidate_hour = F.coalesce(
         hour_from_ref.cast(IntegerType()), hour_from_ts, hour_as_num, _digits_only(raw_crash_hour)
     )
-    std_crash_hour = F.when(
-        candidate_hour.between(0, 23),
-        F.format_string("%02d.00", candidate_hour),
-    ).otherwise(None)
+    std_crash_hour = F.when(candidate_hour.between(0, 23), candidate_hour).otherwise(None)
 
     # crash_month: exact lookup (from ref or digits) -> fuzzy canonical fallback
     exact_crash_month = _build_map_expr("crash_month", mapping_dict, raw_crash_month)
@@ -306,10 +328,17 @@ def standardize_silver2(
     )
     std_crash_day_of_week = F.coalesce(exact_crash_day, fuzzy_day_canonical)
 
-    # num_units: ref lookup for words ('one' -> 1.0) or regex numeric extract
+    # num_units: ref lookup for words ('one' -> '1.0') or regex numeric extract -> INT
+    # (the reference table writes the canonical value as '2.0'; 2.0 is stored as 2)
     units_from_ref = _build_map_expr("num_units", mapping_dict, raw_num_units)
     units_from_regex = F.regexp_extract(raw_num_units, r"(\d{1,8}(\.\d+)?)", 1).cast(DecimalType(10, 1))
-    std_num_units = F.coalesce(units_from_ref.cast(DecimalType(10, 1)), units_from_regex)
+    std_num_units = F.coalesce(units_from_ref.cast(DecimalType(10, 1)), units_from_regex).cast(IntegerType())
+
+    # injury counts: the sources write them as '0.0' / '1.0'; stored as INT. This is
+    # the cast Gold always applied (a stray '0.6' becomes 0, as it did in Gold), so
+    # Gold's values do not change. Not tracked: a count that is not a number is NULL,
+    # as before.
+    std_injuries = {c: _whole_count(df[c]) for c in INJURY_COLUMNS}
 
     # posted_speed_limit: regex numeric extract
     std_posted_speed_limit = F.regexp_extract(raw_speed_limit, r"(\d{1,4})", 1).cast(IntegerType())
@@ -396,13 +425,7 @@ def standardize_silver2(
         std_num_units.alias("num_units"),
         std_crash_month.alias("crash_month"),
         F.col("most_severe_injury"),
-        F.col("injuries_total"),
-        F.col("injuries_fatal"),
-        F.col("injuries_incapacitating"),
-        F.col("injuries_non_incapacitating"),
-        F.col("injuries_reported_not_evident"),
-        F.col("injuries_no_indication"),
-        F.col("injuries_unknown"),
+        *[std_injuries[c].alias(c) for c in INJURY_COLUMNS],
         std_crash_hour.alias("crash_hour"),
         std_crash_day_of_week.alias("crash_day_of_week"),
         F.col("idot_control_no"),
@@ -640,6 +663,32 @@ def _require_spark_version(spark: SparkSession) -> None:
         )
 
 
+# Columns Silver 2 stores as INT. Tables written before that held crash_hour as
+# text ("09.00"), num_units as DECIMAL(10,1) and the injury counts as the source text
+# ("0.0"); upgrade_silver2_types.py converts them once.
+INT_COLUMNS = ("crash_hour", "num_units", *INJURY_COLUMNS)
+
+
+def old_type_columns(spark: SparkSession, path: str) -> List[str]:
+    """The INT_COLUMNS a Silver 2 or quarantine table still holds with the old type."""
+    if not has_delta_commit(path):
+        return []
+    types = {f.name: f.dataType for f in spark.read.format("delta").load(path).schema.fields}
+    return [c for c in INT_COLUMNS if c in types and not isinstance(types[c], IntegerType)]
+
+
+def require_int_columns(spark: SparkSession, path: str) -> None:
+    """Stop with the fix when a table was written before the INT columns: appending
+    INT rows to it would fail on Delta's schema check with a less helpful error."""
+    old = old_type_columns(spark, path)
+    if old:
+        raise RuntimeError(
+            f"{path} still holds {', '.join(old)} with the old types. Stop the pipeline and "
+            "the agent, then convert the tables once: docker compose run --rm silver2-gold-job "
+            "python upgrade_silver2_types.py"
+        )
+
+
 def init_shared_tables(spark: SparkSession) -> None:
     """Create the shared reference and audit tables once, before any source query starts."""
     _require_spark_version(spark)
@@ -658,6 +707,10 @@ def start(
     silver1_path = table_path("silver1", source)
     silver2_path = table_path("silver2", source)
     target_table = table_name("silver2", source)
+
+    # Tables written before crash_hour, num_units and the injury counts were INT
+    require_int_columns(spark, silver2_path)
+    require_int_columns(spark, QUARANTINE_PATH)
 
     # Wait for upstream Silver 1 Delta table
     wait_for_delta_table(silver1_path, upstream=upstream)

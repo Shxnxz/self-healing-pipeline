@@ -47,6 +47,7 @@ def test_value_corruptions():
     assert faults.corrupt(spec(kind="unseen_format", column="crash_date"), "2021-06-22", rng) == "22nd of June 2021"
     assert faults.corrupt(spec(kind="unseen_format", column="crash_date"), "2019-07-11", rng) == "11th of July 2019"
     assert faults.corrupt(spec(kind="unseen_format", column="crash_hour"), "19.00", rng) == "7 o'clock in the evening"
+    assert faults.corrupt(spec(kind="unseen_format", column="crash_hour"), 19, rng) == "7 o'clock in the evening"
     assert faults.corrupt(spec(kind="unseen_format", column="posted_speed_limit"), "30", rng) == "thirty"
     assert faults.corrupt(spec(kind="unseen_format", column="date_police_notified"),
                           "2021-06-22 19:05:00", rng) == "22nd of June 2021 at 19:05"
@@ -82,6 +83,7 @@ def test_canonical_matches_the_reference_table_spelling():
 
     assert faults.canonical("hit_and_run_i", True) == "TRUE"
     assert faults.canonical("num_units", Decimal("2.0")) == "2.0"
+    assert faults.canonical("num_units", 2) == "2.0"  # Silver 2 stores INT, the table writes 2.0
     assert faults.canonical("crash_month", "JUNE") == "JUNE"
     assert faults.canonical("crash_month", None) is None
 

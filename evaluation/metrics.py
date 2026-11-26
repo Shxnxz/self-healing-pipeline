@@ -299,6 +299,8 @@ def workflow_metrics(records: List[dict], workflows: List[dict]) -> dict:
         "no_right_answer": len(no_answer),
         "no_right_answer_escalated": sum(1 for w in no_answer if w.get("escalated")),
         "promoted": sum(1 for w in workflows if w.get("promotion_status") == "PROMOTED"),
+        # the agent's own validated fixes: reused from memory, promoted only when an engineer approves (EL2)
+        "awaiting_promotion": sum(1 for w in workflows if w.get("promotion_status") == "AWAITING_APPROVAL"),
         "policy_gate": gate,
         "workflow_seconds_to_resolve": spread(ttr),
     }
@@ -341,6 +343,7 @@ HEADLINE = [
     ("Workflows that asked the model (answered or not)", ("workflows", "model_called"), "n"),
     ("Escalation rate (workflows)", ("workflows", "escalation_rate"), "pct"),
     ("Fixes promoted into ref_canonical_mappings", ("workflows", "promoted"), "n"),
+    ("Agent fixes awaiting an engineer's promotion", ("workflows", "awaiting_promotion"), "n"),
 ]
 
 

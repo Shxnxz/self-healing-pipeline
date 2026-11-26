@@ -21,8 +21,12 @@ learn_node = importlib.import_module("agent.nodes.learn")   # agent.nodes export
 @pytest.fixture(autouse=True)
 def vocabulary(monkeypatch):
     monkeypatch.setattr(reference, "read_canonical_values", canonical_values)
-    monkeypatch.setattr(config, "PROMOTE_MIN_OCCURRENCES", 5)
-    monkeypatch.setattr(config, "PROMOTE_MIN_BATCHES", 3)
+
+
+@pytest.fixture
+def approval_on_p1(monkeypatch):
+    """The optional borrowed-fix approval switched on for P1 (off by default)."""
+    monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset({"P1"}))
 
 
 def thread(failure_id):
@@ -80,9 +84,10 @@ def test_an_automatic_fix_is_stored_as_a_verified_incident(memory):
 
     learned = out["learned"]
     assert learned["status"] == "STORED" and learned["incident_id"] == "f1" and learned["verified"] is True
-    assert learned["promotion"]["status"] == "BELOW_THRESHOLD"
-    assert "healed 2 rows in 1 batches so far, needs 5 rows in 3 batches" in learned["promotion"]["reasons"][0]
-    assert memory.mappings == {} and stored["promotion"] == "BELOW_THRESHOLD"
+    assert learned["promotion"]["status"] == "AWAITING_APPROVAL" and learned["promotion"]["route"] is None
+    assert "promoted only when an engineer approves it (EL2): python -m agent.review promote f1" \
+        in learned["promotion"]["reasons"][0]
+    assert memory.mappings == {} and stored["promotion"] == "AWAITING_APPROVAL"
 
 
 def test_learn_can_run_twice_without_storing_twice(memory):
@@ -93,53 +98,32 @@ def test_learn_can_run_twice_without_storing_twice(memory):
     assert again["learned"]["promotion"]["occurrences"] == 2   # counted once
 
 
-# --- promotion by recurrence (Thay, 2026-11-14: 5 rows across 3 batches) --------------
-def test_a_fix_the_agent_made_is_promoted_once_it_recurs_in_three_batches(memory):
+# --- the agent's own fix is never promoted by itself (EL2, Thay 2026-11-20) -----------
+def test_a_fix_the_agent_made_is_never_promoted_however_often_it_recurs(memory):
+    """The old rule (5 rows in 3 batches) promoted the agent's own repeats of a wrong fix."""
     g = graph(**AUTO)
-    outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=2)), thread(f"f{b}")) for b in (7, 8, 9)]
-    assert [o["learned"]["promotion"]["status"] for o in outs] == ["BELOW_THRESHOLD", "BELOW_THRESHOLD", "PROMOTED"]
-    third = outs[-1]["learned"]["promotion"]
-    assert (third["occurrences"], third["batches"], third["route"]) == (6, 3, "RECURRENCE")
-    assert memory.promoted == [{"column": "crash_month", "raw": "JULE", "canonical": "JULY",
-                                "added_by": "recovery_agent:recurrence", "source": "recovery_agent:f9"}]
-    assert memory.incidents["f9"]["promoted"] is True
-
-    # the next one finds the variant in the table already
-    fourth = g.invoke(initial_state("L1", item_in_batch("f10", 10)), thread("f10"))
-    assert fourth["learned"]["promotion"]["status"] == "ALREADY_IN_TABLE"
+    outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=5)), thread(f"f{b}")) for b in range(7, 13)]
+    assert {o["learned"]["promotion"]["status"] for o in outs} == {"AWAITING_APPROVAL"}
+    last = outs[-1]["learned"]["promotion"]
+    assert (last["occurrences"], last["batches"]) == (30, 6)   # shown to the engineer as evidence
+    assert memory.promoted == [] and memory.mappings == {}
+    assert all(memory.incidents[f"f{b}"].get("promoted") is False for b in range(7, 13))
 
 
-def test_three_batches_are_not_enough_without_five_rows(memory):
-    g = graph(**AUTO)
-    outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=1)), thread(f"f{b}")) for b in (7, 8, 9)]
-    assert outs[-1]["learned"]["promotion"]["status"] == "BELOW_THRESHOLD"
-    assert memory.mappings == {}
+def test_a_fix_reused_from_memory_is_not_promoted_either(memory):
+    exact = {**PAST_FIX, "matched_by": "EXACT"}
+    out = graph().invoke(initial_state("L1", item_in_batch("f1", 7, route="remediate", match=exact)), thread("f1"))
+    assert out["status"] == "RESOLVED" and memory.incidents["f1"]["resolved_by"] == "LOOKUP"
+    assert out["learned"]["promotion"]["status"] == "AWAITING_APPROVAL" and memory.mappings == {}
 
 
 def test_the_same_batch_number_in_two_sources_is_two_batches():
     assert promotion.batch_key("silver2_crash1", "7") != promotion.batch_key("silver2_crash3", "7")
 
 
-def test_never_turns_automatic_promotion_off(memory, monkeypatch):
-    monkeypatch.setattr(config, "PROMOTE_MIN_OCCURRENCES", 0)
-    g = graph(**AUTO)
-    outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=5)), thread(f"f{b}")) for b in (7, 8, 9)]
-    assert outs[-1]["learned"]["promotion"]["status"] == "BELOW_THRESHOLD"
-    assert "automatic promotion is off" in outs[-1]["learned"]["promotion"]["reasons"][0]
-    assert memory.mappings == {}
-
-
-@pytest.mark.parametrize("raw, expected", [("", 5), ("3", 3), ("NEVER", 0), ("never", 0)])
-def test_promotion_settings(monkeypatch, raw, expected):
-    monkeypatch.setenv("PROMOTE_MIN_OCCURRENCES", raw)
-    assert config._count("PROMOTE_MIN_OCCURRENCES", 5) == expected
-
-
-@pytest.mark.parametrize("raw", ["0", "-1", "five"])
-def test_a_promotion_setting_that_would_promote_everything_stops_the_agent(monkeypatch, raw):
-    monkeypatch.setenv("PROMOTE_MIN_BATCHES", raw)
-    with pytest.raises(ValueError):
-        config._count("PROMOTE_MIN_BATCHES", 3)
+def test_the_old_recurrence_settings_are_gone():
+    assert not hasattr(config, "PROMOTE_MIN_OCCURRENCES") and not hasattr(config, "PROMOTE_MIN_BATCHES")
+    assert not hasattr(promotion, "RECURRENCE")
 
 
 # --- never for an ambiguous value ---------------------------------------------------
@@ -161,12 +145,13 @@ def test_a_value_fixed_to_two_different_months_is_never_promoted(memory):
     assert memory.mappings == {}
 
 
-def test_a_fix_that_failed_validation_before_is_not_promoted_by_recurrence(memory):
+def test_a_fix_that_failed_validation_before_is_shown_as_a_doubt(memory):
     past(memory, "old-fail", "JULY", outcome="FAILED_VALIDATION")
     g = graph(**AUTO)
-    outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=5)), thread(f"f{b}")) for b in (7, 8, 9)]
-    assert outs[-1]["learned"]["promotion"]["status"] == "BLOCKED"
-    assert "the same fix failed validation before (incident old-fail)" in outs[-1]["learned"]["promotion"]["reasons"]
+    out = g.invoke(initial_state("L1", item_in_batch("f7", 7, rows=5)), thread("f7"))
+    promotion_ = out["learned"]["promotion"]
+    assert promotion_["status"] == "AWAITING_APPROVAL"
+    assert "doubt: the same fix failed validation before (incident old-fail)" in promotion_["reasons"]
 
 
 def test_a_table_that_maps_the_value_elsewhere_blocks_promotion(memory):
@@ -204,7 +189,7 @@ def test_an_engineers_fix_that_validated_is_promoted_at_once(memory):
     assert memory.mappings == {("crash_month", "JULE"): "JULY"}
 
 
-def test_no_promote_heals_the_records_only_and_keeps_recurrence_from_promoting_it(memory):
+def test_no_promote_heals_the_records_only(memory):
     g = graph(diagnose=diagnose_july, policy_gate=gate_rejects)
     g.invoke(initial_state("L1", item_in_batch("f1", 7)), thread("f1"))
     out = decide(g, "f1", "APPLY_FIX", action="ADD_VARIANT", params={"canonical_value": "JULY"}, promote=False)
@@ -213,9 +198,9 @@ def test_no_promote_heals_the_records_only_and_keeps_recurrence_from_promoting_i
     assert memory.incidents["f1"]["promote_declined"] is True
 
     auto = graph(**AUTO)
-    outs = [auto.invoke(initial_state("L1", item_in_batch(f"g{b}", b, rows=5)), thread(f"g{b}")) for b in (8, 9, 10)]
-    assert outs[-1]["learned"]["promotion"]["status"] == "BLOCKED"
-    assert "an engineer declined promoting this fix (incident f1)" in outs[-1]["learned"]["promotion"]["reasons"]
+    later = auto.invoke(initial_state("L1", item_in_batch("g8", 8, rows=5)), thread("g8"))
+    assert later["learned"]["promotion"]["status"] == "AWAITING_APPROVAL" and memory.mappings == {}
+    assert "doubt: an engineer declined promoting this fix (incident f1)" in later["learned"]["promotion"]["reasons"]
 
 
 def test_a_fix_that_failed_validation_is_stored_as_a_failed_attempt(memory):
@@ -275,20 +260,22 @@ def test_nothing_is_stored_when_nobody_decided(memory):
 BORROWED = {**PAST_FIX, "matched_by": "STRUCTURED", "score": 0.9}
 
 
-def test_a_borrowed_fix_nobody_approved_is_stored_as_borrowed_and_does_not_count(memory):
+def test_a_borrowed_fix_nobody_approved_is_stored_as_borrowed_and_does_not_count(memory, monkeypatch):
+    monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset())   # the default: off
     g = graph()
-    outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=5, route="remediate", match=BORROWED)),
-                     thread(f"f{b}")) for b in (7, 8, 9)]
-    assert [o["status"] for o in outs] == ["RESOLVED"] * 3        # P2: reused without approval
+    outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=5, route="remediate", match=BORROWED,
+                                                       tier=tier)), thread(f"f{b}"))
+            for b, tier in ((7, "P2"), (8, "P1"), (9, "P2"))]
+    assert [o["status"] for o in outs] == ["RESOLVED"] * 3        # approval is off by default, also on P1
     assert all(memory.incidents[f"f{b}"]["borrowed"] is True for b in (7, 8, 9))
     assert memory.incidents["f7"]["matched_by"] == "STRUCTURED" and memory.incidents["f7"]["resolved_by"] == "LOOKUP"
     promotion_ = outs[-1]["learned"]["promotion"]
-    assert promotion_["status"] == "BELOW_THRESHOLD" and promotion_["occurrences"] == 0
+    assert promotion_["status"] == "AWAITING_APPROVAL" and promotion_["occurrences"] == 0
     assert "borrowed from a similar incident without approval" in promotion_["reasons"][0]
     assert memory.mappings == {}
 
 
-def test_an_exact_match_on_a_borrowed_fix_still_waits_for_approval_on_p1(memory):
+def test_an_exact_match_on_a_borrowed_fix_still_waits_for_approval_on_p1(memory, approval_on_p1):
     """Reusing a borrowed fix again must not turn it into an exact one on P1."""
     exact_on_borrowed = {**PAST_FIX, "matched_by": "EXACT", "borrowed": True}
     g = graph()
@@ -302,7 +289,7 @@ def test_an_exact_match_on_a_borrowed_fix_still_waits_for_approval_on_p1(memory)
     assert p2["status"] == "RESOLVED" and memory.incidents["f2"]["borrowed"] is True   # stays borrowed
 
 
-def test_a_borrowed_fix_an_engineer_approved_is_not_borrowed_and_is_promoted(memory):
+def test_a_borrowed_fix_an_engineer_approved_is_not_borrowed_and_is_promoted(memory, approval_on_p1):
     g = graph()
     g.invoke(initial_state("L1", item_in_batch("f1", 7, route="remediate", match=BORROWED, tier="P1")), thread("f1"))
     out = decide(g, "f1", "APPLY_FIX", action="ADD_VARIANT", params={"canonical_value": "JULY"})
@@ -404,7 +391,8 @@ def test_an_engineers_approval_overrides_an_earlier_failure_of_the_same_fix():
     assert approved["status"] == "PROMOTED"
     assert approved["overridden"] == ["the same fix failed validation before (incident old)"]
     automatic = promotion.decide(incident=incident, history=[failed], existing=None, engineer_approved=False)
-    assert automatic["status"] == "BLOCKED"
+    assert automatic["status"] == "AWAITING_APPROVAL"
+    assert "doubt: the same fix failed validation before (incident old)" in automatic["reasons"]
 
     # a conflicting value still blocks, approval or not
     other = {**failed, "incident_id": "june", "action_params": {"canonical_value": "JUNE"}, "outcome": "SUCCESS",
@@ -456,3 +444,134 @@ def test_the_poll_loop_retries_learn_on_its_own(memory):
     run(consumer, g, max_messages=1, retry=retry)
     assert retry.pending == set() and memory.incidents["f1"]["outcome"] == "SUCCESS"
     assert consumer.paused is False
+
+
+# --- an engineer approves promoting the agent's own fix (agent.review, EL2) -----------
+def test_an_engineer_promotes_a_fix_the_agent_made(memory, capsys):
+    from agent import review
+
+    g = graph(**AUTO)
+    for b in (7, 8):
+        g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=3)), thread(f"f{b}"))
+
+    review.main(["promotions"])
+    listed = capsys.readouterr().out
+    assert "1 variant(s) waiting for an engineer" in listed
+    assert "f8 " in listed and "crash_month: 'JULE' -> JULY  healed 6 row(s) in 2 batch(es), 2 incident(s)  [promote]" \
+        in listed
+
+    review.main(["promote", "f8", "--by", "thay", "--note", "every crash_date is in July"])
+    assert "Promoted crash_month: 'JULE' -> JULY into ref_canonical_mappings" in capsys.readouterr().out
+    assert memory.promoted == [{"column": "crash_month", "raw": "JULE", "canonical": "JULY",
+                                "added_by": "recovery_agent:engineer:thay", "source": "recovery_agent:f8"}]
+    stored = memory.incidents["f8"]
+    assert stored["promotion"] == "PROMOTED" and stored["promoted"] is True and stored["promoted_by"] == "thay"
+    assert "engineer thay: every crash_date is in July" in stored["promotion_reason"]
+
+    # f7 made the same variant: it was decided with f8, so the list is empty at once
+    assert memory.incidents["f7"]["promotion"] == "ALREADY_IN_TABLE"
+    assert "decided with incident f8" in memory.incidents["f7"]["promotion_reason"]
+    review.main(["promotions"])
+    assert "0 variant(s)" in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="promoted already"):
+        review.main(["promote", "f8", "--by", "thay"])
+
+    # from then on Learn finds the variant in the table
+    later = g.invoke(initial_state("L1", item_in_batch("f9", 9)), thread("f9"))
+    assert later["learned"]["promotion"]["status"] == "ALREADY_IN_TABLE"
+
+
+def test_an_ambiguous_value_cannot_be_promoted_even_by_an_engineer(memory, capsys):
+    from agent import review
+
+    past(memory, "old-june", "JUNE")
+    graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
+    assert memory.incidents["f7"]["promotion"] == "BLOCKED"   # Learn saw the conflict already
+
+    review.main(["promotions"])
+    listed = capsys.readouterr().out
+    assert "0 variant(s) waiting" in listed and "1 more cannot be promoted now" in listed
+    review.main(["promotions", "--all"])
+    assert "[cannot: incident old-june fixed the same value to JUNE]" in capsys.readouterr().out
+    review.main(["promote", "f7", "--by", "thay"])
+    assert "Not promoted (BLOCKED)" in capsys.readouterr().out
+    assert memory.mappings == {} and memory.incidents["f7"]["promotion"] == "BLOCKED"
+
+    # the conflict is cleared (the wrong JUNE incident is withdrawn): f7 is offered again
+    memory.incidents["old-june"]["outcome"] = "DISMISSED"
+    review.main(["promotions"])
+    assert "1 variant(s) waiting" in capsys.readouterr().out
+
+
+def test_a_variant_an_engineers_fix_promoted_leaves_the_list(memory, capsys):
+    """The agent's JULE -> JULY waits; then an engineer's own fix of the same value is
+    promoted by Learn. The agent's incident is not offered any more."""
+    from agent import review
+
+    graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
+    g = graph(diagnose=diagnose_july, policy_gate=gate_rejects)
+    g.invoke(initial_state("L1", item_in_batch("f8", 8)), thread("f8"))
+    assert decide(g, "f8", "APPLY_FIX", action="ADD_VARIANT",
+                  params={"canonical_value": "JULY"})["learned"]["promotion"]["status"] == "PROMOTED"
+    review.main(["promotions"])
+    assert "0 variant(s) waiting" in capsys.readouterr().out
+    review.main(["promotions", "--all"])
+    assert "[already in the table]" in capsys.readouterr().out
+
+
+def test_a_promotion_an_engineer_declined_needs_an_explicit_override(memory, capsys):
+    from agent import review
+
+    g = graph(diagnose=diagnose_july, policy_gate=gate_rejects)
+    g.invoke(initial_state("L1", item_in_batch("f1", 7)), thread("f1"))
+    decide(g, "f1", "APPLY_FIX", action="ADD_VARIANT", params={"canonical_value": "JULY"}, promote=False)
+    assert memory.incidents["f1"]["promotion"] == "DECLINED"
+    with pytest.raises(SystemExit, match="--override-decline"):
+        review.main(["promote", "f1", "--by", "ana"])
+    review.main(["promote", "f1", "--by", "ana", "--override-decline"])
+    assert memory.mappings == {("crash_month", "JULE"): "JULY"}
+    assert memory.incidents["f1"]["promoted_by"] == "ana"
+
+
+def test_promote_writes_the_variant_validate_checked(memory):
+    """Learn records the overlay it promoted from; `promote` uses that, not the raw value."""
+    from agent import review
+
+    graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
+    stored = memory.incidents["f7"]
+    assert (stored["promotion_column"], stored["promotion_raw"], stored["promotion_canonical"]) == \
+        ("crash_month", "JULE", "JULY")
+    stored.update(raw_value="jule (as the failure named it)")   # differs from the overlay key
+    review.main(["promote", "f7", "--by", "thay"])
+    assert memory.mappings == {("crash_month", "JULE"): "JULY"}
+
+
+def test_promote_reports_an_unreadable_table_without_a_traceback(memory, monkeypatch):
+    from agent import review
+
+    graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
+
+    def unreadable(column, raw, path=None):
+        raise OSError("ref_canonical_mappings: no such table")
+
+    monkeypatch.setattr(promotion, "current_mapping", unreadable)
+    with pytest.raises(SystemExit, match="Could not read the promotions: OSError"):
+        review.main(["promotions"])
+    with pytest.raises(SystemExit, match="Not promoted: OSError"):
+        review.main(["promote", "f7", "--by", "thay"])
+
+
+def test_promote_needs_a_name_and_a_known_fix(memory, monkeypatch):
+    from agent import review
+
+    monkeypatch.delenv("ENGINEER_NAME", raising=False)
+    with pytest.raises(SystemExit, match="--by NAME"):
+        review.main(["promote", "f1"])
+    with pytest.raises(SystemExit, match="No incident nope"):
+        review.main(["promote", "nope", "--by", "thay"])
+
+    g = graph(diagnose=diagnose_july, policy_gate=gate_rejects)
+    g.invoke(initial_state("L1", item_in_batch("f1", 7)), thread("f1"))
+    decide(g, "f1", "DISMISS", note="test data")
+    with pytest.raises(SystemExit, match="nothing to promote"):
+        review.main(["promote", "f1", "--by", "thay"])
