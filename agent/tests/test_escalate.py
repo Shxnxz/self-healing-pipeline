@@ -428,9 +428,11 @@ def test_exact_matches_and_lower_tiers_still_reuse_the_fix_directly(tier, matche
     assert state["status"] == "RESOLVED"
 
 
-def test_a_borrowed_fix_on_p1_runs_without_approval_by_default():
-    """Off by default (Thay, 2026-11-20; final report 3.2.4)."""
-    assert config.APPROVE_BORROWED_FIX_TIERS == frozenset()
+def test_a_borrowed_fix_on_p1_runs_without_approval_when_the_option_is_off(monkeypatch):
+    """Off is the default (Thay, 2026-11-20; final report 3.2.4; the parsed default is
+    tested in test_policy_gate). Set here so an old APPROVE_BORROWED_FIX_TIERS=P1 in the
+    environment cannot change the test."""
+    monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset())
     state = graph(remediate=remediate_ok, validate=validate_ok, learn=learn_ok).invoke(
         initial_state("L1", p1(stack_item("f1", route="remediate", match=BORROWED))), thread())
     assert state["status"] == "RESOLVED" and "escalation" not in state

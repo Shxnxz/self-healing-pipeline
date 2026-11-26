@@ -599,15 +599,19 @@ docker compose exec recovery-agent python -m agent.review promotions
 docker compose exec recovery-agent python -m agent.review promote <incident_id> --by thay --note "dates agree"
 ```
 
-`promotions` lists one line per variant waiting for approval (incidents with promotion
-`AWAITING_APPROVAL`, or `BELOW_THRESHOLD` from before the change): column, raw value,
-canonical value, the rows and batches the fix healed, the incidents that made it, and
-what `promote` would do now (promote, already in the table, or why it cannot). `promote`
+`promotions` re-decides every open incident (promotion `AWAITING_APPROVAL`, `BLOCKED`,
+or `BELOW_THRESHOLD` from before the change) and lists one line per variant an approval
+would promote: column, raw value, canonical value, the rows and batches the fix healed,
+the incidents that made it, and any doubts the approval overrides. `--all` also lists
+the variants that cannot be promoted now (a conflict, which may be cleared later) and
+those already in the table (an engineer's fix, an earlier promotion). `promote`
 runs the same decision with the engineer's approval, writes the variant with the same
 MERGE as Learn (`added_by = recovery_agent:engineer:<name>`) and marks the incident
 `PROMOTED` with `promoted_by` and the note. Every other waiting incident of the same
 variant is marked with it (`ALREADY_IN_TABLE`), so the variant leaves the list at once.
-A conflict still refuses it (`BLOCKED` is recorded on all of them, so it leaves the list). It works on finished workflows, directly against Neo4j
+A conflict still refuses it (`BLOCKED` is recorded on that incident, which stays open
+and is offered again once the conflict is gone). A fix an engineer approved with
+`--no-promote` is promoted only with `--override-decline`. It works on finished workflows, directly against Neo4j
 and the reference table (no Kafka), so the agent container's writable mount of
 `ref_canonical_mappings` is what it uses.
 

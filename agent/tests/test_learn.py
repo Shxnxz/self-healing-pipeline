@@ -260,7 +260,8 @@ def test_nothing_is_stored_when_nobody_decided(memory):
 BORROWED = {**PAST_FIX, "matched_by": "STRUCTURED", "score": 0.9}
 
 
-def test_a_borrowed_fix_nobody_approved_is_stored_as_borrowed_and_does_not_count(memory):
+def test_a_borrowed_fix_nobody_approved_is_stored_as_borrowed_and_does_not_count(memory, monkeypatch):
+    monkeypatch.setattr(config, "APPROVE_BORROWED_FIX_TIERS", frozenset())   # the default: off
     g = graph()
     outs = [g.invoke(initial_state("L1", item_in_batch(f"f{b}", b, rows=5, route="remediate", match=BORROWED,
                                                        tier=tier)), thread(f"f{b}"))
@@ -487,12 +488,49 @@ def test_an_ambiguous_value_cannot_be_promoted_even_by_an_engineer(memory, capsy
     graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
     assert memory.incidents["f7"]["promotion"] == "BLOCKED"   # Learn saw the conflict already
 
-    memory.incidents["f7"]["promotion"] = "BELOW_THRESHOLD"     # as the old recurrence rule left it
     review.main(["promotions"])
+    listed = capsys.readouterr().out
+    assert "0 variant(s) waiting" in listed and "1 more cannot be promoted now" in listed
+    review.main(["promotions", "--all"])
     assert "[cannot: incident old-june fixed the same value to JUNE]" in capsys.readouterr().out
     review.main(["promote", "f7", "--by", "thay"])
     assert "Not promoted (BLOCKED)" in capsys.readouterr().out
     assert memory.mappings == {} and memory.incidents["f7"]["promotion"] == "BLOCKED"
+
+    # the conflict is cleared (the wrong JUNE incident is withdrawn): f7 is offered again
+    memory.incidents["old-june"]["outcome"] = "DISMISSED"
+    review.main(["promotions"])
+    assert "1 variant(s) waiting" in capsys.readouterr().out
+
+
+def test_a_variant_an_engineers_fix_promoted_leaves_the_list(memory, capsys):
+    """The agent's JULE -> JULY waits; then an engineer's own fix of the same value is
+    promoted by Learn. The agent's incident is not offered any more."""
+    from agent import review
+
+    graph(**AUTO).invoke(initial_state("L1", item_in_batch("f7", 7)), thread("f7"))
+    g = graph(diagnose=diagnose_july, policy_gate=gate_rejects)
+    g.invoke(initial_state("L1", item_in_batch("f8", 8)), thread("f8"))
+    assert decide(g, "f8", "APPLY_FIX", action="ADD_VARIANT",
+                  params={"canonical_value": "JULY"})["learned"]["promotion"]["status"] == "PROMOTED"
+    review.main(["promotions"])
+    assert "0 variant(s) waiting" in capsys.readouterr().out
+    review.main(["promotions", "--all"])
+    assert "[already in the table]" in capsys.readouterr().out
+
+
+def test_a_promotion_an_engineer_declined_needs_an_explicit_override(memory, capsys):
+    from agent import review
+
+    g = graph(diagnose=diagnose_july, policy_gate=gate_rejects)
+    g.invoke(initial_state("L1", item_in_batch("f1", 7)), thread("f1"))
+    decide(g, "f1", "APPLY_FIX", action="ADD_VARIANT", params={"canonical_value": "JULY"}, promote=False)
+    assert memory.incidents["f1"]["promotion"] == "DECLINED"
+    with pytest.raises(SystemExit, match="--override-decline"):
+        review.main(["promote", "f1", "--by", "ana"])
+    review.main(["promote", "f1", "--by", "ana", "--override-decline"])
+    assert memory.mappings == {("crash_month", "JULE"): "JULY"}
+    assert memory.incidents["f1"]["promoted_by"] == "ana"
 
 
 def test_promote_writes_the_variant_validate_checked(memory):

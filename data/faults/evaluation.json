@@ -1,6 +1,6 @@
 {
   "name": "evaluation",
-  "description": "The evaluation experiment (Task 111, docs/evaluation.md): one fixed value per fault so each becomes one recovery case, spread over micro-batches so the promotion rule (5 rows in 3 batches) can be met. Fixable values (ambiguous, unseen variants), values Silver 2 must fix itself (typos), a fuzzy-matching trap (LIGHT is one edit from NIGHT, an accepted spelling of DARKNESS, but means DAYLIGHT), values with no right answer (unknown, unseen date format, missing date) and a schema change.",
+  "description": "The evaluation experiment (Task 111, docs/evaluation.md): one fixed value per fault so each becomes one recovery case, spread over micro-batches so a later batch can reuse a fix from memory (promotion into the reference table needs an engineer's approval). Fixable values (ambiguous, unseen variants), values Silver 2 must fix itself (typos), a fuzzy-matching trap (LIGHT is one edit from NIGHT, an accepted spelling of DARKNESS, but means DAYLIGHT), values with no right answer (unknown, unseen date format, missing date) and a schema change.",
   "faults": [
     {"kind": "ambiguous", "source": "crash1", "column": "crash_month", "value": "Jule", "base": "JUNE", "count": 4, "batches": 3},
     {"kind": "ambiguous", "source": "crash3", "column": "crash_day_of_week", "value": "S", "base": "SUNDAY", "count": 2, "batches": 3},

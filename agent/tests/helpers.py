@@ -273,12 +273,12 @@ class FakeMemory:
         stored = self.incidents.get(incident_id)
         return dict(stored) if stored else None
 
-    def awaiting_promotion(self, driver, statuses, limit=200):
+    def awaiting_promotion(self, driver, statuses):
         self._check()
         found = [dict(i) for i in self.incidents.values()
                  if i.get("promotion") in statuses and i.get("outcome") == "SUCCESS" and i.get("verified") is True
                  and i.get("action") == "ADD_VARIANT"]
-        return list(reversed(found))[:limit]
+        return list(reversed(found))
 
     # agent.promotion
     def current_mapping(self, column, raw, path=None):

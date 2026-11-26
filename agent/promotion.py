@@ -53,10 +53,12 @@ DECLINED = "DECLINED"                  # the engineer approved the fix but not t
 NOT_APPLICABLE = "NOT_APPLICABLE"      # nothing to promote (no validated ADD_VARIANT)
 
 ENGINEER_APPROVED = "ENGINEER_APPROVED"   # the only route into the table
-# Statuses an engineer can still turn into PROMOTED with `agent.review promote`.
-# BELOW_THRESHOLD is what the old recurrence rule wrote on incidents stored before
-# promotion needed an engineer; those wait for approval the same way.
-PROMOTABLE = ("AWAITING_APPROVAL", "BELOW_THRESHOLD")
+# Statuses whose promotion is still open: `agent.review promotions` re-decides them
+# with an engineer's approval each time it lists them. BELOW_THRESHOLD is what the old
+# recurrence rule wrote before promotion needed an engineer. BLOCKED stays open too:
+# a conflict can be cleared later, and the old rule also wrote BLOCKED for a mere
+# doubt, which an approval now overrides.
+PROMOTABLE = ("AWAITING_APPROVAL", "BELOW_THRESHOLD", "BLOCKED")
 
 
 def batch_key(table: Optional[str], batch: str) -> str:

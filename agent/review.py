@@ -8,7 +8,7 @@
   docker compose exec recovery-agent python -m agent.review resolved <failure_id> --by NAME --note "what you did"
   docker compose exec recovery-agent python -m agent.review dismiss  <failure_id> --by NAME --note "why"
 
-  docker compose exec recovery-agent python -m agent.review promotions                       # fixes awaiting promotion
+  docker compose exec recovery-agent python -m agent.review promotions [--all]               # fixes awaiting promotion
   docker compose exec recovery-agent python -m agent.review promote <incident_id> --by NAME [--note ...]
 
 `--by` can be left out when ENGINEER_NAME is set. The decision is checked here
@@ -250,9 +250,10 @@ def _decide(driver, incident: dict, mappings: Optional[dict] = None) -> dict:
 
 
 def promotion_candidates(driver=None) -> List[dict]:
-    """Validated agent fixes waiting for an engineer, one line per variant (column, raw
-    value, canonical value) with every incident that made it and what an approval
-    would do now."""
+    """Validated agent fixes whose promotion is open, one entry per variant (column, raw
+    value, canonical value) with every incident that made it and what an approval would
+    do now: PROMOTED (waiting for an engineer), BLOCKED (cannot now) or
+    ALREADY_IN_TABLE (done some other way: an engineer's fix, another promotion)."""
     driver = driver or memory.shared_driver()
     variants, mappings = {}, {}
     for incident in memory.awaiting_promotion(driver, promo.PROMOTABLE):
@@ -277,7 +278,8 @@ def promotion_line(candidate: dict) -> str:
             f"{decision.get('batches', 0)} batch(es), {len(candidate['incidents'])} incident(s)  [{what}]{doubts}")
 
 
-def promote_incident(incident_id: str, engineer: str, note: Optional[str] = None, driver=None) -> dict:
+def promote_incident(incident_id: str, engineer: str, note: Optional[str] = None, driver=None,
+                     override_decline: bool = False) -> dict:
     """An engineer approves promoting a validated fix of the agent (EL2). Returns the
     promotion decision; exits when there is nothing to promote."""
     driver = driver or memory.shared_driver()
@@ -290,6 +292,11 @@ def promote_incident(incident_id: str, engineer: str, note: Optional[str] = None
     decision = _decide(driver, incident)
     if decision["status"] == promo.NOT_APPLICABLE:
         sys.exit(f"Incident {incident_id} has nothing to promote: {'; '.join(decision['reasons'])}")
+    if incident.get("promotion") == promo.DECLINED and not override_decline:
+        sys.exit(f"An engineer approved incident {incident_id} with --no-promote (for these records only). "
+                 f"Add --override-decline to promote it anyway.")
+    if incident.get("promotion") == promo.DECLINED:
+        decision.setdefault("overridden", []).append("an engineer declined promoting this very fix (--no-promote)")
     reasons = list(decision["reasons"]) + [f"engineer {engineer}: {note}" if note else f"engineer {engineer}"]
     target = _target(incident)
     if decision["status"] == promo.PROMOTED:
@@ -298,15 +305,21 @@ def promote_incident(incident_id: str, engineer: str, note: Optional[str] = None
                                              source=f"recovery_agent:{incident_id}")
         memory.mark_promotion(driver, incident_id, promo.PROMOTED, "; ".join(reasons), promoted_by=engineer,
                               target=target)
-    else:   # ALREADY_IN_TABLE or BLOCKED: recorded, so it leaves the list
-        memory.mark_promotion(driver, incident_id, decision["status"], "; ".join(reasons), target=target)
+    elif decision["status"] == promo.ALREADY_IN_TABLE:
+        # The engineer approved this variant and it is in the table, perhaps by an
+        # earlier run of this command that wrote the row and then lost Neo4j.
+        memory.mark_promotion(driver, incident_id, promo.ALREADY_IN_TABLE, "; ".join(reasons),
+                              promoted_by=engineer, target=target)
+    else:   # BLOCKED: stays open, so it is offered again once the conflict is gone
+        memory.mark_promotion(driver, incident_id, promo.BLOCKED, "; ".join(reasons), target=target)
+        decision["siblings"] = []
+        return decision
     # Every other incident that made the same variant is decided with it, so the
     # variant leaves `promotions` at once instead of resurfacing under the next one.
-    sibling_status = promo.ALREADY_IN_TABLE if decision["status"] == promo.PROMOTED else decision["status"]
     siblings = [i["incident_id"] for i in memory.awaiting_promotion(driver, promo.PROMOTABLE)
                 if i.get("incident_id") != incident_id and _variant(_target(i)) == _variant(target)]
     for other in siblings:
-        memory.mark_promotion(driver, other, sibling_status,
+        memory.mark_promotion(driver, other, promo.ALREADY_IN_TABLE,
                               f"decided with incident {incident_id}: " + "; ".join(reasons))
     decision["siblings"] = siblings
     return decision
@@ -334,11 +347,15 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
         if name in ("approve", "fix"):
             cmd.add_argument("--no-promote", dest="promote", action="store_false",
                              help="heal these records only; do not add the variant to ref_canonical_mappings")
-    sub.add_parser("promotions", help="validated fixes of the agent waiting for an engineer to promote them")
+    lst = sub.add_parser("promotions", help="validated fixes of the agent waiting for an engineer to promote them")
+    lst.add_argument("--all", action="store_true",
+                     help="also list variants that cannot be promoted now (conflicts) or are in the table already")
     prom = sub.add_parser("promote", help="add the variant of a validated fix to ref_canonical_mappings")
     prom.add_argument("incident_id", help="from `promotions` (the workflow's failure_id)")
     prom.add_argument("--by", default=os.environ.get("ENGINEER_NAME"), help="your name (or ENGINEER_NAME)")
     prom.add_argument("--note", help="why it is right (stored on the incident)")
+    prom.add_argument("--override-decline", action="store_true",
+                      help="promote a fix an engineer approved with --no-promote")
     args = parser.parse_args(argv)
 
     if args.command == "promotions":
@@ -346,18 +363,23 @@ def main(argv: Optional[List[str]] = None, graph=None, send=publish) -> None:
             candidates = promotion_candidates()
         except Exception as exc:   # Neo4j or the reference table unreachable
             sys.exit(f"Could not read the promotions: {type(exc).__name__}: {exc}")
-        print(f"{len(candidates)} variant(s) waiting for an engineer to approve their promotion")
-        for candidate in candidates:
+        waiting = [c for c in candidates if c["decision"]["status"] == promo.PROMOTED]
+        other = [c for c in candidates if c["decision"]["status"] != promo.PROMOTED]
+        print(f"{len(waiting)} variant(s) waiting for an engineer to approve their promotion")
+        for candidate in waiting + (other if args.all else []):
             print(promotion_line(candidate))
-        if candidates:
+        if waiting:
             print("Promote one with: python -m agent.review promote <incident_id> --by NAME")
+        if other and not args.all:
+            print(f"{len(other)} more cannot be promoted now (a conflict) or are in the table already: --all lists them")
         return
     if args.command == "promote":
         if not (args.by or "").strip():
             sys.exit("Say who approves: --by NAME (or set ENGINEER_NAME)")
         try:
-            decision = promote_incident(args.incident_id, args.by.strip(), args.note)
-        except Exception as exc:   # Neo4j or the reference table unreachable: running it again is safe
+            decision = promote_incident(args.incident_id, args.by.strip(), args.note,
+                                        override_decline=args.override_decline)
+        except Exception as exc:   # Neo4j or the reference table unreachable: run it again
             sys.exit(f"Not promoted: {type(exc).__name__}: {exc}")
         if decision["status"] == promo.PROMOTED:
             print(f"Promoted {decision['column']}: {decision['raw_value']!r} -> {decision['canonical_value']} "

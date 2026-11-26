@@ -219,9 +219,10 @@ def get_incident(driver, incident_id: str) -> Optional[dict]:
     return {**records[0].data(), "action_params": _params(records[0]["action_params"])}
 
 
-def awaiting_promotion(driver, statuses, limit: int = 200) -> list:
-    """Validated agent fixes that wait for an engineer to approve their promotion
-    (promotion in `statuses`), newest first (agent.review promotions)."""
+def awaiting_promotion(driver, statuses) -> list:
+    """Validated agent fixes whose promotion is still open (promotion in `statuses`),
+    newest first (agent.review promotions / promote). No limit: the promote command
+    must find every incident of a variant, and these are a few hundred at most."""
     records, _, _ = driver.execute_query(
         """
         MATCH (i:Incident)
@@ -232,9 +233,9 @@ def awaiting_promotion(driver, statuses, limit: int = 200) -> list:
                i.promotion AS promotion, toString(i.resolved_at) AS resolved_at,
                i.promotion_column AS promotion_column, i.promotion_raw AS promotion_raw,
                i.promotion_canonical AS promotion_canonical
-        ORDER BY i.resolved_at DESC LIMIT $limit
+        ORDER BY i.resolved_at DESC
         """,
-        statuses=list(statuses), limit=limit)
+        statuses=list(statuses))
     return [{**r.data(), "action_params": _params(r["action_params"])} for r in records]
 
 
